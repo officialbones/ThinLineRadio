@@ -81,3 +81,11 @@ tlr-time-sync/
 
 ThinLineRadioV7-config.json
 node_modules
+
+# Vertical ops dashboard (local secrets + Street View/map cache)
+dashboard/.env
+dashboard/.venv/
+dashboard/cache/**
+!dashboard/cache/.gitkeep
+dashboard/**/__pycache__/
+dashboard/*.pyc
