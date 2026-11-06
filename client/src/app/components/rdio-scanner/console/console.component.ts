@@ -698,6 +698,8 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
             width: '640px',
             maxWidth: '95vw',
             autoFocus: false,
+            panelClass: 'tlr-lcd-dialog',
+            backdropClass: 'tlr-lcd-dialog-backdrop',
         });
     }
 

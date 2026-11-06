@@ -1,6 +1,7 @@
 .public-api-dialog {
   min-width: min(560px, 92vw);
   max-width: 640px;
+  color: var(--tlr-text);
 
   section {
     margin-bottom: 1.25rem;
@@ -9,10 +10,12 @@
   h3 {
     margin: 0 0 0.35rem;
     font-size: 1rem;
+    color: var(--tlr-text);
+    font-weight: 700;
   }
 
   .hint {
-    color: rgba(0, 0, 0, 0.6);
+    color: var(--tlr-text-secondary);
     font-size: 0.85rem;
     margin: 0 0 0.75rem;
   }
@@ -37,23 +40,32 @@
     gap: 0.5rem;
     align-items: center;
     padding: 0.65rem 0.75rem;
-    background: rgba(0, 0, 0, 0.04);
-    border-radius: 6px;
+    background: var(--tlr-obsidian);
+    border: 1px solid var(--tlr-line);
+    border-radius: var(--tlr-radius-sm, 6px);
     margin-bottom: 0.75rem;
+    color: var(--tlr-text);
 
     code {
       flex: 1;
       word-break: break-all;
       font-size: 0.8rem;
+      font-family: var(--tlr-font-numeric);
+      color: var(--tlr-text);
+      background: transparent;
     }
   }
 
   .snippet {
-    background: rgba(0, 0, 0, 0.04);
+    background: var(--tlr-obsidian);
+    border: 1px solid var(--tlr-line);
+    color: var(--tlr-text);
     padding: 0.65rem 0.75rem;
-    border-radius: 6px;
+    border-radius: var(--tlr-radius-sm, 6px);
     font-size: 0.75rem;
+    font-family: var(--tlr-font-numeric);
     overflow-x: auto;
+    margin: 0;
   }
 
   .key-row {
@@ -62,21 +74,33 @@
     align-items: center;
     gap: 0.75rem;
     padding: 0.45rem 0;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    border-bottom: 1px solid var(--tlr-line);
+    color: var(--tlr-text);
 
     &.disabled {
       opacity: 0.55;
     }
 
+    strong {
+      color: var(--tlr-text);
+    }
+
     code {
       margin-left: 0.5rem;
       font-size: 0.8rem;
+      font-family: var(--tlr-font-numeric);
+      color: var(--tlr-text-soft);
+      background: transparent;
     }
 
     .meta {
       display: block;
       font-size: 0.75rem;
-      color: rgba(0, 0, 0, 0.55);
+      color: var(--tlr-text-secondary);
     }
+  }
+
+  .email-dest strong {
+    color: var(--tlr-text);
   }
 }
