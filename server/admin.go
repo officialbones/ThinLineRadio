@@ -29,6 +29,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -166,9 +168,24 @@ func (admin *Admin) requireAdminBasicAuth(next http.HandlerFunc) http.HandlerFun
 // behaviour now also respects AdminAllowedIPs).
 func (admin *Admin) requireLocalhost(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// A valid admin JWT already proved identity (SSO or password login).
+		// Skip the IP allowlist so system admins can manage from the mobile app.
+		t := admin.GetAuthorization(r)
+		if t != "" && admin.ValidateToken(t) {
+			next(w, r)
+			return
+		}
+
 		clientIP := GetClientIP(r)
 
 		if !admin.isAdminIPAllowed(clientIP) {
+			// Expired or evicted token: 401 tells an SSO client to sign in
+			// again, where a 403 would leave it stuck.
+			if t != "" {
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+				return
+			}
 			log.Printf("Admin access denied from IP: %s for route: %s", clientIP, r.URL.Path)
 			w.WriteHeader(http.StatusForbidden)
 			json.NewEncoder(w).Encode(map[string]string{
@@ -215,6 +232,33 @@ func (admin *Admin) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 			w.Write(b)
 		} else {
 			w.WriteHeader(http.StatusExpectationFailed)
+		}
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (admin *Admin) ListenersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		t := admin.GetAuthorization(r)
+		if !admin.ValidateToken(t) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		snapshot := ListenersSnapshot{}
+		if admin.Controller != nil && admin.Controller.Clients != nil {
+			snapshot = admin.Controller.Clients.SnapshotListeners()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(snapshot); err != nil {
+			w.WriteHeader(http.StatusExpectationFailed)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "failed to marshal listeners snapshot",
+			})
 		}
 
 	default:
@@ -854,6 +898,7 @@ func (admin *Admin) SystemHealthAlertsEnabledHandler(w http.ResponseWriter, r *h
 		// If enabling, restart no-audio monitoring for all systems
 		if request.Enabled {
 			go admin.Controller.StartNoAudioMonitoringForAllSystems()
+			go admin.Controller.StartNoAudioMonitoringForAllApiKeys()
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1024,6 +1069,7 @@ func (admin *Admin) SystemHealthAlertSettingsHandler(w http.ResponseWriter, r *h
 		// If no-audio alerts setting was changed, restart monitoring for all systems
 		if request.NoAudioAlertsEnabled != nil {
 			go admin.Controller.StartNoAudioMonitoringForAllSystems()
+			go admin.Controller.StartNoAudioMonitoringForAllApiKeys()
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1093,6 +1139,110 @@ func (admin *Admin) SystemNoAudioSettingsHandler(w http.ResponseWriter, r *http.
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"message": "system no-audio settings updated successfully",
+	})
+}
+
+// SystemRetentionSettingsHandler handles updating per-system call retention overrides.
+func (admin *Admin) SystemRetentionSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var request struct {
+		SystemId      uint `json:"systemId"`
+		RetentionDays uint `json:"retentionDays"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "invalid request body",
+		})
+		return
+	}
+
+	system, ok := admin.Controller.Systems.GetSystemById(uint64(request.SystemId))
+	if !ok || system == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "system not found",
+		})
+		return
+	}
+
+	system.RetentionDays = request.RetentionDays
+
+	if err := admin.Controller.Systems.Write(admin.Controller.Database); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("failed to save system settings: %v", err),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "system retention settings updated successfully",
+	})
+}
+
+// SystemDuplicateDetectionSettingsHandler handles updating per-system duplicate detection toggles.
+func (admin *Admin) SystemDuplicateDetectionSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var request struct {
+		SystemId                    uint `json:"systemId"`
+		DuplicateDetectionEnabled bool `json:"duplicateDetectionEnabled"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "invalid request body",
+		})
+		return
+	}
+
+	system, ok := admin.Controller.Systems.GetSystemById(uint64(request.SystemId))
+	if !ok || system == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "system not found",
+		})
+		return
+	}
+
+	system.DuplicateDetectionEnabled = request.DuplicateDetectionEnabled
+
+	if err := admin.Controller.Systems.Write(admin.Controller.Database); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("failed to save system settings: %v", err),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "system duplicate detection settings updated successfully",
 	})
 }
 
@@ -1321,6 +1471,158 @@ func (admin *Admin) ChangePassword(currentPassword any, newPassword string) erro
 	return nil
 }
 
+// remapTalkgroupRefsInSystemsPayload rewrites talkgroup groupIds and tagIds in a config
+// PUT payload so they match database IDs after groups/tags have been written. CSV and bulk
+// imports assign provisional client-side ids that may not match persisted rows when labels
+// already exist or sequence gaps are present.
+func remapTalkgroupRefsInSystemsPayload(systems []any, groupsPayload []any, tagsPayload []any, dbGroups *Groups, dbTags *Tags) {
+	if len(systems) == 0 {
+		return
+	}
+
+	groupRemap := map[uint64]uint64{}
+	for _, raw := range groupsPayload {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		label, _ := m["label"].(string)
+		if label == "" {
+			continue
+		}
+		group, ok := dbGroups.GetGroupByLabel(label)
+		if !ok {
+			continue
+		}
+		if clientId, ok := configPayloadUint64(m["id"]); ok && clientId > 0 {
+			groupRemap[clientId] = group.Id
+		}
+	}
+
+	tagRemap := map[uint64]uint64{}
+	for _, raw := range tagsPayload {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		label, _ := m["label"].(string)
+		if label == "" {
+			continue
+		}
+		tag, ok := dbTags.GetTagByLabel(label)
+		if !ok {
+			continue
+		}
+		if clientId, ok := configPayloadUint64(m["id"]); ok && clientId > 0 {
+			tagRemap[clientId] = tag.Id
+		}
+	}
+
+	for _, sysRaw := range systems {
+		sys, ok := sysRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		tgs, ok := sys["talkgroups"].([]any)
+		if !ok {
+			continue
+		}
+		for _, tgRaw := range tgs {
+			tg, ok := tgRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			if ids, ok := tg["groupIds"].([]any); ok {
+				newIds := make([]any, 0, len(ids))
+				for _, idRaw := range ids {
+					clientId, ok := configPayloadUint64(idRaw)
+					if !ok || clientId == 0 {
+						continue
+					}
+					if dbId, ok := groupRemap[clientId]; ok {
+						newIds = append(newIds, float64(dbId))
+					} else if dbId, ok := configGroupIdByPayloadLabel(groupsPayload, clientId, dbGroups); ok {
+						newIds = append(newIds, float64(dbId))
+					} else if group, ok := dbGroups.GetGroupById(clientId); ok {
+						newIds = append(newIds, float64(group.Id))
+					}
+				}
+				tg["groupIds"] = newIds
+			}
+
+			if clientTagId, ok := configPayloadUint64(tg["tagId"]); ok && clientTagId > 0 {
+				if dbId, ok := tagRemap[clientTagId]; ok {
+					tg["tagId"] = float64(dbId)
+				} else if dbId, ok := configTagIdByPayloadLabel(tagsPayload, clientTagId, dbTags); ok {
+					tg["tagId"] = float64(dbId)
+				} else if tag, ok := dbTags.GetTagById(clientTagId); ok {
+					tg["tagId"] = float64(tag.Id)
+				}
+			}
+		}
+	}
+}
+
+func configPayloadUint64(v any) (uint64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return uint64(n), true
+	case int:
+		return uint64(n), true
+	case int64:
+		return uint64(n), true
+	case uint64:
+		return n, true
+	case uint:
+		return uint64(n), true
+	default:
+		return 0, false
+	}
+}
+
+func configGroupIdByPayloadLabel(groupsPayload []any, clientId uint64, dbGroups *Groups) (uint64, bool) {
+	for _, raw := range groupsPayload {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, ok := configPayloadUint64(m["id"])
+		if !ok || id != clientId {
+			continue
+		}
+		label, _ := m["label"].(string)
+		if label == "" {
+			continue
+		}
+		if group, ok := dbGroups.GetGroupByLabel(label); ok {
+			return group.Id, true
+		}
+	}
+	return 0, false
+}
+
+func configTagIdByPayloadLabel(tagsPayload []any, clientId uint64, dbTags *Tags) (uint64, bool) {
+	for _, raw := range tagsPayload {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, ok := configPayloadUint64(m["id"])
+		if !ok || id != clientId {
+			continue
+		}
+		label, _ := m["label"].(string)
+		if label == "" {
+			continue
+		}
+		if tag, ok := dbTags.GetTagByLabel(label); ok {
+			return tag.Id, true
+		}
+	}
+	return 0, false
+}
+
 func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(r.Header.Get("upgrade"), "websocket") {
 		upgrader := websocket.Upgrader{
@@ -1391,6 +1693,9 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 
 			admin.Controller.Dirwatches.Stop()
 
+			var groupsPayload []any
+			var tagsPayload []any
+
 			switch v := m["apikeys"].(type) {
 			case []any:
 				admin.Controller.Apikeys.FromMap(v)
@@ -1401,6 +1706,8 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 					err = admin.Controller.Apikeys.Read(admin.Controller.Database)
 					if err != nil {
 						logError(err)
+					} else {
+						admin.Controller.forgetDeletedSdrtrunkKeys()
 					}
 				}
 			}
@@ -1435,6 +1742,7 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 
 			switch v := m["groups"].(type) {
 			case []any:
+				groupsPayload = v
 				admin.Controller.Groups.FromMap(v)
 				err = admin.Controller.Groups.Write(admin.Controller.Database)
 				if err != nil {
@@ -1464,17 +1772,17 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 
 						// Restart no-audio monitoring in case health alert settings changed
 						go admin.Controller.StartNoAudioMonitoringForAllSystems()
+						go admin.Controller.StartNoAudioMonitoringForAllApiKeys()
 
 						// If audio encryption is enabled and we don't have a key yet
 						// (or it was just enabled), fetch the key + client token from
 						// the relay server without requiring a server restart.
 						if admin.Controller.Options.AudioEncryptionEnabled &&
-							admin.Controller.Options.RelayServerURL != "" &&
 							admin.Controller.Options.RelayServerAPIKey != "" &&
 							len(admin.Controller.AudioKey) == 0 {
 							go func() {
 								key, fetchErr := FetchAudioKeyFromRelay(
-									admin.Controller.Options.RelayServerURL,
+									getRelayServerURL(),
 									admin.Controller.Options.RelayServerAPIKey,
 								)
 								if fetchErr != nil {
@@ -1525,6 +1833,7 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 			// Talkgroups reference tags via foreign key, so tags must exist before talkgroups are inserted
 			switch v := m["tags"].(type) {
 			case []any:
+				tagsPayload = v
 				admin.Controller.Tags.FromMap(v)
 				err = admin.Controller.Tags.Write(admin.Controller.Database)
 				if err != nil {
@@ -1552,9 +1861,8 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 					// Only patch fields that are completely absent from the payload
 					_, hasEnabled := m["noAudioAlertsEnabled"]
 					_, hasThreshold := m["noAudioThresholdMinutes"]
-					if hasEnabled && hasThreshold {
-						continue
-					}
+					_, hasRetention := m["retentionDays"]
+					_, hasDuplicateDetection := m["duplicateDetectionEnabled"]
 					// Try to find the matching existing system by id, then by systemRef
 					var existing *System
 					if idVal, ok := m["id"].(float64); ok {
@@ -1572,7 +1880,40 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 						if !hasThreshold {
 							m["noAudioThresholdMinutes"] = existing.NoAudioThresholdMinutes
 						}
+						if !hasRetention {
+							m["retentionDays"] = existing.RetentionDays
+						}
+						if !hasDuplicateDetection {
+							m["duplicateDetectionEnabled"] = existing.DuplicateDetectionEnabled
+						}
 					}
+
+					if tgs, ok := m["talkgroups"].([]any); ok && existing != nil {
+						for _, tr := range tgs {
+							tgMap, ok := tr.(map[string]any)
+							if !ok {
+								continue
+							}
+							if _, has := tgMap["retentionDays"]; has {
+								continue
+							}
+							var existingTg *Talkgroup
+							if idVal, ok := tgMap["id"].(float64); ok {
+								existingTg, _ = existing.Talkgroups.GetTalkgroupById(uint64(idVal))
+							}
+							if existingTg == nil {
+								if refVal, ok := tgMap["talkgroupRef"].(float64); ok {
+									existingTg, _ = existing.Talkgroups.GetTalkgroupByRef(uint(refVal))
+								}
+							}
+							if existingTg != nil {
+								tgMap["retentionDays"] = existingTg.RetentionDays
+							}
+						}
+					}
+				}
+				if len(groupsPayload) > 0 || len(tagsPayload) > 0 {
+					remapTalkgroupRefsInSystemsPayload(v, groupsPayload, tagsPayload, admin.Controller.Groups, admin.Controller.Tags)
 				}
 				admin.Controller.Systems.FromMap(v)
 				err = admin.Controller.Systems.Write(admin.Controller.Database)
@@ -1677,9 +2018,12 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 						existingGroup.StripeTaxRateId = getStringFromMap(groupMap, "stripeTaxRateId")
 						existingGroup.IsPublicRegistration = getBoolFromMap(groupMap, "isPublicRegistration", false)
 						existingGroup.AllowAddExistingUsers = getBoolFromMap(groupMap, "allowAddExistingUsers", false)
+						existingGroup.AutoEnableNewTalkgroups = getBoolFromMap(groupMap, "autoEnableNewTalkgroups", false)
 						if createdAt, ok := groupMap["createdAt"].(float64); ok {
 							existingGroup.CreatedAt = int64(createdAt)
 						}
+
+						existingGroup.NormalizeSystemAccess(admin.Controller.Systems)
 
 						if err := admin.Controller.UserGroups.Update(existingGroup, admin.Controller.Database); err != nil {
 							logError(fmt.Errorf("failed to update imported user group %s: %v", name, err))
@@ -1692,29 +2036,32 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 					} else {
 						// Create new group
 						group := &UserGroup{
-							Name:                  name,
-							Description:           getStringFromMap(groupMap, "description"),
-							SystemAccess:          getStringFromMap(groupMap, "systemAccess"),
-							Delay:                 int(getFloat64FromMap(groupMap, "delay")),
-							SystemDelays:          getStringFromMap(groupMap, "systemDelays"),
-							TalkgroupDelays:       getStringFromMap(groupMap, "talkgroupDelays"),
-							ConnectionLimit:       uint(getFloat64FromMap(groupMap, "connectionLimit")),
-							MaxUsers:              uint(getFloat64FromMap(groupMap, "maxUsers")),
-							BillingEnabled:        getBoolFromMap(groupMap, "billingEnabled", false),
-							StripePriceId:         getStringFromMap(groupMap, "stripePriceId"),
-							PricingOptions:        getStringFromMap(groupMap, "pricingOptions"),
-							BillingMode:           getStringFromMap(groupMap, "billingMode"),
-							CollectSalesTax:       getBoolFromMap(groupMap, "collectSalesTax", false),
-							TaxMode:               getStringFromMap(groupMap, "taxMode"),
-							StripeTaxRateId:       getStringFromMap(groupMap, "stripeTaxRateId"),
-							IsPublicRegistration:  getBoolFromMap(groupMap, "isPublicRegistration", false),
-							AllowAddExistingUsers: getBoolFromMap(groupMap, "allowAddExistingUsers", false),
+							Name:                    name,
+							Description:             getStringFromMap(groupMap, "description"),
+							SystemAccess:            getStringFromMap(groupMap, "systemAccess"),
+							Delay:                   int(getFloat64FromMap(groupMap, "delay")),
+							SystemDelays:            getStringFromMap(groupMap, "systemDelays"),
+							TalkgroupDelays:         getStringFromMap(groupMap, "talkgroupDelays"),
+							ConnectionLimit:         uint(getFloat64FromMap(groupMap, "connectionLimit")),
+							MaxUsers:                uint(getFloat64FromMap(groupMap, "maxUsers")),
+							BillingEnabled:          getBoolFromMap(groupMap, "billingEnabled", false),
+							StripePriceId:           getStringFromMap(groupMap, "stripePriceId"),
+							PricingOptions:          getStringFromMap(groupMap, "pricingOptions"),
+							BillingMode:             getStringFromMap(groupMap, "billingMode"),
+							CollectSalesTax:         getBoolFromMap(groupMap, "collectSalesTax", false),
+							TaxMode:                 getStringFromMap(groupMap, "taxMode"),
+							StripeTaxRateId:         getStringFromMap(groupMap, "stripeTaxRateId"),
+							IsPublicRegistration:    getBoolFromMap(groupMap, "isPublicRegistration", false),
+							AllowAddExistingUsers:   getBoolFromMap(groupMap, "allowAddExistingUsers", false),
+							AutoEnableNewTalkgroups: getBoolFromMap(groupMap, "autoEnableNewTalkgroups", false),
 						}
 						if createdAt, ok := groupMap["createdAt"].(float64); ok {
 							group.CreatedAt = int64(createdAt)
 						} else {
 							group.CreatedAt = time.Now().Unix()
 						}
+
+						group.NormalizeSystemAccess(admin.Controller.Systems)
 
 						if err := admin.Controller.UserGroups.Add(group, admin.Controller.Database); err != nil {
 							logError(fmt.Errorf("failed to import user group %s: %v", name, err))
@@ -1850,7 +2197,12 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 						existingUser.UserGroupId = actualUserGroupId
 						existingUser.IsGroupAdmin = getBoolFromMap(userMap, "isGroupAdmin", false)
 						existingUser.SystemAdmin = getBoolFromMap(userMap, "systemAdmin", false)
+						existingUser.PushSystemNoAudioAlerts = getBoolFromMap(userMap, "pushSystemNoAudioAlerts", false)
+						existingUser.PushApiKeyNoAudioAlerts = getBoolFromMap(userMap, "pushApiKeyNoAudioAlerts", false)
+						existingUser.SystemNoAudioAlertSystems = getStringFromMap(userMap, "systemNoAudioAlertSystems")
+						existingUser.ApiKeyNoAudioAlertApiKeys = getStringFromMap(userMap, "apiKeyNoAudioAlertApiKeys")
 						existingUser.ForcePasswordReset = getBoolFromMap(userMap, "forcePasswordReset", false)
+						existingUser.Suspended = getBoolFromMap(userMap, "suspended", false)
 						existingUser.PinExpiresAt = getUint64FromMap(userMap, "pinExpiresAt")
 						existingUser.ConnectionLimit = uint(getFloat64FromMap(userMap, "connectionLimit"))
 						existingUser.Systems = getStringFromMap(userMap, "systems")
@@ -1895,8 +2247,13 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 							Verified:             getBoolFromMap(userMap, "verified", false),
 							UserGroupId:          actualUserGroupId,
 							IsGroupAdmin:         getBoolFromMap(userMap, "isGroupAdmin", false),
-							SystemAdmin:          getBoolFromMap(userMap, "systemAdmin", false),
-							ForcePasswordReset:   getBoolFromMap(userMap, "forcePasswordReset", false),
+							SystemAdmin:             getBoolFromMap(userMap, "systemAdmin", false),
+							PushSystemNoAudioAlerts: getBoolFromMap(userMap, "pushSystemNoAudioAlerts", false),
+							PushApiKeyNoAudioAlerts: getBoolFromMap(userMap, "pushApiKeyNoAudioAlerts", false),
+							SystemNoAudioAlertSystems: getStringFromMap(userMap, "systemNoAudioAlertSystems"),
+							ApiKeyNoAudioAlertApiKeys: getStringFromMap(userMap, "apiKeyNoAudioAlertApiKeys"),
+							ForcePasswordReset:      getBoolFromMap(userMap, "forcePasswordReset", false),
+							Suspended:               getBoolFromMap(userMap, "suspended", false),
 							Pin:                  getStringFromMap(userMap, "pin"),
 							PinExpiresAt:         getUint64FromMap(userMap, "pinExpiresAt"),
 							ConnectionLimit:      uint(getFloat64FromMap(userMap, "connectionLimit")),
@@ -2134,8 +2491,8 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 						}
 
 						importedUserId := uint64(getFloat64FromMap(tokenMap, "userId"))
-						token := getStringFromMap(tokenMap, "token")
-						if importedUserId == 0 || token == "" {
+						token, fcmToken, pushType := normalizeImportedDeviceTokenFields(tokenMap)
+						if importedUserId == 0 || (token == "" && fcmToken == "") {
 							continue
 						}
 
@@ -2149,6 +2506,9 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 
 						platform := getStringFromMap(tokenMap, "platform")
 						sound := getStringFromMap(tokenMap, "sound")
+						if sound == "" {
+							sound = "startup.wav"
+						}
 						createdAt := int64(getFloat64FromMap(tokenMap, "createdAt"))
 						lastUsed := int64(getFloat64FromMap(tokenMap, "lastUsed"))
 						if createdAt == 0 {
@@ -2158,34 +2518,23 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 							lastUsed = createdAt
 						}
 
-						if admin.Controller.Database.Config.DbType == DbTypePostgresql {
-							query := `INSERT INTO "deviceTokens" ("userId", "token", "platform", "sound", "createdAt", "lastUsed") VALUES ($1, $2, $3, $4, $5, $6)`
-							if _, err := admin.Controller.Database.Sql.Exec(query, actualUserId, token, platform, sound, createdAt, lastUsed); err != nil {
-								logError(fmt.Errorf("failed to import device token for userId=%d (mapped from %d): %v", actualUserId, importedUserId, err))
-							}
-						} else {
-							query := `INSERT INTO "deviceTokens" ("userId", "token", "platform", "sound", "createdAt", "lastUsed") VALUES (?, ?, ?, ?, ?, ?)`
-							if _, err := admin.Controller.Database.Sql.Exec(query, actualUserId, token, platform, sound, createdAt, lastUsed); err != nil {
-								logError(fmt.Errorf("failed to import device token for userId=%d (mapped from %d): %v", actualUserId, importedUserId, err))
-							}
+						var fcmTokenArg, pushTypeArg *string
+						if fcmToken != "" {
+							fcmTokenArg = &fcmToken
+						}
+						if pushType != "" {
+							pushTypeArg = &pushType
+						}
+
+						query := `INSERT INTO "deviceTokens" ("userId", "token", "fcmToken", "pushType", "platform", "sound", "createdAt", "lastUsed") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+						if _, err := admin.Controller.Database.Sql.Exec(query, actualUserId, token, fcmTokenArg, pushTypeArg, platform, sound, createdAt, lastUsed); err != nil {
+							logError(fmt.Errorf("failed to import device token for userId=%d (mapped from %d): %v", actualUserId, importedUserId, err))
 						}
 					}
 
-					// Reload device tokens into memory
-					admin.Controller.DeviceTokens.mutex.Lock()
-					admin.Controller.DeviceTokens.tokens = make(map[uint64]*DeviceToken)
-					query := `SELECT "deviceTokenId", "userId", "token", "platform", "sound", "createdAt", "lastUsed" FROM "deviceTokens"`
-					rows, err := admin.Controller.Database.Sql.Query(query)
-					if err == nil {
-						defer rows.Close()
-						for rows.Next() {
-							var dt DeviceToken
-							if err := rows.Scan(&dt.Id, &dt.UserId, &dt.Token, &dt.Platform, &dt.Sound, &dt.CreatedAt, &dt.LastUsed); err == nil {
-								admin.Controller.DeviceTokens.tokens[dt.Id] = &dt
-							}
-						}
+					if err := admin.Controller.DeviceTokens.Load(admin.Controller.Database); err != nil {
+						logError(fmt.Errorf("failed to reload device tokens after import: %v", err))
 					}
-					admin.Controller.DeviceTokens.mutex.Unlock()
 				}
 			} // End isFullImport check for userAlertPreferences and deviceTokens
 
@@ -2196,7 +2545,13 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 			// Sync config to file if enabled
 			admin.Controller.SyncConfigToFile()
 
-			admin.SendConfig(w)
+			extras := map[string]any{}
+			if isFullImport {
+				summary := admin.buildConfigImportSummary(m)
+				extras["importSummary"] = summary
+				extras["importSummaryMessage"] = formatImportSummaryMessage(summary)
+			}
+			admin.writeConfigResponse(w, extras)
 
 			admin.Controller.Logs.LogEvent(LogLevelWarn, "configuration changed")
 
@@ -2204,6 +2559,684 @@ func (admin *Admin) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}
+}
+
+// OptionsPatchHandler is the API-driven entry point for the admin Options screens.
+// It accepts a partial JSON object of option keys and persists only those keys,
+// leaving every other option untouched, then broadcasts the new config to live
+// clients via EmitConfig (same mechanism the old whole-config save used).
+//
+//	PATCH /api/admin/options   body: { "<optionKey>": <value>, ... }
+//	PATCH /api/admin/options?compact=1  same, but responds with only
+//	  { "ok": true, "version": "...", "options": { ...masked options... } }
+//	  instead of the entire config (used by Central Management bulk pushes).
+//	GET   /api/admin/options   -> { "version": "...", "options": { ...masked options... } }
+//	  Credentials are never returned; they appear as {"set": true|false}.
+func (admin *Admin) OptionsPatchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch && r.Method != http.MethodPost && r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		masked, err := admin.Controller.Options.MaskedMap()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"version": Version, "options": masked})
+		return
+	}
+
+	partial := map[string]any{}
+	if err := json.NewDecoder(r.Body).Decode(&partial); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	if len(partial) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no option keys provided"})
+		return
+	}
+
+	// Guard: refuse to disable password login when no system admin exists, so the
+	// operator cannot lock themselves out (mirrors the whole-config save guard).
+	if v, ok := partial["adminPasswordLoginDisabled"].(bool); ok && v {
+		if !admin.Controller.Users.HasSystemAdmin() {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "cannot disable password login: no system administrator user exists",
+			})
+			return
+		}
+	}
+
+	// Guard: reject an unknown timezone or malformed prune time instead of silently
+	// dropping it (options.FromMap would otherwise reset the field).
+	if v, present := partial["timeZone"]; present {
+		str, isStr := v.(string)
+		if !isStr || !validTimeZone(str) {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "timeZone must be empty or a valid IANA zone such as America/Chicago"})
+			return
+		}
+	}
+	if v, present := partial["pruneTime"]; present {
+		str, isStr := v.(string)
+		if _, ok := normalizePruneTime(str); !isStr || !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "pruneTime must be empty or a 24-hour time such as 03:30"})
+			return
+		}
+	}
+
+	// Guard: Turnstile cannot be enabled without both site and secret keys (issue #259).
+	if enabled, ok := partial["turnstileEnabled"].(bool); ok && enabled {
+		siteKey := strings.TrimSpace(admin.Controller.Options.TurnstileSiteKey)
+		secretKey := strings.TrimSpace(admin.Controller.Options.TurnstileSecretKey)
+		if v, ok := partial["turnstileSiteKey"].(string); ok {
+			siteKey = strings.TrimSpace(v)
+		}
+		if v, ok := partial["turnstileSecretKey"].(string); ok {
+			secretKey = strings.TrimSpace(v)
+		}
+		if siteKey == "" || secretKey == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Cloudflare Turnstile requires both a site key and a secret key",
+			})
+			return
+		}
+	}
+
+	admin.mutex.Lock()
+	err := admin.Controller.Options.ApplyPartial(admin.Controller.Database, partial)
+	admin.mutex.Unlock()
+
+	if err != nil {
+		admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.options.patch: %s", err.Error()))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	admin.Controller.ApplyOptionsRuntimeSideEffects(partial)
+
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
+
+	admin.Controller.Logs.LogEvent(LogLevelInfo, "options changed")
+
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Query().Get("compact") == "1" {
+		masked, merr := admin.Controller.Options.MaskedMap()
+		if merr != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": merr.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": Version, "options": masked})
+		return
+	}
+	admin.SendConfig(w)
+}
+
+// ApikeysHandler is the API-driven endpoint for the admin API Keys screen.
+//
+//	GET /api/admin/apikeys        -> { "apikeys": [...] }
+//	PUT /api/admin/apikeys        body: [...]  (full list; replaces + diffs)
+//
+// The PUT path reuses the same FromMap/Write/Read collection logic the old
+// whole-config save used, then broadcasts the new config to live clients.
+func (admin *Admin) ApikeysHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]any{"apikeys": admin.Controller.Apikeys.List})
+
+	case http.MethodPut:
+		var list []any
+		if err := json.NewDecoder(r.Body).Decode(&list); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		admin.mutex.Lock()
+		admin.Controller.Apikeys.FromMap(list)
+		err := admin.Controller.Apikeys.Write(admin.Controller.Database)
+		if err == nil {
+			err = admin.Controller.Apikeys.Read(admin.Controller.Database)
+		}
+		if err == nil {
+			admin.Controller.forgetDeletedSdrtrunkKeys()
+		}
+		admin.mutex.Unlock()
+
+		if err != nil {
+			admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.apikeys.put: %s", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		go admin.Controller.EmitConfig()
+		admin.Controller.SyncConfigToFile()
+
+		go admin.Controller.StartNoAudioMonitoringForAllApiKeys()
+
+		json.NewEncoder(w).Encode(map[string]any{"apikeys": admin.Controller.Apikeys.List})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// TagsHandler is the API-driven endpoint for the admin Tags screen.
+//
+//	GET /api/admin/tags    -> { "tags": [...] }
+//	PUT /api/admin/tags    body: [...]  (full list)
+func (admin *Admin) TagsHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]any{"tags": admin.Controller.Tags.List})
+
+	case http.MethodPut:
+		var list []any
+		if err := json.NewDecoder(r.Body).Decode(&list); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		admin.mutex.Lock()
+		admin.Controller.Tags.FromMap(list)
+		err := admin.Controller.Tags.Write(admin.Controller.Database)
+		if err == nil {
+			err = admin.Controller.Tags.Read(admin.Controller.Database)
+		}
+		admin.mutex.Unlock()
+
+		if err != nil {
+			admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.tags.put: %s", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		go admin.Controller.EmitConfig()
+		admin.Controller.SyncConfigToFile()
+
+		json.NewEncoder(w).Encode(map[string]any{"tags": admin.Controller.Tags.List})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// GroupsConfigHandler is the API-driven endpoint for the admin (talkgroup) Groups screen.
+// Named to avoid collision with the user-group handlers under /api/admin/groups.
+//
+//	GET /api/admin/talkgroup-groups    -> { "groups": [...] }
+//	PUT /api/admin/talkgroup-groups    body: [...]  (full list)
+func (admin *Admin) GroupsConfigHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]any{"groups": admin.Controller.Groups.List})
+
+	case http.MethodPut:
+		var list []any
+		if err := json.NewDecoder(r.Body).Decode(&list); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		admin.mutex.Lock()
+		admin.Controller.Groups.FromMap(list)
+		err := admin.Controller.Groups.Write(admin.Controller.Database)
+		if err == nil {
+			err = admin.Controller.Groups.Read(admin.Controller.Database)
+		}
+		admin.mutex.Unlock()
+
+		if err != nil {
+			admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.groups.put: %s", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		go admin.Controller.EmitConfig()
+		admin.Controller.SyncConfigToFile()
+
+		json.NewEncoder(w).Encode(map[string]any{"groups": admin.Controller.Groups.List})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// DownstreamsHandler is the API-driven endpoint for the admin Downstreams screen.
+//
+//	GET /api/admin/downstreams    -> { "downstreams": [...] }
+//	PUT /api/admin/downstreams    body: [...]  (full list)
+func (admin *Admin) DownstreamsHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]any{"downstreams": admin.Controller.Downstreams.List})
+
+	case http.MethodPut:
+		var list []any
+		if err := json.NewDecoder(r.Body).Decode(&list); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		admin.mutex.Lock()
+		admin.Controller.Downstreams.FromMap(list)
+		err := admin.Controller.Downstreams.Write(admin.Controller.Database)
+		if err == nil {
+			err = admin.Controller.Downstreams.Read(admin.Controller.Database)
+		}
+		admin.mutex.Unlock()
+
+		if err != nil {
+			admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.downstreams.put: %s", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		go admin.Controller.EmitConfig()
+		admin.Controller.SyncConfigToFile()
+
+		json.NewEncoder(w).Encode(map[string]any{"downstreams": admin.Controller.Downstreams.List})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// DirwatchConfigHandler is the API-driven endpoint for the admin Dirwatch screen.
+// Like the whole-config save, it stops the watchers before writing and restarts
+// them afterwards so the new directory watches take effect immediately.
+//
+//	GET /api/admin/dirwatch    -> { "dirwatch": [...] }
+//	PUT /api/admin/dirwatch    body: [...]  (full list)
+func (admin *Admin) DirwatchConfigHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]any{"dirwatch": admin.Controller.Dirwatches.List})
+
+	case http.MethodPut:
+		var list []any
+		if err := json.NewDecoder(r.Body).Decode(&list); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		admin.mutex.Lock()
+		admin.Controller.Dirwatches.Stop()
+		admin.Controller.Dirwatches.FromMap(list)
+		err := admin.Controller.Dirwatches.Write(admin.Controller.Database)
+		if err == nil {
+			err = admin.Controller.Dirwatches.Read(admin.Controller.Database)
+		}
+		admin.Controller.Dirwatches.Start(admin.Controller)
+		admin.mutex.Unlock()
+
+		if err != nil {
+			admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.dirwatch.put: %s", err.Error()))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		go admin.Controller.EmitConfig()
+		admin.Controller.SyncConfigToFile()
+
+		json.NewEncoder(w).Encode(map[string]any{"dirwatch": admin.Controller.Dirwatches.List})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// SystemSaveHandler is the API-driven endpoint for saving a SINGLE system.
+//
+//	PUT/POST /api/admin/systems/save   body: { ...one system... }
+//
+// Saving one system at a time is required because the admin UI lazily loads a
+// system's talkgroups only when it is opened. The opened system is therefore the
+// only one guaranteed to be fully populated, so we merge just that system into the
+// existing in-memory list (preserving every other system's talkgroups untouched),
+// then persist + broadcast. Mirrors the no-audio-preservation + ID-lookups-reload
+// behaviour of the old whole-config save.
+func (admin *Admin) SystemSaveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	incoming := map[string]any{}
+	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	// Resolve the existing system (by id, then systemRef) to preserve the
+	// System Health no-audio settings when the payload omits them.
+	var existing *System
+	if idVal, ok := incoming["id"].(float64); ok && idVal > 0 {
+		existing, _ = admin.Controller.Systems.GetSystemById(uint64(idVal))
+	}
+	if existing == nil {
+		if refVal, ok := incoming["systemRef"].(float64); ok {
+			existing, _ = admin.Controller.Systems.GetSystemByRef(uint(refVal))
+		}
+	}
+	if existing != nil {
+		if _, has := incoming["noAudioAlertsEnabled"]; !has {
+			incoming["noAudioAlertsEnabled"] = existing.NoAudioAlertsEnabled
+		}
+		if _, has := incoming["noAudioThresholdMinutes"]; !has {
+			incoming["noAudioThresholdMinutes"] = existing.NoAudioThresholdMinutes
+		}
+		if _, has := incoming["retentionDays"]; !has {
+			incoming["retentionDays"] = existing.RetentionDays
+		}
+		if _, has := incoming["duplicateDetectionEnabled"]; !has {
+			incoming["duplicateDetectionEnabled"] = existing.DuplicateDetectionEnabled
+		}
+
+		if tgs, ok := incoming["talkgroups"].([]any); ok {
+			for _, tr := range tgs {
+				tgMap, ok := tr.(map[string]any)
+				if !ok {
+					continue
+				}
+				if _, has := tgMap["retentionDays"]; has {
+					continue
+				}
+				var existingTg *Talkgroup
+				if idVal, ok := tgMap["id"].(float64); ok {
+					existingTg, _ = existing.Talkgroups.GetTalkgroupById(uint64(idVal))
+				}
+				if existingTg == nil {
+					if refVal, ok := tgMap["talkgroupRef"].(float64); ok {
+						existingTg, _ = existing.Talkgroups.GetTalkgroupByRef(uint(refVal))
+					}
+				}
+				if existingTg != nil {
+					tgMap["retentionDays"] = existingTg.RetentionDays
+				}
+			}
+		}
+	}
+
+	admin.mutex.Lock()
+
+	// Serialize the current list, replace/insert the one system, rebuild via FromMap.
+	currentJSON, err := json.Marshal(admin.Controller.Systems.List)
+	if err == nil {
+		var arr []any
+		if err = json.Unmarshal(currentJSON, &arr); err == nil {
+			replaced := false
+			if idVal, ok := incoming["id"].(float64); ok && idVal > 0 {
+				for i, r := range arr {
+					if m, ok := r.(map[string]any); ok {
+						if mid, ok := m["id"].(float64); ok && mid == idVal {
+							arr[i] = incoming
+							replaced = true
+							break
+						}
+					}
+				}
+			}
+			if !replaced {
+				arr = append(arr, incoming)
+			}
+
+			admin.Controller.Systems.FromMap(arr)
+			err = admin.Controller.Systems.Write(admin.Controller.Database)
+			if err == nil {
+				err = admin.Controller.Systems.Read(admin.Controller.Database)
+				if err == nil {
+					if e := admin.Controller.IdLookupsCache.Read(admin.Controller.Database); e != nil {
+						admin.Controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to reload ID lookups cache: %v", e))
+					}
+				}
+			} else {
+				// Restore a clean in-memory state after a failed write.
+				if readErr := admin.Controller.Systems.Read(admin.Controller.Database); readErr != nil {
+					admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.systems.save.recover: %s", readErr.Error()))
+				}
+			}
+		}
+	}
+
+	admin.mutex.Unlock()
+
+	if err != nil {
+		admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.systems.save: %s", err.Error()))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"systems": admin.Controller.Systems.List})
+}
+
+// SystemsOrderHandler updates only the display order of systems (admin Systems list drag-reorder).
+//
+//	PUT /api/admin/systems/order   body: [{ "id": 1, "order": 1 }, ...]
+func (admin *Admin) SystemsOrderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var items []struct {
+		Id    uint64 `json:"id"`
+		Order uint   `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+		return
+	}
+	if len(items) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "empty order list"})
+		return
+	}
+
+	byID := make(map[uint64]uint, len(items))
+	for _, item := range items {
+		if item.Id == 0 {
+			continue
+		}
+		byID[item.Id] = item.Order
+	}
+	if len(byID) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no valid system ids"})
+		return
+	}
+
+	admin.mutex.Lock()
+	updated := 0
+	for _, sys := range admin.Controller.Systems.List {
+		if sys == nil {
+			continue
+		}
+		if order, ok := byID[sys.Id]; ok {
+			sys.Order = order
+			updated++
+		}
+	}
+	var err error
+	if updated > 0 {
+		err = admin.Controller.Systems.Write(admin.Controller.Database)
+		if err == nil {
+			err = admin.Controller.Systems.Read(admin.Controller.Database)
+		}
+	}
+	admin.mutex.Unlock()
+
+	if err != nil {
+		admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.systems.order: %s", err.Error()))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"systems": admin.Controller.Systems.List})
+}
+
+// SystemDeleteHandler deletes a SINGLE system by id.
+//
+//	DELETE /api/admin/systems/delete/{id}
+func (admin *Admin) SystemDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/admin/systems/delete/")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || id == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid system id"})
+		return
+	}
+
+	admin.mutex.Lock()
+
+	currentJSON, mErr := json.Marshal(admin.Controller.Systems.List)
+	if mErr == nil {
+		var arr []any
+		if mErr = json.Unmarshal(currentJSON, &arr); mErr == nil {
+			filtered := make([]any, 0, len(arr))
+			for _, r := range arr {
+				if m, ok := r.(map[string]any); ok {
+					if mid, ok := m["id"].(float64); ok && uint64(mid) == id {
+						continue
+					}
+				}
+				filtered = append(filtered, r)
+			}
+
+			admin.Controller.Systems.FromMap(filtered)
+			mErr = admin.Controller.Systems.Write(admin.Controller.Database)
+			if mErr == nil {
+				mErr = admin.Controller.Systems.Read(admin.Controller.Database)
+				if mErr == nil {
+					if e := admin.Controller.IdLookupsCache.Read(admin.Controller.Database); e != nil {
+						admin.Controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to reload ID lookups cache: %v", e))
+					}
+				}
+			} else {
+				if readErr := admin.Controller.Systems.Read(admin.Controller.Database); readErr != nil {
+					admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.systems.delete.recover: %s", readErr.Error()))
+				}
+			}
+		}
+	}
+
+	admin.mutex.Unlock()
+
+	if mErr != nil {
+		admin.Controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("admin.systems.delete: %s", mErr.Error()))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": mErr.Error()})
+		return
+	}
+
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"systems": admin.Controller.Systems.List})
 }
 
 func (admin *Admin) StripeSyncHandler(w http.ResponseWriter, r *http.Request) {
@@ -2363,9 +3396,15 @@ func (admin *Admin) GetConfig() map[string]any {
 			"pinExpiresAt":         user.PinExpiresAt,
 			"connectionLimit":      user.ConnectionLimit,
 			"userGroupId":          user.UserGroupId,
+			"userGroupIds":         user.GroupIds(),
 			"isGroupAdmin":         user.IsGroupAdmin,
 			"systemAdmin":          user.SystemAdmin,
+			"pushSystemNoAudioAlerts": user.PushSystemNoAudioAlerts,
+			"pushApiKeyNoAudioAlerts": user.PushApiKeyNoAudioAlerts,
+			"systemNoAudioAlertSystems": user.SystemNoAudioAlertSystems,
+			"apiKeyNoAudioAlertApiKeys": user.ApiKeyNoAudioAlertApiKeys,
 			"forcePasswordReset":   user.ForcePasswordReset,
+			"suspended":            user.Suspended,
 			"stripeCustomerId":     user.StripeCustomerId,
 			"stripeSubscriptionId": user.StripeSubscriptionId,
 			"subscriptionStatus":   user.SubscriptionStatus,
@@ -2378,25 +3417,26 @@ func (admin *Admin) GetConfig() map[string]any {
 	userGroupList := make([]map[string]any, 0, len(userGroups))
 	for _, group := range userGroups {
 		userGroupList = append(userGroupList, map[string]any{
-			"id":                    group.Id,
-			"name":                  group.Name,
-			"description":           group.Description,
-			"systemAccess":          group.SystemAccess,
-			"delay":                 group.Delay,
-			"systemDelays":          group.SystemDelays,
-			"talkgroupDelays":       group.TalkgroupDelays,
-			"connectionLimit":       group.ConnectionLimit,
-			"maxUsers":              group.MaxUsers,
-			"billingEnabled":        group.BillingEnabled,
-			"stripePriceId":         group.StripePriceId,
-			"pricingOptions":        group.PricingOptions,
-			"billingMode":           group.BillingMode,
-			"collectSalesTax":       group.CollectSalesTax,
-			"taxMode":               group.TaxMode,
-			"stripeTaxRateId":       group.StripeTaxRateId,
-			"isPublicRegistration":  group.IsPublicRegistration,
-			"allowAddExistingUsers": group.AllowAddExistingUsers,
-			"createdAt":             group.CreatedAt,
+			"id":                      group.Id,
+			"name":                    group.Name,
+			"description":             group.Description,
+			"systemAccess":            group.SystemAccess,
+			"delay":                   group.Delay,
+			"systemDelays":            group.SystemDelays,
+			"talkgroupDelays":         group.TalkgroupDelays,
+			"connectionLimit":         group.ConnectionLimit,
+			"maxUsers":                group.MaxUsers,
+			"billingEnabled":          group.BillingEnabled,
+			"stripePriceId":           group.StripePriceId,
+			"pricingOptions":          group.PricingOptions,
+			"billingMode":             group.BillingMode,
+			"collectSalesTax":         group.CollectSalesTax,
+			"taxMode":                 group.TaxMode,
+			"stripeTaxRateId":         group.StripeTaxRateId,
+			"isPublicRegistration":    group.IsPublicRegistration,
+			"allowAddExistingUsers":   group.AllowAddExistingUsers,
+			"autoEnableNewTalkgroups": group.AutoEnableNewTalkgroups,
+			"createdAt":               group.CreatedAt,
 		})
 	}
 
@@ -2407,7 +3447,9 @@ func (admin *Admin) GetConfig() map[string]any {
 		deviceTokenList = append(deviceTokenList, map[string]any{
 			"id":        token.Id,
 			"userId":    token.UserId,
-			"token":     token.Token, // Legacy field (kept for reference)
+			"token":     token.Token,
+			"fcmToken":  token.FCMToken,
+			"pushType":  token.PushType,
 			"platform":  token.Platform,
 			"sound":     token.Sound,
 			"createdAt": token.CreatedAt,
@@ -2510,6 +3552,30 @@ func (admin *Admin) GetConfig() map[string]any {
 		"userAlertPreferences": userAlertPrefList,
 		"version":              Version,
 	}
+}
+
+func (admin *Admin) LogsCategoriesHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	b, err := json.Marshal(map[string]any{
+		"categories": LogCategoryInfoForAdmin(admin.Controller.Options.CentralManagementEnabled),
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusExpectationFailed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
 }
 
 func (admin *Admin) LogsHandler(w http.ResponseWriter, r *http.Request) {
@@ -2748,13 +3814,8 @@ func (admin *Admin) SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply the same IP restrictions as the normal admin login
 	clientIP := GetClientIP(r)
-	if !admin.isAdminIPAllowed(clientIP) {
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Admin access denied: your IP address is not on the admin allow list"})
-		return
-	}
+	remoteAddr := GetRemoteAddr(r)
 
 	var body struct {
 		Pin string `json:"pin"`
@@ -2762,6 +3823,27 @@ func (admin *Admin) SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Pin == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "pin is required"})
+		return
+	}
+
+	admin.mutex.Lock()
+	attempt := admin.Attempts[remoteAddr]
+	if attempt == nil {
+		admin.Attempts[remoteAddr] = &AdminLoginAttempt{Count: 1, Date: time.Now()}
+		attempt = admin.Attempts[remoteAddr]
+	} else if time.Since(attempt.Date) > admin.AttemptsMaxDelay {
+		attempt.Count = 1
+		attempt.Date = time.Now()
+	} else {
+		attempt.Count++
+		attempt.Date = time.Now()
+	}
+	lockedOut := attempt.Count > admin.AttemptsMax
+	admin.mutex.Unlock()
+	if lockedOut {
+		admin.Controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("admin: SSO login locked out from %s", clientIP))
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{"error": "too many attempts, try again later"})
 		return
 	}
 
@@ -2778,6 +3860,13 @@ func (admin *Admin) SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
 		admin.Controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("admin: SSO login denied for user %s — not a system admin", user.Email))
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{"error": "user is not a system administrator"})
+		return
+	}
+
+	if user.IsSuspended() {
+		admin.Controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("admin: SSO login denied for user %s — account suspended", user.Email))
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"error": "account suspended"})
 		return
 	}
 
@@ -2800,6 +3889,7 @@ func (admin *Admin) SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		admin.Tokens = append(admin.Tokens[1:], sToken)
 	}
+	delete(admin.Attempts, remoteAddr)
 	admin.mutex.Unlock()
 
 	admin.Controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("admin: SSO login granted for system admin %s from %s", user.Email, clientIP))
@@ -3022,25 +4112,7 @@ func (admin *Admin) PasswordHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (admin *Admin) SendConfig(w http.ResponseWriter) {
-	var m map[string]any
-	_, docker := os.LookupEnv("DOCKER")
-	if docker {
-		m = map[string]any{
-			"config":             admin.GetConfig(),
-			"docker":             docker,
-			"passwordNeedChange": admin.Controller.Options.adminPasswordNeedChange,
-		}
-	} else {
-		m = map[string]any{
-			"config":             admin.GetConfig(),
-			"passwordNeedChange": admin.Controller.Options.adminPasswordNeedChange,
-		}
-	}
-	if b, err := json.Marshal(m); err == nil {
-		w.Write(b)
-	} else {
-		w.WriteHeader(http.StatusExpectationFailed)
-	}
+	admin.writeConfigResponse(w, nil)
 }
 
 func (admin *Admin) Start() error {
@@ -4357,61 +5429,35 @@ func (v *rrSiteImportID) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// RadioReferenceImportToSystemHandler directly writes RR talkgroups or sites into a local
-// system, creating any missing groups/tags in the database on the fly.
-func (admin *Admin) RadioReferenceImportToSystemHandler(w http.ResponseWriter, r *http.Request) {
-	t := admin.GetAuthorization(r)
-	if !admin.ValidateToken(t) {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+type radioReferenceImportBody struct {
+	SystemId   float64 `json:"systemId"`
+	Talkgroups []struct {
+		Id          float64 `json:"id"`
+		AlphaTag    string  `json:"alphaTag"`
+		Description string  `json:"description"`
+		Group       string  `json:"group"`
+		Tag         string  `json:"tag"`
+		Enc         float64 `json:"enc"`
+	} `json:"talkgroups"`
+	Sites []struct {
+		Id          rrSiteImportID `json:"id"`
+		Name        string         `json:"name"`
+		Rfss        float64        `json:"rfss"`
+		Frequencies []float64      `json:"frequencies"`
+	} `json:"sites"`
+}
 
-	var body struct {
-		SystemId   float64 `json:"systemId"`
-		Talkgroups []struct {
-			Id          float64 `json:"id"`
-			AlphaTag    string  `json:"alphaTag"`
-			Description string  `json:"description"`
-			Group       string  `json:"group"`
-			Tag         string  `json:"tag"`
-			Enc         float64 `json:"enc"`
-		} `json:"talkgroups"`
-		Sites []struct {
-			Id          rrSiteImportID `json:"id"`
-			Name        string         `json:"name"`
-			Rfss        float64        `json:"rfss"`
-			Frequencies []float64      `json:"frequencies"`
-		} `json:"sites"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
-		return
-	}
+func (admin *Admin) radioReferenceImportToSystemCore(body radioReferenceImportBody) (created, updated int, err error) {
 	if body.SystemId == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "systemId is required (select a target system in the import UI)"})
-		return
+		return 0, 0, fmt.Errorf("systemId is required")
 	}
-
 	ctrl := admin.Controller
 	systemId := uint64(body.SystemId)
-
 	system, ok := ctrl.Systems.GetSystemById(systemId)
 	if !ok {
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "system not found"})
-		return
+		return 0, 0, fmt.Errorf("system not found")
 	}
 
-	created := 0
-	updated := 0
-
-	// ── Talkgroups ────────────────────────────────────────────────────────────
 	for _, tg := range body.Talkgroups {
 		groupLabel := tg.Group
 		if groupLabel == "" {
@@ -4428,20 +5474,14 @@ func (admin *Admin) RadioReferenceImportToSystemHandler(w http.ResponseWriter, r
 			group = &Group{Label: groupLabel}
 			ctrl.Groups.List = append(ctrl.Groups.List, group)
 			if err := ctrl.Groups.Write(ctrl.Database); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "failed to write group: " + err.Error()})
-				return
+				return created, updated, fmt.Errorf("failed to write group: %w", err)
 			}
 			if err := ctrl.Groups.Read(ctrl.Database); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "failed to read groups: " + err.Error()})
-				return
+				return created, updated, fmt.Errorf("failed to read groups: %w", err)
 			}
 			group, ok = ctrl.Groups.GetGroupByLabel(groupLabel)
 			if !ok {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "group disappeared after write: " + groupLabel})
-				return
+				return created, updated, fmt.Errorf("group disappeared after write: %s", groupLabel)
 			}
 		}
 
@@ -4451,20 +5491,14 @@ func (admin *Admin) RadioReferenceImportToSystemHandler(w http.ResponseWriter, r
 			tag = &Tag{Label: tagLabel}
 			ctrl.Tags.List = append(ctrl.Tags.List, tag)
 			if err := ctrl.Tags.Write(ctrl.Database); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "failed to write tag: " + err.Error()})
-				return
+				return created, updated, fmt.Errorf("failed to write tag: %w", err)
 			}
 			if err := ctrl.Tags.Read(ctrl.Database); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "failed to read tags: " + err.Error()})
-				return
+				return created, updated, fmt.Errorf("failed to read tags: %w", err)
 			}
 			tag, ok = ctrl.Tags.GetTagByLabel(tagLabel)
 			if !ok {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "tag disappeared after write: " + tagLabel})
-				return
+				return created, updated, fmt.Errorf("tag disappeared after write: %s", tagLabel)
 			}
 		}
 
@@ -4527,19 +5561,62 @@ func (admin *Admin) RadioReferenceImportToSystemHandler(w http.ResponseWriter, r
 		}
 	}
 
-	// ── Persist ───────────────────────────────────────────────────────────────
 	if err := ctrl.Systems.Write(ctrl.Database); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "failed to write systems: " + err.Error()})
-		return
+		return created, updated, fmt.Errorf("failed to write systems: %w", err)
 	}
 	if err := ctrl.Systems.Read(ctrl.Database); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "failed to read systems: " + err.Error()})
+		return created, updated, fmt.Errorf("failed to read systems: %w", err)
+	}
+	ctrl.SyncConfigToFile()
+	return created, updated, nil
+}
+
+func (admin *Admin) radioReferenceImportToSystemFromJSON(payloadJSON []byte) (created, updated int, err error) {
+	var body radioReferenceImportBody
+	if err = json.Unmarshal(payloadJSON, &body); err != nil {
+		return 0, 0, err
+	}
+	return admin.radioReferenceImportToSystemCore(body)
+}
+
+// RadioReferenceImportToSystemHandler directly writes RR talkgroups or sites into a local
+// system, creating any missing groups/tags in the database on the fly.
+func (admin *Admin) RadioReferenceImportToSystemHandler(w http.ResponseWriter, r *http.Request) {
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	ctrl.SyncConfigToFile()
+	var body radioReferenceImportBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	if body.SystemId == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "systemId is required (select a target system in the import UI)"})
+		return
+	}
+
+	created, updated, err := admin.radioReferenceImportToSystemCore(body)
+	if err != nil {
+		switch err.Error() {
+		case "system not found":
+			w.WriteHeader(http.StatusNotFound)
+		case "systemId is required":
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 
 	json.NewEncoder(w).Encode(map[string]any{
 		"success": true,
@@ -4684,6 +5761,9 @@ func (admin *Admin) EmailLogoUploadHandler(w http.ResponseWriter, r *http.Reques
 		log.Printf("Failed to reload options: %v", err)
 	}
 
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
@@ -4767,6 +5847,9 @@ func (admin *Admin) EmailLogoDeleteHandler(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		log.Printf("Failed to reload options: %v", err)
 	}
+
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -4877,6 +5960,9 @@ func (admin *Admin) FaviconUploadHandler(w http.ResponseWriter, r *http.Request)
 		log.Printf("Failed to reload options: %v", err)
 	}
 
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
@@ -4919,6 +6005,9 @@ func (admin *Admin) FaviconDeleteHandler(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		log.Printf("Failed to reload options: %v", err)
 	}
+
+	go admin.Controller.EmitConfig()
+	admin.Controller.SyncConfigToFile()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -5303,46 +6392,56 @@ func (admin *Admin) UsersListHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Format lastLogin
+		var lastLoginAt int64
 		if user.LastLogin == "" || user.LastLogin == "0" {
 			lastLoginFormatted = "User has not logged in"
+			lastLoginAt = 0
 		} else {
 			if timestamp, err := strconv.ParseInt(user.LastLogin, 10, 64); err == nil {
 				// Check if timestamp is 0 (Unix epoch) which means never logged in
 				if timestamp == 0 {
 					lastLoginFormatted = "User has not logged in"
+					lastLoginAt = 0
 				} else {
 					lastLoginFormatted = time.Unix(timestamp, 0).Format("2006-01-02 15:04:05 MST")
+					lastLoginAt = timestamp
 				}
 			} else {
 				lastLoginFormatted = "User has not logged in" // fallback for invalid timestamps
+				lastLoginAt = 0
 			}
 		}
 
 		// Get effective connection limit (group limit if user is in a group, otherwise user limit)
 		effectiveConnectionLimit := user.ConnectionLimit
+		userGroupName := ""
 		if user.UserGroupId > 0 {
 			group := admin.Controller.UserGroups.Get(user.UserGroupId)
-			if group != nil && group.ConnectionLimit > 0 {
-				effectiveConnectionLimit = group.ConnectionLimit
+			if group != nil {
+				userGroupName = group.Name
+				if group.ConnectionLimit > 0 {
+					effectiveConnectionLimit = group.ConnectionLimit
+				}
 			}
 		}
 
-		// Get device tokens (FCM) for this user
+		// Get push device tokens for this user (FCM, VoIP, and legacy token records).
 		deviceTokens := admin.Controller.DeviceTokens.GetByUser(user.Id)
 		var fcmTokens []map[string]interface{}
 		for _, dt := range deviceTokens {
-			// Only include tokens that have FCM tokens
-			if dt.FCMToken != "" {
-				fcmTokens = append(fcmTokens, map[string]interface{}{
-					"id":        dt.Id,
-					"fcmToken":  dt.FCMToken,
-					"pushType":  dt.PushType,
-					"platform":  dt.Platform,
-					"sound":     dt.Sound,
-					"createdAt": time.Unix(dt.CreatedAt, 0).Format("2006-01-02 15:04:05 MST"),
-					"lastUsed":  time.Unix(dt.LastUsed, 0).Format("2006-01-02 15:04:05 MST"),
-				})
+			displayToken, pushType, ok := deviceTokenDisplayFields(dt)
+			if !ok {
+				continue
 			}
+			fcmTokens = append(fcmTokens, map[string]interface{}{
+				"id":        dt.Id,
+				"fcmToken":  displayToken,
+				"pushType":  pushType,
+				"platform":  dt.Platform,
+				"sound":     dt.Sound,
+				"createdAt": time.Unix(dt.CreatedAt, 0).Format("2006-01-02 15:04:05 MST"),
+				"lastUsed":  time.Unix(dt.LastUsed, 0).Format("2006-01-02 15:04:05 MST"),
+			})
 		}
 
 		userList = append(userList, map[string]interface{}{
@@ -5354,6 +6453,7 @@ func (admin *Admin) UsersListHandler(w http.ResponseWriter, r *http.Request) {
 			"verified":                 user.Verified,
 			"createdAt":                createdAtFormatted,
 			"lastLogin":                lastLoginFormatted,
+			"lastLoginAt":              lastLoginAt,
 			"systems":                  user.Systems,
 			"delay":                    user.Delay,
 			"systemDelays":             user.SystemDelays,
@@ -5364,12 +6464,22 @@ func (admin *Admin) UsersListHandler(w http.ResponseWriter, r *http.Request) {
 			"connectionLimit":          user.ConnectionLimit,
 			"effectiveConnectionLimit": effectiveConnectionLimit,
 			"userGroupId":              user.UserGroupId,
+			"userGroupIds":             user.GroupIds(),
+			"userGroupName":            userGroupName,
 			"isGroupAdmin":             user.IsGroupAdmin,
 			"systemAdmin":              user.SystemAdmin,
+			"publicApiEnabled":         user.PublicApiEnabled,
+			"publicApiCapabilities":    user.PublicApiCaps(),
+			"pushSystemNoAudioAlerts": user.PushSystemNoAudioAlerts,
+			"pushApiKeyNoAudioAlerts": user.PushApiKeyNoAudioAlerts,
+			"systemNoAudioAlertSystems": user.SystemNoAudioAlertSystems,
+			"apiKeyNoAudioAlertApiKeys": user.ApiKeyNoAudioAlertApiKeys,
 			"forcePasswordReset":       user.ForcePasswordReset,
+			"suspended":                user.Suspended,
 			"stripeCustomerId":         user.StripeCustomerId,
 			"stripeSubscriptionId":     user.StripeSubscriptionId,
 			"subscriptionStatus":       user.SubscriptionStatus,
+			"accountExpiresAt":         user.AccountExpiresAt,
 			"fcmTokens":                fcmTokens,
 		})
 	}
@@ -5466,67 +6576,175 @@ func (admin *Admin) UserDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get user to check if exists
-	user := admin.Controller.Users.GetUserById(userID)
-	if user == nil {
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "User not found"})
+	if err := admin.deleteUserWithDeps(userID); err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "last system administrator") {
+			status = http.StatusBadRequest
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// Delete user and all related records in a transaction
-	tx, err := admin.Controller.Database.Sql.Begin()
-	if err != nil {
-		log.Printf("Failed to begin transaction for user %d deletion: %v", userID, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to delete user from database"})
-		return
-	}
-
-	// Delete dependent records first (tables without ON DELETE CASCADE)
-	if _, err = tx.Exec(`DELETE FROM "userAlertPreferences" WHERE "userId" = $1`, userID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to delete userAlertPreferences for user %d: %v", userID, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to delete user from database"})
-		return
-	}
-	if _, err = tx.Exec(`DELETE FROM "deviceTokens" WHERE "userId" = $1`, userID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to delete deviceTokens for user %d: %v", userID, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to delete user from database"})
-		return
-	}
-
-	// Now delete the user
-	if _, err = tx.Exec(`DELETE FROM "users" WHERE "userId" = $1`, userID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to delete user %d from database: %v", userID, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to delete user from database"})
-		return
-	}
-
-	if err = tx.Commit(); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to commit deletion transaction for user %d: %v", userID, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to delete user from database"})
-		return
-	}
-
-	// Remove user from in-memory map
-	if err := admin.Controller.Users.Remove(userID); err != nil {
-		log.Printf("Failed to remove user %d from memory: %v", userID, err)
-		// Don't fail the request since database deletion succeeded
-	}
-
-	// Sync config to file if enabled
 	admin.Controller.SyncConfigToFile()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "User deleted successfully"})
+}
+
+type usersBulkDeleteRequest struct {
+	UserIds []uint64 `json:"userIds"`
+}
+
+type usersBulkDeleteFailure struct {
+	Id    uint64 `json:"id"`
+	Error string `json:"error"`
+}
+
+type usersBulkDeleteResponse struct {
+	Deleted []uint64                 `json:"deleted"`
+	Failed  []usersBulkDeleteFailure `json:"failed"`
+}
+
+// UsersBulkDeleteHandler deletes many users with the same DB-safe cleanup as single delete.
+func (admin *Admin) UsersBulkDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req usersBulkDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if len(req.UserIds) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "userIds is required"})
+		return
+	}
+	if len(req.UserIds) > 500 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "too many userIds (max 500)"})
+		return
+	}
+
+	deletingSet := map[uint64]bool{}
+	ordered := make([]uint64, 0, len(req.UserIds))
+	for _, id := range req.UserIds {
+		if id == 0 || deletingSet[id] {
+			continue
+		}
+		deletingSet[id] = true
+		ordered = append(ordered, id)
+	}
+
+	// Delete non-admins first so bulk can remove extra system admins while still
+	// refusing to remove the final remaining system administrator.
+	sort.SliceStable(ordered, func(i, j int) bool {
+		ui := admin.Controller.Users.GetUserById(ordered[i])
+		uj := admin.Controller.Users.GetUserById(ordered[j])
+		ai := ui != nil && ui.SystemAdmin
+		aj := uj != nil && uj.SystemAdmin
+		if ai == aj {
+			return false
+		}
+		return !ai && aj
+	})
+
+	resp := usersBulkDeleteResponse{
+		Deleted: []uint64{},
+		Failed:  []usersBulkDeleteFailure{},
+	}
+	for _, id := range ordered {
+		if err := admin.deleteUserWithDeps(id); err != nil {
+			resp.Failed = append(resp.Failed, usersBulkDeleteFailure{Id: id, Error: err.Error()})
+			continue
+		}
+		resp.Deleted = append(resp.Deleted, id)
+	}
+
+	admin.Controller.SyncConfigToFile()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// deleteUserWithDeps removes alert prefs + device tokens + the user row in one transaction,
+// then clears in-memory user/token state. Refuses to delete the last system administrator.
+func (admin *Admin) deleteUserWithDeps(userID uint64) error {
+	if admin == nil || admin.Controller == nil || admin.Controller.Database == nil {
+		return fmt.Errorf("server not ready")
+	}
+	if userID == 0 {
+		return fmt.Errorf("invalid user id")
+	}
+
+	user := admin.Controller.Users.GetUserById(userID)
+	if user == nil {
+		return fmt.Errorf("user not found")
+	}
+	if admin.wouldLeaveNoSystemAdmin(userID) {
+		return fmt.Errorf("cannot delete the last system administrator")
+	}
+
+	tx, err := admin.Controller.Database.Sql.Begin()
+	if err != nil {
+		log.Printf("Failed to begin transaction for user %d deletion: %v", userID, err)
+		return fmt.Errorf("failed to delete user from database")
+	}
+
+	if _, err = tx.Exec(`DELETE FROM "userAlertPreferences" WHERE "userId" = $1`, userID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to delete userAlertPreferences for user %d: %v", userID, err)
+		return fmt.Errorf("failed to delete user from database")
+	}
+	if _, err = tx.Exec(`DELETE FROM "deviceTokens" WHERE "userId" = $1`, userID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to delete deviceTokens for user %d: %v", userID, err)
+		return fmt.Errorf("failed to delete user from database")
+	}
+	if _, err = tx.Exec(`DELETE FROM "users" WHERE "userId" = $1`, userID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to delete user %d from database: %v", userID, err)
+		return fmt.Errorf("failed to delete user from database")
+	}
+	if err = tx.Commit(); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to commit deletion transaction for user %d: %v", userID, err)
+		return fmt.Errorf("failed to delete user from database")
+	}
+
+	if admin.Controller.DeviceTokens != nil {
+		admin.Controller.DeviceTokens.PurgeUserMemory(userID, admin.Controller.Clients)
+	}
+	if err := admin.Controller.Users.Remove(userID); err != nil {
+		log.Printf("Failed to remove user %d from memory: %v", userID, err)
+	}
+	return nil
+}
+
+func (admin *Admin) wouldLeaveNoSystemAdmin(userID uint64) bool {
+	user := admin.Controller.Users.GetUserById(userID)
+	if user == nil || !user.SystemAdmin {
+		return false
+	}
+	for _, other := range admin.Controller.Users.GetAllUsers() {
+		if other != nil && other.SystemAdmin && other.Id != userID {
+			return false
+		}
+	}
+	return true
 }
 
 // UserUpdateHandler handles PUT requests to update a user
@@ -5580,11 +6798,19 @@ func (admin *Admin) UserUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		ConnectionLimit      *uint   `json:"connectionLimit"`
 		SystemDelays         *string `json:"systemDelays"`
 		TalkgroupDelays      *string `json:"talkgroupDelays"`
-		RegeneratePin        bool    `json:"regeneratePin"`
-		UserGroupId          *uint64 `json:"userGroupId"`
-		IsGroupAdmin         *bool   `json:"isGroupAdmin"`
-		SystemAdmin          *bool   `json:"systemAdmin"`
-		ForcePasswordReset   *bool   `json:"forcePasswordReset"`
+		RegeneratePin        bool     `json:"regeneratePin"`
+		UserGroupId          *uint64  `json:"userGroupId"`
+		UserGroupIds         *[]uint64 `json:"userGroupIds"`
+		IsGroupAdmin         *bool    `json:"isGroupAdmin"`
+		SystemAdmin             *bool   `json:"systemAdmin"`
+		PublicApiEnabled          *bool                 `json:"publicApiEnabled"`
+		PublicApiCapabilities     *PublicApiCapabilities `json:"publicApiCapabilities"`
+		PushSystemNoAudioAlerts   *bool   `json:"pushSystemNoAudioAlerts"`
+		PushApiKeyNoAudioAlerts   *bool   `json:"pushApiKeyNoAudioAlerts"`
+		SystemNoAudioAlertSystems *string `json:"systemNoAudioAlertSystems"`
+		ApiKeyNoAudioAlertApiKeys *string `json:"apiKeyNoAudioAlertApiKeys"`
+		ForcePasswordReset        *bool   `json:"forcePasswordReset"`
+		Suspended                 *bool   `json:"suspended"`
 		StripeCustomerId     string  `json:"stripeCustomerId"`
 		StripeSubscriptionId string  `json:"stripeSubscriptionId"`
 		SubscriptionStatus   string  `json:"subscriptionStatus"`
@@ -5596,18 +6822,29 @@ func (admin *Admin) UserUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate input
-	if request.Email == "" || request.FirstName == "" || request.LastName == "" || request.ZipCode == "" {
+	// Email is the only required field on update. firstName, lastName and zipCode
+	// are optional (SSO/invited users often have them blank).
+	if err := ValidateEmail(request.Email); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "All fields are required"})
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
+	zipCode := strings.TrimSpace(request.ZipCode)
+	if zipCode != "" {
+		zipOk, _ := regexp.MatchString(`^\d{5}(-\d{4})?$`, zipCode)
+		if !zipOk {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid zip code format (use 12345 or 12345-6789)"})
+			return
+		}
+	}
+
 	// Update user fields
-	user.Email = request.Email
-	user.FirstName = request.FirstName
-	user.LastName = request.LastName
-	user.ZipCode = request.ZipCode
+	user.Email = NormalizeEmail(request.Email)
+	user.FirstName = strings.TrimSpace(request.FirstName)
+	user.LastName = strings.TrimSpace(request.LastName)
+	user.ZipCode = zipCode
 	user.Verified = request.Verified
 	user.Systems = strings.TrimSpace(request.Systems)
 	if request.Delay < 0 {
@@ -5654,6 +6891,24 @@ func (admin *Admin) UserUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Multi-group membership (union access). Applied after the primary so it is
+	// folded into the set; SetGroupIds keeps the primary if present.
+	if request.UserGroupIds != nil {
+		ids := append([]uint64{}, *request.UserGroupIds...)
+		for _, gid := range ids {
+			if gid != 0 && admin.Controller.UserGroups.Get(gid) == nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid group in memberships"})
+				return
+			}
+		}
+		if effectiveUserGroupId != 0 {
+			ids = append(ids, effectiveUserGroupId)
+		}
+		user.SetGroupIds(ids)
+		effectiveUserGroupId = user.UserGroupId
+	}
+
 	if request.IsGroupAdmin != nil {
 		// Only allow setting group admin if user is in a group (check effective group ID)
 		if *request.IsGroupAdmin && effectiveUserGroupId == 0 {
@@ -5667,8 +6922,34 @@ func (admin *Admin) UserUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	if request.SystemAdmin != nil {
 		user.SystemAdmin = *request.SystemAdmin
 	}
+	publicApiDirty := false
+	if request.PublicApiEnabled != nil {
+		user.PublicApiEnabled = *request.PublicApiEnabled
+		publicApiDirty = true
+	}
+	if request.PublicApiCapabilities != nil {
+		capsJson, _ := json.Marshal(*request.PublicApiCapabilities)
+		user.PublicApiCapabilities = string(capsJson)
+		publicApiDirty = true
+	}
+	if request.PushSystemNoAudioAlerts != nil {
+		user.PushSystemNoAudioAlerts = *request.PushSystemNoAudioAlerts
+	}
+	if request.PushApiKeyNoAudioAlerts != nil {
+		user.PushApiKeyNoAudioAlerts = *request.PushApiKeyNoAudioAlerts
+	}
+	if request.SystemNoAudioAlertSystems != nil {
+		user.SystemNoAudioAlertSystems = strings.TrimSpace(*request.SystemNoAudioAlertSystems)
+	}
+	if request.ApiKeyNoAudioAlertApiKeys != nil {
+		user.ApiKeyNoAudioAlertApiKeys = strings.TrimSpace(*request.ApiKeyNoAudioAlertApiKeys)
+	}
 	if request.ForcePasswordReset != nil {
 		user.ForcePasswordReset = *request.ForcePasswordReset
+	}
+	wasSuspended := user.Suspended
+	if request.Suspended != nil {
+		user.Suspended = *request.Suspended
 	}
 
 	if request.RegeneratePin {
@@ -5710,6 +6991,19 @@ func (admin *Admin) UserUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to update user"})
 		return
+	}
+	if publicApiDirty {
+		if err := admin.Controller.Users.WritePublicApiSettings(user, admin.Controller.Database); err != nil {
+			log.Printf("Failed to update public API settings for user %d: %v", userID, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to update public API settings"})
+			return
+		}
+	}
+
+	// Kick active sessions when suspending so they cannot keep listening
+	if !wasSuspended && user.Suspended {
+		admin.Controller.DisconnectUserClients(user.Id, "Account suspended")
 	}
 
 	// Sync config to file if enabled
@@ -5966,6 +7260,80 @@ func (admin *Admin) UserResetPasswordHandler(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Password reset successfully"})
+}
+
+// UserSuspendHandler handles POST /api/admin/users/{id}/suspend to suspend or unsuspend a user.
+func (admin *Admin) UserSuspendHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	t := admin.GetAuthorization(r)
+	if !admin.ValidateToken(t) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 5 { // /api/admin/users/{id}/suspend
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid user ID"})
+		return
+	}
+
+	userIDStr := pathParts[len(pathParts)-2]
+	userID, err := strconv.ParseUint(userIDStr, 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid user ID format"})
+		return
+	}
+
+	user := admin.Controller.Users.GetUserById(userID)
+	if user == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "User not found"})
+		return
+	}
+
+	var request struct {
+		Suspended bool `json:"suspended"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	wasSuspended := user.Suspended
+	user.Suspended = request.Suspended
+
+	admin.Controller.Users.Update(user)
+	if err := admin.Controller.Users.Write(admin.Controller.Database); err != nil {
+		log.Printf("Failed to update suspended state for user %d: %v", userID, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to update user"})
+		return
+	}
+
+	if !wasSuspended && user.Suspended {
+		admin.Controller.DisconnectUserClients(user.Id, "Account suspended")
+	}
+
+	admin.Controller.SyncConfigToFile()
+
+	action := "unsuspended"
+	if user.Suspended {
+		action = "suspended"
+	}
+	log.Printf("Admin %s user: %s (ID: %d)", action, user.Email, user.Id)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":   fmt.Sprintf("User %s successfully", action),
+		"suspended": user.Suspended,
+	})
 }
 
 // HallucinationSuggestionsHandler returns pending hallucination suggestions

@@ -3,24 +3,29 @@
   flex-direction: column;
   align-items: center;
   width: 100%;
+  min-height: 100vh;
   padding: 20px;
+  background: #06080c;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
 }
 
 .registration-form {
-  background: white;
-  border-radius: 8px;
+  background: #0d1118;
+  border-radius: 16px;
   padding: 32px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 24px 60px -30px rgba(0, 0, 0, 0.9);
   width: 100%;
   max-width: 400px;
   display: flex;
   flex-direction: column;
   align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.08);
 
   h2 {
     text-align: center;
     margin-bottom: 24px;
-    color: #333;
+    font-family: "Space Grotesk", ui-sans-serif, sans-serif;
+    color: #e9edf4;
   }
 
   .full-width {
@@ -45,19 +50,19 @@
     }
 
     h3 {
-      color: #333;
+      color: #e9edf4;
       margin-bottom: 16px;
     }
 
     p {
-      color: #666;
+      color: #8590a3;
       margin-bottom: 24px;
     }
 
     .resend-section {
       .resend-text {
         font-size: 14px;
-        color: #666;
+        color: #8590a3;
         margin-bottom: 16px;
       }
     }
@@ -66,10 +71,10 @@
   p {
     text-align: center;
     margin-top: 16px;
-    color: #666;
+    color: #8590a3;
 
     a {
-      color: #1976d2;
+      color: #ff5b2e;
       text-decoration: none;
       cursor: pointer;
 
@@ -180,7 +185,7 @@
 
     .channels-section {
       margin-top: 16px;
-      border-top: 1px solid #e0e0e0;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
       padding-top: 16px;
 
       .channels-toggle {
@@ -190,13 +195,13 @@
         justify-content: flex-start;
         padding: 12px;
         margin-bottom: 8px;
-        background: #f9f9f9;
-        border-radius: 4px;
+        background: #11161f;
+        border-radius: 10px;
         font-weight: 500;
-        color: #1976d2;
+        color: #ff5b2e;
 
         &:hover {
-          background: #f0f0f0;
+          background: #161c27;
         }
 
         mat-icon {
@@ -207,10 +212,10 @@
       .channels-list {
         max-height: 400px;
         overflow-y: auto;
-        border: 1px solid #e0e0e0;
-        border-radius: 4px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
         padding: 12px;
-        background: white;
+        background: #11161f;
 
         .channel-item {
           margin-bottom: 16px;
@@ -305,4 +310,34 @@
       }
     }
   }
+}
+
+/* Multi-tier signup picker */
+.tiers-section {
+    margin: 12px 0;
+    .tiers-hint { color: #888; font-size: 12px; margin: 0 0 8px; }
+    .tier-option {
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        border-radius: 6px;
+        padding: 10px 12px;
+        margin-bottom: 8px;
+    }
+    .tier-check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        font-weight: 600;
+    }
+    .tier-meta { color: #888; font-weight: 400; }
+    .tier-free { color: #2e7d32; font-weight: 400; }
+    .tier-desc { color: #777; font-size: 12px; margin: 6px 0 0; }
+    .tier-prices {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin: 8px 0 0 24px;
+    }
+    .tier-price-option { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .tier-primary { margin: 6px 0 0 24px; font-size: 12px; color: #555; }
 }

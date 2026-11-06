@@ -4,38 +4,33 @@
  *
  * Licensed under the GNU GPL v3 (or later). See LICENSE.
  *
- * Console — the modern scanner client view.
+ * Console scanner view — hybrid Thinline skin layout with board tabs:
+ * Transmissions · Channels · Alerts · Transcripts · Stats · Settings
  *
- * Replaces the legacy `main.component`. Renders the hybrid Thinline skin
- * (LCD chassis around the live now-playing strip; clean dashboard for the
- * tab content) and hosts the seven primary tabs:
- *
- *     Current · Archive · Channels · Alerts · Transcripts · Stats · Settings
- *
- * Wires all the same business behaviour as the legacy main view (auth,
- * livefeed transport, subscription/checkout, audio playback/replay, call
- * history, scanning animation) but trims the dead display state that older
- * iterations of the LCD readout used to populate.
+ * Wires scanner business behaviour (auth, live feed, playback, board tabs).
  * ****************************************************************************
  */
 
 import {
-    ChangeDetectorRef,
-    Component,
-    EventEmitter,
-    Input,
-    OnChanges,
-    OnDestroy,
-    OnInit,
-    Output,
-    SimpleChanges,
-    ViewChild,
+  ChangeDetectorRef,
+  Component,
+  EventEmitter,
+  Input,
+  OnChanges,
+  OnDestroy,
+  OnInit,
+  Output,
+  SimpleChanges,
+  ViewChild,
+  ChangeDetectionStrategy
 } from '@angular/core';
 import { FormBuilder, FormGroup } from '@angular/forms';
 import { MatInput } from '@angular/material/input';
+import { MatDialog } from '@angular/material/dialog';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { Title } from '@angular/platform-browser';
 import { Subscription, timer } from 'rxjs';
+import { RdioScannerPublicApiDialogComponent } from './public-api-dialog.component';
 
 import packageInfo from '../../../../../package.json';
 import {
@@ -48,28 +43,47 @@ import {
     RdioScannerLivefeedMode,
 } from '../rdio-scanner';
 import { RdioScannerService } from '../rdio-scanner.service';
+import { IncidentMapBridgeService } from '../incident-map/incident-map-bridge.service';
+import { IncidentsService } from '../incident-map/incidents.service';
 import { RdioScannerSearchComponent } from '../search/search.component';
 import { RdioScannerSupportComponent } from '../main/support/support.component';
 import { SettingsService } from '../settings/settings.service';
 import { TagColorService } from '../tag-color.service';
 import { TranscriptAnnotation, renderAnnotatedTranscript } from '../transcript-utils';
-import { findUnitLabelForSrc, resolveUnitLabelForSrc as resolveUnitLabel } from '../unit-utils';
+import { formatCallUnitDisplay, formatUnitDisplay, resolveUnitLabelForSrc as resolveUnitLabel } from '../unit-utils';
 
 /** Stable index per board tab. Order MUST match the template's `<mat-tab>` list. */
 const TAB = {
-    Current: 0,
-    Archive: 1,
-    Channels: 2,
-    Alerts: 3,
-    Transcripts: 4,
-    Stats: 5,
+    Transmissions: 0,
+    Channels: 1,
+    Alerts: 2,
+    Transcripts: 3,
+    Stats: 4,
+    Map: 5,
     Settings: 6,
 } as const;
+
+/** Sub-view inside the Transmissions tab. */
+type TransmissionsPanelMode = 'recent' | 'search';
+
+/** One enabled talkgroup in the scan sweep, matching the mobile channel readout. */
+interface ScanChannelView {
+    system: string;
+    label: string;
+    name: string;
+    tgid: string;
+    tag: string;
+    color: string;
+    position: number;
+    systemTotal: number;
+}
 
 @Component({
     selector: 'rdio-scanner-console',
     templateUrl: './console.component.html',
     styleUrls: ['./console.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit {
 
@@ -79,14 +93,8 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
 
     @Output() toggleFullscreen = new EventEmitter<void>();
     @Output() signOut = new EventEmitter<void>();
-    @Output() toggleClassicViewRequest = new EventEmitter<void>();
 
-    /**
-     * True when this view is the one currently shown to the user. The parent
-     * keeps BOTH views mounted at all times for instant view switching, so
-     * each view must skip user-visible side effects (snackbar errors, PWA
-     * auto-livefeed) when it is the hidden one — otherwise events fire twice.
-     */
+    /** Skips user-visible side effects when this view is not active. */
     @Input() viewActive = true;
 
     @ViewChild('password', { read: MatInput }) private authPassword: MatInput | undefined;
@@ -161,18 +169,36 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
     userEmail = '';
     isGroupAdminManaged = false;
     transferring = false;
+    /** Public unpaid + available tiers for the subscribe modal picker. */
+    checkoutTiers: {
+        groupId: number;
+        name: string;
+        description?: string;
+        pricingOptions: Array<{ priceId: string; label: string; amount: string; trialDays?: number }>;
+        required?: boolean;
+        included?: boolean;
+    }[] | null = null;
     private subscriptionCheckInProgress = false;
 
     // ────────────────────────────────────────────────────────────────────────
     // TAB / CONFIG
     // ────────────────────────────────────────────────────────────────────────
 
-    boardTabIndex: number = TAB.Current;
+    boardTabIndex: number = TAB.Transmissions;
+    /** Recent (last hour) vs archive search within the Transmissions tab. */
+    transmissionsPanelMode: TransmissionsPanelMode = 'recent';
     config: RdioScannerConfig | undefined;
     map: RdioScannerLivefeedMap = {};
 
     /** Cycles through `getEnabledSystems()` while scanning banner is shown. */
     currentScanningSystemIndex = 0;
+
+    /** Enabled talkgroups walked while the live feed is searching. */
+    scanChannels: ScanChannelView[] = [];
+    scanChannelIndex = 0;
+    /** 28-segment sweep, same count as the mobile scan bar. */
+    readonly scanBarSegments = Array.from({ length: 28 }, (_, i) => i);
+    private scanChannelsKey = '';
 
     // ────────────────────────────────────────────────────────────────────────
     // SUBSCRIPTIONS / STORED AUTH STATE
@@ -191,11 +217,14 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
     constructor(
         private rdioScannerService: RdioScannerService,
         private matSnackBar: MatSnackBar,
+        private matDialog: MatDialog,
         private cdr: ChangeDetectorRef,
         private fb: FormBuilder,
         private tagColorService: TagColorService,
         private settingsService: SettingsService,
         private titleService: Title,
+        private incidentMapBridge: IncidentMapBridgeService,
+        private incidentsService: IncidentsService,
     ) {
         this.authForm = this.fb.group<{ password: string | null }>({ password: null });
 
@@ -225,6 +254,9 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         const currentConfig = this.rdioScannerService.getConfig();
         if (currentConfig) {
             this.config = currentConfig;
+            if (this.showIncidentMapTab) {
+                this.incidentsService.prefetchDefault24h(this.rdioScannerService.readPin() || undefined);
+            }
         }
 
         this.syncPageScrollMode();
@@ -242,9 +274,8 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         this.clockTimer?.unsubscribe();
         this.stopScanningAnimation();
         this.eventSubscription.unsubscribe();
-        // Always strip the document-scroll overrides when the view is gone so
-        // the classic view (or any other consumer) doesn't inherit a stale
-        // body class that would relax its viewport-locked layout.
+        // Strip document-scroll overrides when the view is destroyed so body
+        // classes don't linger and relax the viewport-locked layout.
         try {
             document.body.classList.remove('tlr-page-scroll');
             document.body.classList.remove('tlr-channels-scroll');
@@ -266,6 +297,15 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         return this.config?.options?.transcriptionEnabled || false;
     }
 
+    get isIncidentMappingEnabled(): boolean {
+        return !!this.config?.options?.incidentMappingEnabled;
+    }
+
+    /** Map tab requires transcription UI plus the server-wide incident mapping switch. */
+    get showIncidentMapTab(): boolean {
+        return this.isTranscriptionEnabled && this.isIncidentMappingEnabled;
+    }
+
     get isUserAuthenticated(): boolean {
         return !!this.rdioScannerService.readPin();
     }
@@ -274,13 +314,53 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         return this.rdioScannerService.isSystemAdmin();
     }
 
-    /** Settings is always the last tab; its index shifts when transcription tabs hide. */
+    get publicApiEnabled(): boolean {
+        return this.rdioScannerService.isPublicApiEnabled();
+    }
+
+    /**
+     * Settings is always the last tab. With transcription on: tabs 0–4 are fixed
+     * (Transmissions…Stats), Map is optional at 5, Settings follows.
+     * With transcription off: Transmissions, Channels, Settings.
+     */
     get settingsBoardTabIndex(): number {
-        return this.isTranscriptionEnabled ? TAB.Settings : TAB.Alerts;
+        if (!this.isTranscriptionEnabled) {
+            return TAB.Channels + 1;
+        }
+        return this.showIncidentMapTab ? TAB.Settings : TAB.Map;
+    }
+
+    get mapBoardTabIndex(): number {
+        return this.showIncidentMapTab ? TAB.Map : -1;
+    }
+
+    get mapTabActive(): boolean {
+        return this.showIncidentMapTab && this.boardTabIndex === this.mapBoardTabIndex;
+    }
+
+    get statsTabActive(): boolean {
+        return this.isTranscriptionEnabled && this.boardTabIndex === TAB.Stats;
+    }
+
+    /** Recent-alerts rail stays on Transmissions only so Map / Stats / other tabs can use the width. */
+    get alertsSidebarVisible(): boolean {
+        return this.isTranscriptionEnabled && this.boardTabIndex === TAB.Transmissions;
     }
 
     get showScanningAnimation(): boolean {
         return this.livefeedOnline && !this.call && !this.livefeedPaused && this.callQueue === 0;
+    }
+
+    /** Talkgroup line on the side-rail LCD — stable label slot (scanning vs active vs idle). */
+    get scannerTalkgroupLabel(): string {
+        if (this.showScanningAnimation) {
+            return '—';
+        }
+        if (this.call) {
+            const tg = this.call.talkgroupData?.label || this.call.talkgroup;
+            return tg != null && String(tg).trim() !== '' ? String(tg) : '—';
+        }
+        return '—';
     }
 
     /** Detail card source: live call wins; otherwise whichever history row is selected. */
@@ -292,29 +372,101 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
     // TRANSPORT BUTTON ACTIONS
     // ────────────────────────────────────────────────────────────────────────
 
+    /** Mobile scanner_screen.dart 4×2 hardware keypad order. */
+    readonly scannerKeyOrder = [
+        'liveFeed', 'pause', 'replayLast', 'skipNext',
+        'avoid', 'holdSystem', 'holdTalkgroup', 'channelSelect',
+    ] as const;
+
     executeButtonAction(key: string): void {
         switch (key) {
-            case 'liveFeed':     this.livefeed(); break;
-            case 'pause':        this.pause(); break;
-            case 'skipNext':     this.skip(); break;
-            case 'avoid':        this.avoid(); break;
-            case 'favorite':     this.toggleFavorite(); break;
-            case 'holdSystem':   this.holdSystem(); break;
-            case 'holdTalkgroup':this.holdTalkgroup(); break;
+            case 'liveFeed':      this.livefeed(); break;
+            case 'pause':         this.pause(); break;
+            case 'replayLast':    this.replay(); break;
+            case 'skipNext':      this.skip(); break;
+            case 'avoid':         this.avoid(); break;
+            case 'holdSystem':    this.holdSystem(); break;
+            case 'holdTalkgroup': this.holdTalkgroup(); break;
+            case 'channelSelect': this.showSelectPanel(); break;
         }
     }
 
-    toolbarIcon(key: string): string {
-        const icons: Record<string, string> = {
-            liveFeed:      this.livefeedOnline ? 'radio' : 'radio_button_unchecked',
-            pause:         this.livefeedPaused ? 'play_arrow' : 'pause',
-            skipNext:      'skip_next',
-            avoid:         'block',
-            favorite:      this.isFavorite ? 'star' : 'star_border',
-            holdSystem:    'keyboard_arrow_down',
-            holdTalkgroup: 'keyboard_double_arrow_down',
+    toolbarButtonLabel(key: string): string {
+        const labels: Record<string, string> = {
+            liveFeed: 'LIVE FEED',
+            pause: this.livefeedPaused ? 'RESUME' : 'PAUSE',
+            replayLast: 'REPLAY',
+            skipNext: 'SKIP',
+            avoid: 'AVOID TG',
+            holdSystem: 'HOLD SYS',
+            holdTalkgroup: 'HOLD TG',
+            channelSelect: 'SELECT TG',
         };
-        return icons[key] || 'help';
+        return labels[key] || key;
+    }
+
+    /** Material icon for the glass keypad, matching the mobile HUD keys. */
+    scannerKeyIcon(key: string): string {
+        switch (key) {
+            case 'liveFeed': return 'settings_input_antenna';
+            case 'pause': return this.livefeedPaused ? 'play_arrow' : 'pause';
+            case 'replayLast': return 'restore';
+            case 'skipNext': return 'skip_next';
+            case 'avoid': return 'block';
+            case 'holdSystem': return 'lock';
+            case 'holdTalkgroup': return 'lock_outline';
+            case 'channelSelect': return 'tune';
+            default: return 'circle';
+        }
+    }
+
+    scannerKeyState(key: string): {
+        latched: boolean;
+        showGreenLed: boolean;
+        ledGreenLit: boolean;
+        showRedLed: boolean;
+        ledRedLit: boolean;
+        pauseSquare: boolean;
+    } {
+        const off = {
+            latched: false,
+            showGreenLed: false,
+            ledGreenLit: false,
+            showRedLed: false,
+            ledRedLit: false,
+            pauseSquare: false,
+        };
+        switch (key) {
+            case 'liveFeed':
+                return {
+                    ...off,
+                    showGreenLed: true,
+                    ledGreenLit: this.livefeedOnline,
+                    latched: this.livefeedOnline,
+                };
+            case 'pause':
+                return {
+                    ...off,
+                    latched: this.livefeedPaused,
+                    pauseSquare: this.livefeedPaused,
+                };
+            case 'holdSystem':
+                return {
+                    ...off,
+                    showRedLed: true,
+                    ledRedLit: this.holdSys,
+                    latched: this.holdSys,
+                };
+            case 'holdTalkgroup':
+                return {
+                    ...off,
+                    showRedLed: true,
+                    ledRedLit: this.holdTg,
+                    latched: this.holdTg,
+                };
+            default:
+                return off;
+        }
     }
 
     toolbarTooltip(key: string): string {
@@ -322,28 +474,14 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         const tips: Record<string, string> = {
             liveFeed:      this.livefeedOnline ? 'Stop live feed' : 'Start live feed',
             pause:         paused,
+            replayLast:    'Replay last transmission',
             skipNext:      'Skip current call',
             avoid:         'Avoid talkgroup',
-            favorite:      'Favorite this talkgroup',
             holdSystem:    'Hold current system',
             holdTalkgroup: 'Hold current talkgroup',
+            channelSelect: 'Select talkgroups',
         };
         return tips[key] || key;
-    }
-
-    toolbarActionClass(key: string): { active: boolean; inactive: boolean } {
-        const o = { active: false, inactive: false };
-        switch (key) {
-            case 'liveFeed':
-                if (this.livefeedOnline) o.active = true;
-                if (this.livefeedOffline && !this.playbackMode) o.inactive = true;
-                break;
-            case 'pause':        if (this.livefeedPaused) o.active = true; break;
-            case 'favorite':     if (this.isFavorite) o.active = true; break;
-            case 'holdSystem':   if (this.holdSys) o.active = true; break;
-            case 'holdTalkgroup':if (this.holdTg) o.active = true; break;
-        }
-        return o;
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -385,6 +523,16 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         this.rdioScannerService.skip(options);
     }
 
+    replay(): void {
+        if (this.auth) { this.authFocus(); return; }
+        if (!this.livefeedPaused && (this.call || this.callPrevious)) {
+            this.rdioScannerService.beep(RdioScannerBeepStyle.Activate);
+            this.rdioScannerService.replay();
+        } else {
+            this.rdioScannerService.beep(RdioScannerBeepStyle.Denied);
+        }
+    }
+
     avoid(options?: RdioScannerAvoidOptions): void {
         if (this.auth) { this.authFocus(); return; }
         const call = this.call || this.callPrevious;
@@ -421,7 +569,7 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
 
     holdSystem(): void {
         if (this.auth) { this.authFocus(); return; }
-        if (this.call || this.callPrevious) {
+        if (this.holdSys || this.call || this.callPrevious) {
             this.rdioScannerService.beep(
                 this.holdSys ? RdioScannerBeepStyle.Deactivate : RdioScannerBeepStyle.Activate,
             );
@@ -433,7 +581,7 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
 
     holdTalkgroup(): void {
         if (this.auth) { this.authFocus(); return; }
-        if (this.call || this.callPrevious) {
+        if (this.holdTg || this.call || this.callPrevious) {
             this.rdioScannerService.beep(
                 this.holdTg ? RdioScannerBeepStyle.Deactivate : RdioScannerBeepStyle.Activate,
             );
@@ -468,7 +616,10 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         this.applyBoardTab(index, true);
     }
 
-    showSearchPanel(): void  { this.beepThenTab(TAB.Archive,  true); }
+    showSearchPanel(): void {
+        this.transmissionsPanelMode = 'search';
+        this.beepThenTab(TAB.Transmissions, true);
+    }
     showSelectPanel(): void  { this.beepThenTab(TAB.Channels, false); }
     showSettingsPanel(): void{ this.beepThenTab(this.settingsBoardTabIndex, false); }
 
@@ -487,27 +638,48 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
 
     openArchiveSearch(): void { this.showSearchPanel(); }
 
-    private beepThenTab(idx: number, refreshArchive: boolean): void {
+    setTransmissionsPanelMode(mode: TransmissionsPanelMode): void {
+        if (this.transmissionsPanelMode === mode) {
+            return;
+        }
+        if (mode === 'recent') {
+            this.rdioScannerService.stopPlaybackMode();
+        }
+        this.transmissionsPanelMode = mode;
+        if (mode === 'search') {
+            setTimeout(() => this.archiveSearch?.searchCalls(), 0);
+        }
+    }
+
+    private beepThenTab(idx: number, refreshArchiveSearch: boolean): void {
         if (!this.config) return;
         if (this.auth) { this.authFocus(); return; }
         this.rdioScannerService.beep();
-        this.applyBoardTab(idx, refreshArchive);
+        this.applyBoardTab(idx, refreshArchiveSearch);
     }
 
     private applyBoardTab(index: number, refreshArchiveSearch: boolean): void {
         const prev = this.boardTabIndex;
-        if (prev === TAB.Archive && index !== TAB.Archive) {
+        if (prev === TAB.Transmissions && index !== TAB.Transmissions) {
             this.rdioScannerService.stopPlaybackMode();
         }
         this.boardTabIndex = index;
-        if (refreshArchiveSearch && index === TAB.Archive) {
+        if (refreshArchiveSearch && index === TAB.Transmissions && this.transmissionsPanelMode === 'search') {
             setTimeout(() => this.archiveSearch?.searchCalls(), 0);
+        }
+        if (this.showIncidentMapTab && index === this.mapBoardTabIndex) {
+            // Wait for the alerts rail to collapse so Leaflet measures the wider pane.
+            setTimeout(() => {
+                this.cdr.detectChanges();
+                this.incidentMapBridge.getMap()?.invalidateMapSize();
+            }, 80);
+            setTimeout(() => this.incidentMapBridge.getMap()?.invalidateMapSize(), 250);
         }
         this.syncPageScrollMode();
     }
 
     /**
-     * Archive and Channels use the fitted tab viewport: panels stretch to
+     * Transmissions and Channels use the fitted tab viewport: panels stretch to
      * fill the tab body (see `.tab-panel--fill` in console.component.scss).
      * Other tabs keep the same viewport-locked layout.
      */
@@ -521,8 +693,14 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
     // HEADER ACTIONS
     // ────────────────────────────────────────────────────────────────────────
 
-    requestToggleClassicView(): void {
-        this.toggleClassicViewRequest.emit();
+    openPublicApiDialog(): void {
+        this.matDialog.open(RdioScannerPublicApiDialogComponent, {
+            width: '640px',
+            maxWidth: '95vw',
+            autoFocus: false,
+            panelClass: 'tlr-lcd-dialog',
+            backdropClass: 'tlr-lcd-dialog-backdrop',
+        });
     }
 
     openAdminPanel(): void {
@@ -586,17 +764,7 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
     }
 
     displayUnitForCall(call: RdioScannerCall | undefined): string {
-        if (!call) return '—';
-        if (Array.isArray(call.sources) && call.sources.length) {
-            const ordered = [...call.sources].sort((a, b) => (a.pos || 0) - (b.pos || 0));
-            for (const s of ordered) {
-                if (typeof s.tag === 'string' && s.tag.length > 0) return s.tag;
-            }
-            const first = ordered[0];
-            if (typeof first?.src === 'number') return resolveUnitLabel(call.systemData?.units, first.src);
-        }
-        if (typeof call.source === 'number') return resolveUnitLabel(call.systemData?.units, call.source);
-        return '—';
+        return formatCallUnitDisplay(call);
     }
 
     /** Now-playing row prefers the live `callUnit` if it matches; otherwise falls back to the static unit. */
@@ -620,6 +788,21 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         if (call.tagData?.led) return this.tagColorService.getTagColor(call.tagData.led);
         if (call.talkgroupData?.tag) return this.tagColorService.getTagColor(call.talkgroupData.tag);
         return 'transparent';
+    }
+
+    /** Tag label for the mobile-style now-playing grid. */
+    nowPlayingTagLabel(call: RdioScannerCall | undefined): string {
+        if (!call) return '—';
+        const raw = call.talkgroupData?.tag || call.tagData?.label || call.tagData?.led;
+        if (raw == null || String(raw).trim() === '') return '—';
+        return this.tagColorService.resolveTagLabel(raw);
+    }
+
+    /** CSS color for talkgroup card border/glow; falls back to primary neon. */
+    nowPlayingTagColor(call: RdioScannerCall | undefined): string {
+        const col = this.getTransmissionHistoryTagColor(call);
+        if (!col || col === 'transparent') return 'var(--tlr-primary, #39ff14)';
+        return col;
     }
 
     getTransmissionHistoryBackgroundColor(call: RdioScannerCall | undefined): string {
@@ -654,11 +837,9 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         }
         this.selectedHistoryCall = c;
         this.rdioScannerService.beep();
-        if (c.id != null) {
-            this.rdioScannerService.loadAndPlay(c.id);
-        } else {
-            this.playCallFromHistoryEntry(c);
-        }
+        this.playCallFromHistoryEntry(c, {
+            preserveQueue: this.livefeedOnline && !this.playbackMode,
+        });
     }
 
     getDelayedText(): string {
@@ -705,30 +886,145 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         return enabled[this.currentScanningSystemIndex]?.label || enabled[0]?.label || '';
     }
 
-    private updateScanningAnimation(): void {
-        if (this.showScanningAnimation) this.startScanningAnimation();
-        else this.stopScanningAnimation();
+    /** Channel under the scan head, or undefined when the feed is not searching. */
+    get currentScanChannel(): ScanChannelView | undefined {
+        if (!this.showScanningAnimation || this.scanChannels.length === 0) return undefined;
+        return this.scanChannels[this.scanChannelIndex % this.scanChannels.length];
     }
 
-    private startScanningAnimation(): void {
-        this.stopScanningAnimation();
-        const enabled = this.getEnabledSystems();
-        if (enabled.length === 0) return;
-        this.currentScanningSystemIndex = 0;
+    /** `CH 001/018` counter for the channel currently lit. */
+    get scanChannelCounter(): string {
+        const ch = this.currentScanChannel;
+        if (!ch) return '';
+        const width = Math.min(5, Math.max(3, String(ch.systemTotal).length));
+        const pad = (n: number) => String(n).padStart(width, '0');
+        return `CH ${pad(ch.position)}/${pad(ch.systemTotal)}`;
+    }
 
-        // 1s cycle. Timer runs inside Angular's zone so CD is triggered automatically.
-        this.scanningSystemTimer = timer(0, 1000).subscribe(() => {
+    get lcdSystemLabel(): string {
+        const ch = this.currentScanChannel;
+        if (ch) return ch.system;
+        if (!this.call) return '—';
+        return String(this.call.systemData?.label || this.call.system || '—');
+    }
+
+    get lcdTagLabel(): string {
+        const ch = this.currentScanChannel;
+        if (ch) return ch.tag || '—';
+        return this.nowPlayingTagLabel(this.call);
+    }
+
+    get lcdTgid(): string {
+        const ch = this.currentScanChannel;
+        if (ch) return ch.tgid;
+        return this.call ? this.displayTgidForCall(this.call) : '—';
+    }
+
+    private updateScanningAnimation(): void {
+        if (!this.showScanningAnimation) {
+            this.stopScanningAnimation();
+            return;
+        }
+        this.rebuildScanChannels();
+        if (this.scanningSystemTimer) return;
+        this.scanChannelIndex = 0;
+        this.currentScanningSystemIndex = 0;
+        // Same step as the mobile channel sweep. The segmented bar is CSS.
+        this.scanningSystemTimer = timer(182, 182).subscribe(() => {
+            const n = this.scanChannels.length;
+            if (n > 1) this.scanChannelIndex = (this.scanChannelIndex + 1) % n;
             const systems = this.getEnabledSystems();
-            if (systems.length > 0) {
+            if (systems.length > 1 && this.scanChannelIndex === 0) {
                 this.currentScanningSystemIndex = (this.currentScanningSystemIndex + 1) % systems.length;
             }
         });
+    }
+
+    /** Enabled talkgroups in system order, narrowed to a hold when one is on. */
+    private rebuildScanChannels(): void {
+        const key = this.scanChannelsCacheKey();
+        if (key === this.scanChannelsKey) return;
+        this.scanChannelsKey = key;
+        this.scanChannels = this.collectScanChannels();
+        if (this.scanChannelIndex >= this.scanChannels.length) this.scanChannelIndex = 0;
+    }
+
+    private scanChannelsCacheKey(): string {
+        const active: string[] = [];
+        const map = this.map;
+        if (map) {
+            for (const sysId of Object.keys(map)) {
+                const sys = map[+sysId];
+                if (!sys) continue;
+                for (const tgId of Object.keys(sys)) {
+                    if (sys[+tgId]?.active) active.push(`${sysId}:${tgId}`);
+                }
+            }
+        }
+        const held = this.call || this.callPrevious;
+        return [
+            active.join(','),
+            this.holdSys ? 1 : 0,
+            this.holdTg ? 1 : 0,
+            held?.system ?? '',
+            held?.talkgroup ?? '',
+        ].join('|');
+    }
+
+    private collectScanChannels(): ScanChannelView[] {
+        const systems = this.config?.systems;
+        if (!systems?.length || !this.map) return [];
+
+        const held = (this.holdSys || this.holdTg) ? (this.call || this.callPrevious) : undefined;
+        const raw: Array<Omit<ScanChannelView, 'position' | 'systemTotal'>> = [];
+
+        for (const system of systems) {
+            if (this.holdSys && held && system.id !== held.system) continue;
+            const sysMap = this.map[system.id];
+            if (!sysMap) continue;
+            for (const tg of system.talkgroups || []) {
+                if (!sysMap[tg.id]?.active) continue;
+                if (this.holdTg && (!held || system.id !== held.system || tg.id !== held.talkgroup)) continue;
+                const label = (tg.label || tg.name || String(tg.id)).trim();
+                const nameRaw = (tg.name || '').trim();
+                const tagRaw = (tg.tag || '').trim();
+                raw.push({
+                    system: system.label,
+                    label,
+                    name: nameRaw && nameRaw.toLowerCase() !== label.toLowerCase() ? nameRaw : '',
+                    tgid: system.type === 'provoice' || tg.type === 'provoice'
+                        ? this.formatAfs(tg.id)
+                        : String(tg.id),
+                    tag: tagRaw ? this.tagColorService.resolveTagLabel(tagRaw) : '',
+                    color: tagRaw ? this.tagColorService.getTagColor(tagRaw) : 'transparent',
+                });
+            }
+        }
+
+        const totals = new Map<string, number>();
+        for (const ch of raw) totals.set(ch.system, (totals.get(ch.system) ?? 0) + 1);
+
+        const sequence: ScanChannelView[] = [];
+        let current = '';
+        let pos = 0;
+        for (const ch of raw) {
+            if (ch.system !== current) {
+                current = ch.system;
+                pos = 0;
+            }
+            pos++;
+            sequence.push({ ...ch, position: pos, systemTotal: totals.get(ch.system) ?? pos });
+        }
+        return sequence;
     }
 
     private stopScanningAnimation(): void {
         this.scanningSystemTimer?.unsubscribe();
         this.scanningSystemTimer = undefined;
         this.currentScanningSystemIndex = 0;
+        this.scanChannelIndex = 0;
+        this.scanChannels = [];
+        this.scanChannelsKey = '';
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -766,6 +1062,68 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         this.checkUserSubscription();
     }
 
+    /**
+     * Build subscribe-modal tiers from /api/account:
+     * unpaid memberships (required) + other public available tiers (optional, selected by default).
+     */
+    private buildCheckoutTiers(account: any): {
+        groupId: number;
+        name: string;
+        description?: string;
+        pricingOptions: Array<{ priceId: string; label: string; amount: string; trialDays?: number }>;
+        required?: boolean;
+        included?: boolean;
+    }[] {
+        const out: {
+            groupId: number;
+            name: string;
+            description?: string;
+            pricingOptions: Array<{ priceId: string; label: string; amount: string; trialDays?: number }>;
+            required?: boolean;
+            included?: boolean;
+        }[] = [];
+        const seen = new Set<number>();
+
+        const pushTier = (src: any, required: boolean, included: boolean) => {
+            const groupId = Number(src?.groupId);
+            const opts = src?.pricingOptions;
+            if (!groupId || seen.has(groupId) || !Array.isArray(opts) || !opts.length) {
+                return;
+            }
+            if (src.billingEnabled === false) {
+                return;
+            }
+            seen.add(groupId);
+            out.push({
+                groupId,
+                name: src.name || `Tier ${groupId}`,
+                description: src.description || '',
+                pricingOptions: opts,
+                required,
+                included,
+            });
+        };
+
+        const unpaid = Array.isArray(account?.unpaidCheckoutItems) ? account.unpaidCheckoutItems : [];
+        for (const u of unpaid) {
+            pushTier(u, true, true);
+        }
+        if (!unpaid.length && Array.isArray(account?.memberships)) {
+            for (const m of account.memberships) {
+                if (m?.billingEnabled && m?.selfBillable && !m?.paid && m?.pricingOptions?.length) {
+                    pushTier(m, true, true);
+                }
+            }
+        }
+        for (const t of account?.availableTiers || []) {
+            if (t?.billingEnabled && t?.pricingOptions?.length) {
+                // Shown as alternate single-select options (one plan total).
+                pushTier(t, false, false);
+            }
+        }
+        return out;
+    }
+
     private checkUserSubscription(): void {
         const pin = this.rdioScannerService.readPin();
         if (!pin) return;
@@ -774,6 +1132,7 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
             .then(r => r.ok ? r.json() : Promise.reject(new Error('Failed to fetch account info')))
             .then(data => {
                 if (data.email) this.userEmail = data.email;
+                this.checkoutTiers = this.buildCheckoutTiers(data);
 
                 const isAdminManagedNonAdmin =
                     data.subscriptionStatusDisplay === 'group_admin_managed'
@@ -793,6 +1152,8 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
                 const isPinValid = !data.pinExpired;
                 const hasPricingOptions = !!(this.config?.options?.pricingOptions
                     && this.config.options.pricingOptions.length > 0);
+                const hasCheckoutTiers = !!(this.checkoutTiers && this.checkoutTiers.length > 0);
+                const canShowCheckout = hasCheckoutTiers || hasPricingOptions;
                 const isAdminNeedsSubscription = billingRequired && data.isGroupAdmin && !isAdminManagedNonAdmin;
 
                 if (isAdminNeedsSubscription) {
@@ -805,7 +1166,7 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
                         this.subscriptionActive = false;
                         this.subscriptionChecked = true;
                         this.isGroupAdminManaged = false;
-                        this.showCheckout = hasPricingOptions;
+                        this.showCheckout = canShowCheckout;
                         this.cdr.detectChanges();
                     }
                     this.subscriptionCheckInProgress = false;
@@ -844,7 +1205,7 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
                     this.subscriptionActive = false;
                     this.subscriptionChecked = true;
                     this.isGroupAdminManaged = false;
-                    this.showCheckout = hasPricingOptions;
+                    this.showCheckout = canShowCheckout;
                     this.cdr.detectChanges();
                 }
                 this.subscriptionCheckInProgress = false;
@@ -965,6 +1326,18 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
             this.timeFormat = this.config?.time12hFormat ? 'h:mm a' : 'HH:mm';
             this.userRegistrationEnabled = this.config?.options?.userRegistrationEnabled ?? false;
 
+            // When transcription / mapping toggles hide tabs, leave those indices.
+            if (!this.isTranscriptionEnabled && this.boardTabIndex >= TAB.Alerts) {
+                this.boardTabIndex = this.settingsBoardTabIndex;
+            } else if (!this.showIncidentMapTab && this.boardTabIndex === TAB.Map) {
+                this.boardTabIndex = this.settingsBoardTabIndex;
+            }
+            if (this.showIncidentMapTab) {
+                this.incidentsService.prefetchDefault24h(this.rdioScannerService.readPin() || undefined);
+            }
+            this.cdr.markForCheck();
+            this.cdr.detectChanges();
+
             if (!this.userRegistrationEnabled) {
                 const password = this.authForm.get('password')?.value;
                 if (password) {
@@ -1043,21 +1416,12 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
                 (p, v) => (v.pos || 0) <= time ? v : p,
                 {} as { pos?: number; src?: number; tag?: string },
             );
-            const firstAlias = this.call.sources
-                .find(s => typeof s.tag === 'string' && s.tag.trim().length > 0)
-                ?.tag?.trim();
 
             if (typeof source.src === 'number') {
-                if (typeof source.tag === 'string' && source.tag.trim().length > 0) {
-                    this.callUnit = source.tag.trim();
-                } else if (firstAlias) {
-                    this.callUnit = firstAlias;
-                } else {
-                    this.callUnit = findUnitLabelForSrc(this.call.systemData?.units, source.src) ?? `${source.src}`;
-                }
+                this.callUnit = formatUnitDisplay(this.call.systemData?.units, source.src, source.tag);
             }
         } else if (typeof this.call.source === 'number') {
-            this.callUnit = findUnitLabelForSrc(this.call.systemData?.units, this.call.source) ?? `${this.call.source}`;
+            this.callUnit = formatUnitDisplay(this.call.systemData?.units, this.call.source);
         }
 
         this.updateCallFlags();
@@ -1089,12 +1453,15 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
                 if (typeof s.src === 'number') {
                     if (norm === String(s.src)) return true;
                     if (norm === resolveUnitLabel(call.systemData?.units, s.src)) return true;
+                    if (norm === formatUnitDisplay(call.systemData?.units, s.src, s.tag)) return true;
                 }
                 if (typeof s.tag === 'string' && s.tag.trim() === norm) return true;
             }
         }
         if (typeof call.source === 'number'
-            && (norm === String(call.source) || norm === resolveUnitLabel(call.systemData?.units, call.source))) {
+            && (norm === String(call.source)
+                || norm === resolveUnitLabel(call.systemData?.units, call.source)
+                || norm === formatUnitDisplay(call.systemData?.units, call.source))) {
             return true;
         }
         return false;
@@ -1141,14 +1508,17 @@ export class RdioScannerConsoleComponent implements OnChanges, OnDestroy, OnInit
         }
     }
 
-    private playCallFromHistoryEntry(entry: RdioScannerCall | undefined): void {
+    private playCallFromHistoryEntry(
+        entry: RdioScannerCall | undefined,
+        options?: { preserveQueue?: boolean },
+    ): void {
         if (!entry) return;
         const d = entry.audio?.data;
         const hasAudio = Array.isArray(d) ? d.length > 0 : false;
         if (hasAudio) {
             this.rdioScannerService.play(entry);
         } else if (entry.id != null) {
-            this.rdioScannerService.loadAndPlay(entry.id);
+            this.rdioScannerService.loadAndPlay(entry.id, options);
         } else {
             this.rdioScannerService.beep(RdioScannerBeepStyle.Denied);
         }

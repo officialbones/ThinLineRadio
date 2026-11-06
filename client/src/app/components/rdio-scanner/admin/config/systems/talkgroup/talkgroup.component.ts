@@ -17,21 +17,32 @@
  * ****************************************************************************
  */
 
-import { Component, ElementRef, EventEmitter, Input, Output, ViewChild } from '@angular/core';
-import { FormArray, FormBuilder, FormGroup, Validators } from '@angular/forms';
+import { ChangeDetectionStrategy, ChangeDetectorRef, Component, ElementRef, EventEmitter, Input, NgZone, OnDestroy, OnInit, Output, ViewChild } from '@angular/core';
+import { AbstractControl, FormArray, FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { MatSelectChange } from '@angular/material/select';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { finalize } from 'rxjs/operators';
-import { RdioScannerAdminService, Group, Tag } from '../../../admin.service';
+import { Subscription } from 'rxjs';
+import { RdioScannerAdminService, Group, Tag, ToneHistoryAnalyzeResponse, ToneHistorySuggestion } from '../../../admin.service';
 import { RdioScannerToneSet } from '../../../../rdio-scanner';
 
 @Component({
     selector: 'rdio-scanner-admin-talkgroup',
     templateUrl: './talkgroup.component.html',
     styleUrls: ['./talkgroup.component.scss'],
+    changeDetection: ChangeDetectionStrategy.OnPush,
+    standalone: false
 })
-export class RdioScannerAdminTalkgroupComponent {
+export class RdioScannerAdminTalkgroupComponent implements OnInit, OnDestroy {
     @Input() form: FormGroup | undefined;
+    @Input() groups: Group[] = [];
+    @Input() tags: Tag[] = [];
+
+    /** Loose id match so number/string option values don't deselect (issue #248). */
+    compareSelectIds = (a: unknown, b: unknown): boolean => a == b;
+
+    private preservedGroupIds: number[] | null = null;
+    private preservedTagId: number | null = null;
 
     @Output() blacklist = new EventEmitter<void>();
 
@@ -45,23 +56,183 @@ export class RdioScannerAdminTalkgroupComponent {
     syncToneSetsStatus = '';
     syncSelectedIds   = new Set<string>();
 
-    get groups(): Group[] {
-        return this.form?.root.get('groups')?.value as Group[];
-    }
+    // Tone sets are collapsed by default to keep the talkgroup editor compact;
+    // tracked by tone-set id so the expanded state survives add/remove reorders.
+    expandedToneSets = new Set<string>();
 
-    get tags(): Tag[] {
-        return this.form?.root.get('tags')?.value as Tag[];
-    }
+    /** A/B vs long-tone exclusivity subscriptions, keyed by tone-set FormGroup. */
+    private toneExclusiveSubs = new Map<FormGroup, Subscription>();
+
+    private readonly abToneKeys = [
+        'aToneFrequency', 'aToneMinDuration', 'aToneMaxDuration',
+        'bToneFrequency', 'bToneMinDuration', 'bToneMaxDuration',
+    ] as const;
+
+    private readonly longToneKeys = [
+        'longToneFrequency', 'longToneMinDuration', 'longToneMaxDuration',
+    ] as const;
+
+    analyzingToneHistory = false;
+    toneHistoryStatus = '';
+    toneHistoryError = false;
+    toneHistoryComplete = false;
+    toneHistorySuggestions: ToneHistorySuggestion[] = [];
+    toneHistoryPartialPatterns: { patternDesc: string; callCount: number }[] = [];
+    toneHistoryCallsRequired = 3;
+    toneHistoryStats: Pick<ToneHistoryAnalyzeResponse, 'callsScanned' | 'callsWithTones' | 'callsWithCandidates' | 'discoverErrors' | 'patternsBelowThreshold' | 'lookbackHours'> | null = null;
 
     get apikeys(): any[] {
         return this.form?.root.get('apikeys')?.value as any[] || [];
     }
 
+    get systemId(): number | undefined {
+        const systemForm = this.form?.parent?.parent;
+        const id = systemForm?.get('id')?.value;
+        return typeof id === 'number' && id > 0 ? id : undefined;
+    }
+
+    // Playback of the dispatch audio behind a learned tone pattern, so the
+    // operator can hear the tone-out and name the tone set correctly.
+    playingToneCallId: number | null = null;
+    private toneAudioElement: HTMLAudioElement | null = null;
+    // Object URL backing the current playback; revoked whenever playback stops.
+    private toneAudioUrl: string | null = null;
+    // Monotonic token: a newer play (or stop) invalidates any in-flight fetch.
+    private toneAudioReq = 0;
+
     constructor(
         private adminService: RdioScannerAdminService,
+        private cdr: ChangeDetectorRef,
         private formBuilder: FormBuilder,
         private snackBar: MatSnackBar,
+        private ngZone: NgZone,
     ) {
+    }
+
+    ngOnInit(): void {
+        // Snapshot before mat-select mounts; restore if options remount clears them.
+        const groupIds = this.form?.get('groupIds')?.value;
+        this.preservedGroupIds = Array.isArray(groupIds) ? [...groupIds] : null;
+        const tagId = this.form?.get('tagId')?.value;
+        this.preservedTagId = typeof tagId === 'number' ? tagId : null;
+
+        setTimeout(() => this.restoreSelectValuesIfCleared());
+        this.wireAllToneSetExclusivity();
+    }
+
+    ngOnDestroy(): void {
+        this.stopToneAudio();
+        this.clearToneExclusiveSubs();
+    }
+
+    private restoreSelectValuesIfCleared(): void {
+        if (!this.form) {
+            return;
+        }
+        const groupCtrl = this.form.get('groupIds');
+        if (groupCtrl && this.preservedGroupIds?.length) {
+            const current = groupCtrl.value;
+            if (!Array.isArray(current) || current.length === 0) {
+                groupCtrl.setValue([...this.preservedGroupIds], { emitEvent: false });
+                groupCtrl.updateValueAndValidity({ emitEvent: false });
+            }
+        }
+        const tagCtrl = this.form.get('tagId');
+        if (tagCtrl && this.preservedTagId != null && (tagCtrl.value == null || tagCtrl.value === '')) {
+            tagCtrl.setValue(this.preservedTagId, { emitEvent: false });
+            tagCtrl.updateValueAndValidity({ emitEvent: false });
+        }
+        this.cdr.markForCheck();
+    }
+
+    /**
+     * Play (or stop, if already playing) the dispatch audio for one of the calls
+     * behind a learned tone pattern. Fetches with the admin token and plays via a
+     * blob URL, mirroring the system-health call playback.
+     */
+    async playToneSampleAudio(callId: number | undefined): Promise<void> {
+        if (!callId) {
+            return;
+        }
+        if (this.playingToneCallId === callId) {
+            this.ngZone.run(() => {
+                this.stopToneAudio();
+                this.cdr.markForCheck();
+            });
+            return;
+        }
+        this.stopToneAudio();
+        const reqId = ++this.toneAudioReq;
+        try {
+            const response = await fetch(this.adminService.getCallAudioUrl(callId), {
+                headers: this.adminService.getFetchHeaders(),
+            });
+            if (reqId !== this.toneAudioReq) {
+                return; // superseded by a newer play/stop
+            }
+            if (!response.ok) {
+                throw new Error(`audio request failed (${response.status})`);
+            }
+            const blobUrl = URL.createObjectURL(await response.blob());
+            if (reqId !== this.toneAudioReq) {
+                URL.revokeObjectURL(blobUrl);
+                return;
+            }
+            const audio = new Audio(blobUrl);
+            // The fetch/decode continuation may resume outside Angular's zone, so
+            // run the state mutations inside it to guarantee the OnPush view (the
+            // play/stop icon) refreshes deterministically.
+            const finish = () => {
+                // Only the current playback tears down; a superseded one was
+                // already stopped (and its URL revoked) by stopToneAudio().
+                if (this.toneAudioElement === audio) {
+                    this.ngZone.run(() => {
+                        this.stopToneAudio();
+                        this.cdr.markForCheck();
+                    });
+                }
+            };
+            audio.onended = finish;
+            audio.onerror = () => {
+                finish();
+                this.snackBar.open('Failed to play call audio', '', { duration: 4000 });
+            };
+            this.ngZone.run(() => {
+                this.toneAudioElement = audio;
+                this.toneAudioUrl = blobUrl;
+                this.playingToneCallId = callId;
+                this.cdr.markForCheck();
+            });
+            await audio.play();
+        } catch {
+            if (reqId === this.toneAudioReq) {
+                this.ngZone.run(() => {
+                    this.stopToneAudio();
+                    this.snackBar.open('Failed to play call audio', '', { duration: 4000 });
+                    this.cdr.markForCheck();
+                });
+            }
+        }
+    }
+
+    isToneSamplePlaying(callId: number | undefined): boolean {
+        return !!callId && this.playingToneCallId === callId;
+    }
+
+    private stopToneAudio(): void {
+        // Bump the token so any in-flight fetch aborts when it resolves.
+        this.toneAudioReq++;
+        if (this.toneAudioElement) {
+            this.toneAudioElement.onended = null;
+            this.toneAudioElement.onerror = null;
+            this.toneAudioElement.pause();
+            this.toneAudioElement = null;
+        }
+        if (this.toneAudioUrl) {
+            URL.revokeObjectURL(this.toneAudioUrl);
+            this.toneAudioUrl = null;
+        }
+        this.playingToneCallId = null;
     }
 
     getToneSets(): FormArray {
@@ -76,9 +247,10 @@ export class RdioScannerAdminTalkgroupComponent {
         return toneSetsArray;
     }
 
-    addToneSet(toneSet?: Partial<RdioScannerToneSet>): void {
+    addToneSet(toneSet?: Partial<RdioScannerToneSet>, expand = false): void {
+        const id = toneSet?.id || this.generateToneSetId();
         const toneSetForm = this.formBuilder.group({
-            id: [toneSet?.id || this.generateToneSetId()],
+            id: [id],
             label: [toneSet?.label || '', Validators.required],
             aToneFrequency: [toneSet?.aTone?.frequency ?? null],
             aToneMinDuration: [toneSet?.aTone?.minDuration ?? null],
@@ -90,17 +262,174 @@ export class RdioScannerAdminTalkgroupComponent {
             longToneMinDuration: [toneSet?.longTone?.minDuration ?? null],
             longToneMaxDuration: [toneSet?.longTone?.maxDuration ?? null],
             tolerance: [toneSet?.tolerance ?? 10],
-            minDuration: [toneSet?.minDuration ?? null],
             // TonesToActive downstream forwarding (per tone set)
             downstreamEnabled: [(toneSet as any)?.downstreamEnabled ?? false],
             downstreamURL: [(toneSet as any)?.downstreamURL ?? ''],
             downstreamAPIKey: [(toneSet as any)?.downstreamAPIKey ?? ''],
+            geoCity: [toneSet?.geoCity ?? ''],
+            geoLat: [toneSet?.geoLat ?? null],
+            geoLon: [toneSet?.geoLon ?? null],
+            geoRadiusMiles: [toneSet?.geoRadiusMiles ?? null],
+            locationContext: [toneSet?.locationContext ?? ''],
         });
         this.getToneSets().push(toneSetForm);
+        this.wireToneSetExclusivity(toneSetForm);
+        if (expand) {
+            this.expandedToneSets.add(id);
+        }
     }
 
     removeToneSet(index: number): void {
+        const ctrl = this.getToneSets().at(index);
+        const label = (ctrl?.get('label')?.value || '').toString().trim() || `tone set ${index + 1}`;
+        if (!confirm(`Are you sure you want to delete ${label}?`)) {
+            return;
+        }
+        const id = ctrl?.get('id')?.value;
+        if (id) {
+            this.expandedToneSets.delete(id);
+        }
+        if (ctrl instanceof FormGroup) {
+            this.unwireToneSetExclusivity(ctrl);
+        }
         this.getToneSets().removeAt(index);
+    }
+
+    /** True when any A/B tone field has a value — long-tone inputs should be locked. */
+    isLongToneLocked(ctrl: AbstractControl): boolean {
+        return this.hasAbToneInput(ctrl);
+    }
+
+    /** True when any long-tone field has a value — A/B inputs should be locked. */
+    isAbToneLocked(ctrl: AbstractControl): boolean {
+        return this.hasLongToneInput(ctrl);
+    }
+
+    private wireAllToneSetExclusivity(): void {
+        for (const ctrl of this.getToneSets().controls) {
+            if (ctrl instanceof FormGroup) {
+                this.wireToneSetExclusivity(ctrl);
+            }
+        }
+    }
+
+    private wireToneSetExclusivity(toneSet: FormGroup): void {
+        this.unwireToneSetExclusivity(toneSet);
+        this.syncToneModeExclusivity(toneSet);
+        const sub = toneSet.valueChanges.subscribe(() => {
+            this.syncToneModeExclusivity(toneSet);
+        });
+        this.toneExclusiveSubs.set(toneSet, sub);
+    }
+
+    private unwireToneSetExclusivity(toneSet: FormGroup): void {
+        const sub = this.toneExclusiveSubs.get(toneSet);
+        if (sub) {
+            sub.unsubscribe();
+            this.toneExclusiveSubs.delete(toneSet);
+        }
+    }
+
+    private clearToneExclusiveSubs(): void {
+        for (const sub of this.toneExclusiveSubs.values()) {
+            sub.unsubscribe();
+        }
+        this.toneExclusiveSubs.clear();
+    }
+
+    private isToneFieldFilled(value: unknown): boolean {
+        return value !== null && value !== undefined && value !== '';
+    }
+
+    private hasAbToneInput(ctrl: AbstractControl): boolean {
+        return this.abToneKeys.some((key) => this.isToneFieldFilled(ctrl.get(key)?.value));
+    }
+
+    private hasLongToneInput(ctrl: AbstractControl): boolean {
+        return this.longToneKeys.some((key) => this.isToneFieldFilled(ctrl.get(key)?.value));
+    }
+
+    private syncToneModeExclusivity(toneSet: FormGroup): void {
+        const hasAb = this.hasAbToneInput(toneSet);
+        const hasLong = this.hasLongToneInput(toneSet);
+
+        if (hasAb) {
+            this.clearToneFields(toneSet, this.longToneKeys);
+            this.setToneFieldsEnabled(toneSet, this.longToneKeys, false);
+            this.setToneFieldsEnabled(toneSet, this.abToneKeys, true);
+        } else if (hasLong) {
+            this.clearToneFields(toneSet, this.abToneKeys);
+            this.setToneFieldsEnabled(toneSet, this.abToneKeys, false);
+            this.setToneFieldsEnabled(toneSet, this.longToneKeys, true);
+        } else {
+            this.setToneFieldsEnabled(toneSet, this.abToneKeys, true);
+            this.setToneFieldsEnabled(toneSet, this.longToneKeys, true);
+        }
+        this.cdr.markForCheck();
+    }
+
+    private clearToneFields(toneSet: FormGroup, keys: readonly string[]): void {
+        for (const key of keys) {
+            const ctrl = toneSet.get(key);
+            if (ctrl && this.isToneFieldFilled(ctrl.value)) {
+                ctrl.setValue(null, { emitEvent: false });
+            }
+        }
+    }
+
+    private setToneFieldsEnabled(toneSet: FormGroup, keys: readonly string[], enabled: boolean): void {
+        for (const key of keys) {
+            const ctrl = toneSet.get(key);
+            if (!ctrl) {
+                continue;
+            }
+            if (enabled && ctrl.disabled) {
+                ctrl.enable({ emitEvent: false });
+            } else if (!enabled && ctrl.enabled) {
+                ctrl.disable({ emitEvent: false });
+            }
+        }
+    }
+
+    isToneSetExpanded(ctrl: AbstractControl): boolean {
+        return this.expandedToneSets.has(ctrl.get('id')?.value);
+    }
+
+    toggleToneSet(ctrl: AbstractControl): void {
+        const id = ctrl.get('id')?.value;
+        if (!id) {
+            return;
+        }
+        if (this.expandedToneSets.has(id)) {
+            this.expandedToneSets.delete(id);
+        } else {
+            this.expandedToneSets.add(id);
+        }
+    }
+
+    toneSetTitle(ctrl: AbstractControl, index: number): string {
+        const label = (ctrl.get('label')?.value || '').toString().trim();
+        const base = label || `Tone set ${index + 1}`;
+        const loc = this.toneSetLocationSummary(ctrl);
+        return loc ? `${base} · ${loc}` : base;
+    }
+
+    toneSetLocationSummary(ctrl: AbstractControl): string {
+        const city = (ctrl.get('geoCity')?.value || '').toString().trim();
+        if (city) {
+            const radius = ctrl.get('geoRadiusMiles')?.value;
+            return radius ? `${city} (${radius} mi)` : city;
+        }
+        const lat = ctrl.get('geoLat')?.value;
+        const lon = ctrl.get('geoLon')?.value;
+        if (typeof lat === 'number' && typeof lon === 'number' && lat !== 0 && lon !== 0) {
+            return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+        }
+        return '';
+    }
+
+    toneSetHasLocation(ctrl: AbstractControl): boolean {
+        return !!this.toneSetLocationSummary(ctrl);
     }
 
     triggerToneImport(format: ToneImportFormat): void {
@@ -225,6 +554,91 @@ export class RdioScannerAdminTalkgroupComponent {
                     this.snackBar.open(msg, '', { duration: 5000 });
                 },
             });
+    }
+
+    analyzeToneHistory(): void {
+        if (!this.form || this.analyzingToneHistory) {
+            return;
+        }
+
+        const talkgroupId = this.form.get('id')?.value;
+        const systemId = this.systemId;
+        if (!talkgroupId || !systemId) {
+            this.snackBar.open('Save this talkgroup first so it has a database ID', '', { duration: 5000 });
+            return;
+        }
+
+        this.stopToneAudio();
+        this.analyzingToneHistory = true;
+        this.toneHistoryComplete = false;
+        this.toneHistoryError = false;
+        this.toneHistoryStatus = '';
+        this.toneHistorySuggestions = [];
+        this.toneHistoryPartialPatterns = [];
+        this.toneHistoryStats = null;
+        this.cdr.markForCheck();
+
+        this.adminService.analyzeToneHistory(systemId, talkgroupId)
+            .pipe(finalize(() => {
+                this.analyzingToneHistory = false;
+                this.cdr.markForCheck();
+            }))
+            .subscribe({
+                next: (response) => {
+                    this.toneHistoryComplete = true;
+                    this.toneHistoryError = false;
+                    this.toneHistoryCallsRequired = response?.callsRequired ?? 3;
+                    this.toneHistorySuggestions = response?.suggestions || [];
+                    this.toneHistoryPartialPatterns = response?.partialPatterns || [];
+                    this.toneHistoryStats = {
+                        callsScanned: response?.callsScanned ?? 0,
+                        callsWithTones: response?.callsWithTones ?? 0,
+                        callsWithCandidates: response?.callsWithCandidates ?? 0,
+                        discoverErrors: response?.discoverErrors ?? 0,
+                        patternsBelowThreshold: response?.patternsBelowThreshold ?? 0,
+                        lookbackHours: response?.lookbackHours ?? 168,
+                    };
+                    if (this.toneHistorySuggestions.length > 0) {
+                        this.toneHistoryStatus = `Found ${this.toneHistorySuggestions.length} pattern${this.toneHistorySuggestions.length === 1 ? '' : 's'} (≥${this.toneHistoryCallsRequired} calls each)`;
+                    } else {
+                        this.toneHistoryStatus = response?.message || `No patterns with at least ${this.toneHistoryCallsRequired} matching calls`;
+                    }
+                    this.cdr.markForCheck();
+                },
+                error: (error) => {
+                    this.toneHistoryComplete = true;
+                    this.toneHistoryError = true;
+                    this.toneHistoryStatus = error?.error?.error || 'Tone history analysis failed';
+                    this.cdr.markForCheck();
+                },
+            });
+    }
+
+    addSuggestedToneSet(suggestion: ToneHistorySuggestion): void {
+        if (!this.form || !suggestion?.toneSet) {
+            return;
+        }
+        if (!this.form.get('toneDetectionEnabled')?.value) {
+            this.form.get('toneDetectionEnabled')?.setValue(true);
+        }
+        this.addToneSet({
+            ...suggestion.toneSet,
+            label: suggestion.label || suggestion.toneSet.label,
+        }, true);
+        // Stop playback if it belonged to the suggestion we just consumed.
+        if (this.isSuggestionCallId(suggestion, this.playingToneCallId)) {
+            this.stopToneAudio();
+        }
+        this.toneHistorySuggestions = this.toneHistorySuggestions.filter((s) => s !== suggestion);
+        this.cdr.markForCheck();
+    }
+
+    private isSuggestionCallId(suggestion: ToneHistorySuggestion, callId: number | null): boolean {
+        if (!callId) {
+            return false;
+        }
+        return (suggestion.callIds || []).includes(callId) ||
+            (suggestion.samples || []).some((s) => s.callId === callId);
     }
 
     private appendImportedToneSets(toneSets: RdioScannerToneSet[]): void {

@@ -1,126 +1,34 @@
 <div class="scanner-shell">
-    <!-- Email Verification (shown when there's a verification token) -->
-    <rdio-scanner-email-verification 
-        *ngIf="hasVerificationToken()">
+  <!-- Email Verification (shown when there's a verification token) -->
+  @if (hasVerificationToken()) {
+    <rdio-scanner-email-verification
+      >
     </rdio-scanner-email-verification>
+  }
 
-    <!-- Auth Screen (shown when authentication is required and user is not authenticated) -->
-    <rdio-scanner-auth-screen 
-        *ngIf="!hasVerificationToken() && authRequired && !userAuthenticated"
-        (authenticated)="onUserAuthenticated()">
+  <!-- Auth Screen (shown when authentication is required and user is not authenticated) -->
+  @if (!hasVerificationToken() && authRequired && !userAuthenticated) {
+    <rdio-scanner-auth-screen
+      (authenticated)="onUserAuthenticated()">
     </rdio-scanner-auth-screen>
+  }
 
-    <!-- Mobile web: no scanner UI — account, billing, app links only -->
+  <!-- Mobile web: no scanner UI — account, billing, app links only -->
+  @if (!hasVerificationToken() && (!authRequired || userAuthenticated) && isMobileRestrictedBrowser) {
     <rdio-scanner-mobile-web-hub
-        *ngIf="!hasVerificationToken() && (!authRequired || userAuthenticated) && isMobileRestrictedBrowser"
-        (signOut)="onSignOut()">
+      (signOut)="onSignOut()">
     </rdio-scanner-mobile-web-hub>
+  }
 
-    <!-- ═══════════════════════════════════════════════════════════════════
-         Both layouts are kept mounted simultaneously; only one is visible at
-         a time. Toggling between them is instant — no re-mount, no refetch,
-         no loss of filter / scroll / form state. Cost: both subscribe to the
-         singleton scanner service, which is cheap since audio + websocket
-         state lives in the service itself, not the views.
-    ════════════════════════════════════════════════════════════════════ -->
-    <ng-container *ngIf="!hasVerificationToken() && (!authRequired || userAuthenticated) && !isMobileRestrictedBrowser">
-
-        <!-- NEW TAB-BASED LAYOUT -->
-        <div class="view-host" [hidden]="useClassicView">
-            <rdio-scanner-chassis class="thinline-skin">
-                <rdio-scanner-console
-                    [viewActive]="!useClassicView"
-                    (toggleFullscreen)="toggleFullscreen()"
-                    (signOut)="onSignOut()"
-                    (toggleClassicViewRequest)="toggleClassicView()">
-                </rdio-scanner-console>
-            </rdio-scanner-chassis>
-        </div>
-
-        <!-- CLASSIC LAYOUT -->
-        <div class="view-host" [hidden]="!useClassicView">
-        <mat-sidenav-container [hasBackdrop]="false" class="thinline-skin">
-            <mat-sidenav #classicSearchPanel [autoFocus]="false" [disableClose]="true" position="start" (closedStart)="onSearchPanelClosed()">
-                <div class="panel search">
-                    <mat-toolbar>
-                        <div>
-                            <button mat-icon-button (click)="classicSearchPanel.close()">
-                                <mat-icon>arrow_forward</mat-icon>
-                            </button>
-                        </div>
-                    </mat-toolbar>
-                    <div #classicScrollableSearch>
-                        <div>
-                            <rdio-scanner-search #classicSearchComponent></rdio-scanner-search>
-                        </div>
-                    </div>
-                </div>
-            </mat-sidenav>
-
-            <mat-sidenav #classicSelectPanel [autoFocus]="false" [disableClose]="true" position="end">
-                <div class="panel select">
-                    <mat-toolbar>
-                        <div>
-                            <button mat-icon-button (click)="classicSelectPanel.close()">
-                                <mat-icon>arrow_back</mat-icon>
-                            </button>
-                        </div>
-                    </mat-toolbar>
-                    <div #classicScrollableSelect>
-                        <div>
-                            <rdio-scanner-select></rdio-scanner-select>
-                        </div>
-                    </div>
-                </div>
-            </mat-sidenav>
-
-            <mat-sidenav #classicSettingsPanel [autoFocus]="false" [disableClose]="true" position="end">
-                <div class="panel settings">
-                    <mat-toolbar>
-                        <div>
-                            <button mat-icon-button (click)="classicSettingsPanel.close()">
-                                <mat-icon>arrow_back</mat-icon>
-                            </button>
-                        </div>
-                    </mat-toolbar>
-                    <div #classicScrollableSettings>
-                        <div>
-                            <rdio-scanner-settings></rdio-scanner-settings>
-                        </div>
-                    </div>
-                </div>
-            </mat-sidenav>
-
-            <mat-sidenav #classicAlertsPanel [autoFocus]="false" [disableClose]="true" position="end">
-                <div class="panel alerts">
-                    <mat-toolbar>
-                        <div>
-                            <button mat-icon-button (click)="classicAlertsPanel.close()">
-                                <mat-icon>arrow_back</mat-icon>
-                            </button>
-                        </div>
-                    </mat-toolbar>
-                    <div #classicScrollableAlerts>
-                        <div>
-                            <rdio-scanner-alerts [includeTranscriptsTab]="true" #classicAlertsComponent></rdio-scanner-alerts>
-                        </div>
-                    </div>
-                </div>
-            </mat-sidenav>
-
-            <mat-sidenav-content>
-                <rdio-scanner-main-legacy
-                    [viewActive]="useClassicView"
-                    (openSearchPanel)="classicScrollTop(classicScrollableSearch); classicSearchPanel.open(); classicSearchComponent.searchCalls()"
-                    (openSelectPanel)="classicScrollTop(classicScrollableSelect); classicSelectPanel.open()"
-                    (openSettingsPanel)="classicScrollTop(classicScrollableSettings); classicSettingsPanel.open()"
-                    (openAlertsPanel)="classicScrollTop(classicScrollableAlerts); classicAlertsPanel.open()"
-                    (toggleFullscreen)="toggleFullscreen()"
-                    (signOut)="onSignOut()"
-                    (toggleClassicViewRequest)="toggleClassicView()">
-                </rdio-scanner-main-legacy>
-            </mat-sidenav-content>
-        </mat-sidenav-container>
-        </div>
-    </ng-container>
+  @if (!hasVerificationToken() && (!authRequired || userAuthenticated) && !isMobileRestrictedBrowser) {
+    <div class="view-host"
+      >
+      <rdio-scanner-chassis class="thinline-skin">
+        <rdio-scanner-console
+          (toggleFullscreen)="toggleFullscreen()"
+          (signOut)="onSignOut()">
+        </rdio-scanner-console>
+      </rdio-scanner-chassis>
+    </div>
+  }
 </div>

@@ -1,5 +1,1143 @@
 # Change log
 
+## Version 26.10.32 - Released October 30, 2026
+
+### Fixed
+
+- **Deleted API keys in SDR Health**
+  - Deleting an API key now removes its SDR Health entry and dismisses its open SDRTrunk alerts. Before, a deleted key stayed in SDR Health with no name and could keep an "SDRTrunk offline" alert open.
+  - An SDRTrunk still connected with a deleted key is disconnected, so it can't keep reporting under that key.
+  - Entries left behind by keys deleted before this update are cleaned up when the server starts.
+
+---
+
+## Version 26.10.31 - Released October 30, 2026
+
+### Fixed
+
+- **Duplicate API keys**
+  - A new API key could be saved more than once. After the first save the Admin → API Keys page kept the key without its id, so changing its systems, toggling it, reordering, or saving another key added it again. The page now picks up the saved id, and the server updates a key it already has instead of adding a copy, even from a page that was opened before the upgrade.
+  - Deleting an API key while a newly added key had not been saved yet could leave the deleted key in place.
+
+---
+
+## Version 26.10.30 - Released October 30, 2026
+
+### Fixed
+
+- **Thinline Radio Core stall**
+  - A call with back-to-back key-ups could be split apart and merged back together endlessly. This tied up Core, so SDRTrunk sites took turns showing **SDRTrunk offline**, upload requests went unanswered, and held calls arrived late. Calls are now split so the parts can't merge back.
+
+---
+
+## Version 26.10.29 - Released October 29, 2026
+
+### Added
+
+- **Thinline Radio Core (multi-site call selection)**
+  - SDRTrunk sites with a **Thinline Radio Core** stream hold each recording and report it to the server as it starts and when it is ready, with its length and voice decode quality. The server groups every site's copy of the same transmission and asks only the best one to upload. The other copies are discarded, so listeners hear each call once.
+  - The longest copy wins. When copies are the same length, the one with the cleaner decode wins.
+  - Works with one site too: when a site hears the same call on more than one tower, Core keeps the best copy.
+  - If a site loses its connection to the server, it uploads its held calls directly, so nothing is lost. A held call whose audio is mostly inside a call another site already delivered is dropped as a duplicate.
+  - A very short best copy waits up to one second for other sites before it is chosen, so a fragment from one site cannot replace another site's full call.
+  - Requires the Thinline Dynamic Solutions SDRTrunk build.
+- **SDR Health (Admin)**
+  - Live view of each connected SDRTrunk site: tuners, channels, streams, playlist, preferences, and a spectrum display in dB with channel markers.
+  - Change tuner, channel, stream, and preference settings remotely, assign talkgroups to streams, and add or delete streams.
+  - Each site decides what can be changed remotely under **User Preferences → Thinline Radio** in SDRTrunk.
+- **Site Control & Thinline Core keys**
+  - Admin → API Keys has separate **Uploads** and **Site Control & Thinline Core** tabs. These keys connect SDRTrunk for health, remote control and Thinline Core, and upload only the Core calls the server picks (or held calls while the site is disconnected).
+- **SDRTrunk system alerts**
+  - Control channel lost, tuner error, uploader error, sample overflow, and site offline alerts appear under a new **SDRTrunk** group.
+- **Transcribe all calls**
+  - Admin → Options → Transcription has a **Transcribe all calls** switch that transcribes every call on every system, not only talkgroups with alerts or auto-learn. Duration and tone-only skips still apply. Off by default; cloud transcription providers will cost more when it is on.
+  - A talkgroup's **Exclude from transcription** setting skips that channel entirely.
+- **Require listener sign-in**
+  - Admin → Options has a **Require listener sign-in** switch. Creating users or turning on registration no longer locks the scanner by itself (#302).
+  - Existing servers that already required sign-in keep it on after the upgrade. Importing an older backup or saving options without this setting keeps the current value.
+- **Sort talkgroups by group**
+  - The system talkgroup list has a **Sort by Group** button next to Sort A–Z, and a per-page choice of 50, 100, 200, 500, or All (#300). Talkgroup search also matches group names.
+
+### Changed
+
+- **Transcript training review**
+  - An approval is blocked, with the reason shown, when the clip is over 30 seconds, has no spoken words, uses number words instead of digits, or abbreviates street types, directions, or "route". Problems show on each card and update as you edit.
+  - The editing guide is updated to match these rules.
+
+---
+
+## Version 26.10.25 - Released October 25, 2026
+
+### Added
+
+- **Shared call classifications**
+  - Admin → Call Natures can **Update from ThinLine** to download the shared category list. Categories you added on this server, such as local 10-codes, are kept, and map expire times are not changed. **Clear local classifications** removes the whole list.
+- **Correct Pin address search**
+  - Type an address and choose **Find**. One match moves the pin. Several matches are shown as A, B, C, D dots on the map and as a list. Pick one, then save.
+
+### Changed
+
+- **Alerts**
+  - Dispatch cards are grouped by channel, with the call label, transcript, and a map when the call is pinned. The map and label fill in on the open card when mapping finishes.
+  - **All** lists every radio-transmission alert the account can hear. **Mine** stays limited to alert preferences. **System** stays health alerts only.
+  - The recent-alerts rail shows on the Transmissions tab only.
+- **Stats**
+  - Ranges are today, 24 hours, 7 days, and 30 days. The board shows call volume, incidents, tone-outs, channels, and call natures.
+
+### Fixed
+
+- **Alert sounds**
+  - Saving Alerts → Preferences no longer clears custom notification sounds or pager playback.
+- **Unspecified alarms**
+  - When the radio does not say fire or burglary, the channel tag decides. A commercial alarm on a fire channel is a fire alarm.
+
+---
+
+## Version 26.10.20 - Released October 20, 2026
+
+### Added
+
+- **Remote settings management (Central Management)**
+  - `GET /api/admin/options` returns the current options plus the server version. Credentials (API keys, passwords, secrets, tokens) are never returned; they appear as `{"set": true|false}`.
+  - `PATCH /api/admin/options?compact=1` applies a partial update exactly as before but responds with only `{ok, version, options}` instead of the entire config (no users or systems in the response).
+  - Central Management uses these with its existing admin-token handshake to view and edit settings on one server or push them to many servers at once. Behavior for local admins is unchanged.
+
+- **Config backup to Central Management**
+  - A server paired with Central Management now sends its full configuration (the same document config sync writes and the admin export contains) to Central Management after every configuration change, so CM can keep versioned snapshots and restore one.
+  - Changes are coalesced: the push waits 30 seconds after the last change (never more than 5 minutes after the first) and is skipped when nothing differs from the last copy CM accepted. A baseline copy is also sent about 2 minutes after startup. The push is gzip-compressed and independent of the file-based **Config sync** setting.
+  - Failures retry with backoff (1 to 15 minutes) and log at most every 15 minutes. A Central Management that does not support backups yet is rechecked hourly.
+  - The export includes password hashes and credentials, exactly like config sync, so the Central Management database should be treated as sensitive.
+
+- **Per-instance time zone**
+  - New **Time Zone** option (Admin > Config > Options > General, IANA name such as `America/Chicago`). Call times in the web app (console, search, alerts, incident map), the time in tone/pre-alert push notifications, and the prune time use it. Empty keeps the old behavior (browser time zone in the web app, server time zone elsewhere).
+  - Zone names are validated in the admin, over the options API and on import; an unknown name is rejected. The zone database is embedded in the binary, so it works on minimal hosts and containers.
+
+- **Prune at a set time of day**
+  - New **Prune Time** option (24-hour `HH:MM`, in the instance time zone). When set, the database prune runs once a day at that time instead of at startup and every hour. Instances that share a host can be given different times so they do not all prune together.
+  - A restart does not trigger a catch-up prune outside the slot. Two prunes never overlap. Leave the option empty to keep the previous behavior.
+  - Both options can be pushed from Central Management with no restart.
+
+---
+
+## Version 26.10.11 - Released October 10, 2026
+
+### Added
+
+- **Hidden channels**
+  - New **Hidden** toggle on each talkgroup in the admin. A hidden talkgroup is removed from the channel list users see (live feed, channel selection, available channels) and new calls for it are dropped at ingest.
+  - The talkgroup itself stays in the database, so every existing call, transcript and alert for it is kept. Deleting a talkgroup removes all of those, so use Hidden to retire a channel, for example one that has gone encrypted.
+  - Turn the toggle off to bring the channel back.
+
+---
+
+## Version 26.10.10 - Released October 10, 2026
+
+### Fixed
+
+- **Dispatch voice calls skipped as "tone-only"**
+  - Tone removal before transcription mistook a dispatcher's steady vowel pitch (200-650 Hz) for a sustained tone. The voice left after the last "tone" fell under 2 seconds, so the whole call was skipped and never transcribed. The tones that came before it then had no voice call to attach to.
+  - A frame now only counts as a tone when its energy sits in a few narrow spectral peaks, which pure paging tones do and speech does not.
+  - Whether a clip still has speech is now decided by measuring the audio left after the tones are cut, not by the time after the last tone. Real speech before a late or steady tone is no longer thrown away.
+- **Tone pages transcribed as "YOU" / "THANK YOU"**
+  - After the tones are removed, a clip with no speech left (only silence and static) is no longer sent to speech-to-text, which was inventing filler words from it.
+- **Tone alerts fired on filler instead of waiting for the voice call**
+  - A tone clip of 3 seconds or more whose transcript was filler was treated as a real voice call, so the alert fired right away with that filler and the actual dispatch got no tones. It now stays pending until the real voice call arrives.
+  - If no voice call arrives within 60 seconds, the alert's transcript is `TONES DETECTED - NO VOICE CALL AVAILABLE` instead of the filler text sent to Tones To Active.
+
+---
+
+## Version 26.10.01 - Released October 6, 2026
+
+### Changed
+
+- **Web scanner matches the mobile HUD**
+  - Glass display with a tag-colored backlight, annunciator flags (LIVE, SCAN, RX, HOLD SYS, HOLD TG, PAUSE), a signal meter, and the system, tag, TGID, and unit lines.
+  - While the live feed is searching, the display walks each enabled talkgroup. A segmented sweep bar runs left to right, the same direction as the phone.
+  - The keypad uses the same glass keys as the mobile scanner.
+- **Audio conversion is plain AAC**
+  - Admin → Options offers Disabled or Enabled. The normalization modes and the voice-filter chain are gone. Incoming audio is stored as AAC m4a. Dispatch tones are still removed before transcription.
+  - The transcription audio-enhancement toggle is removed. Audio is no longer denoised or compressed with ffmpeg before speech-to-text.
+- **Web fonts are self-hosted**
+  - The scanner no longer loads fonts from a third party, and the unused Stripe.js script tag is gone.
+
+### Fixed
+
+- **Expired admin session away from localhost**
+  - A stale admin token now returns 401 instead of 403, so the mobile app can send the admin back through sign-in.
+
+---
+
+## Version 26.09.24 - Released September 21, 2026
+
+### Changed
+
+- **Scanner boot message stays hidden**
+  - "Loading ThinLine Radio…" no longer flashes above the scanner while the client starts. The message only appears if the page still has not started after recovery.
+
+---
+
+## Version 26.09.23 - Released September 21, 2026
+
+### Fixed
+
+- **Chrome OS / Chromebox blank screen (`Object.hasOwn is not a function`)**
+  - Angular 22 chunks call `Object.hasOwn`, which older Chrome OS does not have. The scanner never boots (white, then black after 26.09.22). A small polyfill now runs in `index.html` before those chunks.
+  - Stale-bundle recovery is keyed to this version so a Chromebox that already ran 26.09.22 recovery is not left executing a no-op JS chunk.
+
+---
+
+## Version 26.09.22 - Released September 21, 2026
+
+### Fixed
+
+- **Chrome OS / Chromebox white screen on the public scanner**
+  - Chrome OS often installs the scanner as a PWA. After a deploy the service worker still had the previous `index.html`, which requested hashed JS files that no longer exist, so Angular never booted and Material's light canvas stayed white. Missing JS now returns a recovery script that unregisters the worker and reloads.
+  - Manifest orientation is `any` instead of `portrait` so landscape Chromeboxes are not locked.
+  - Chrome OS is never treated as the mobile-only hub, even when the UA also says Android.
+  - `html`/`body` use the dark scanner background so a failed boot is not a white page.
+
+---
+
+## Version 26.09.21 - Released September 21, 2026
+
+### Changed
+
+- **Cloudflare and AssemblyAI transcription send without a worker pool**
+  - Those cloud STT jobs are dispatched as calls arrive instead of waiting on local transcription threads. Local Whisper still uses the worker pool because of VRAM limits.
+  - Fixes morning backlog on busy servers where two workers sat behind 2–5 minute Cloudflare hangs.
+
+---
+
+## Version 26.09.20 - Released September 20, 2026
+
+### Added
+
+- **Relay billing roster** (`GET /api/relay/billing-roster`)
+  - Authenticated with the relay API key. Returns opaque user ids plus subscription, suspended, expired, and billing-required flags so the relay can bill ad-free seats. Count is calculated on the relay, not here.
+  - Ad-free is a separate relay plan. It does not include push or geocoding.
+  - Existing admin-overridden ad-free servers keep ads off and can still start a paid Ad-free checkout to convert, except AlertPage and Ohio Radio Scanner Network which stay complimentary with no convert-by date.
+  - Other complimentary Ad-free operators are asked to convert by September 30, 2026. Ads are not auto-cut on that date.
+  - Ad-free roster billing is $25/mo minimum. Every seat is billed at the Volume rate for that roster size ($0.50 down to $0.20).
+
+---
+
+## Version 26.09.15 - Released September 15, 2026
+
+### Added
+
+- **Profanity filter on transcripts and alerts**
+  - After transcription (local STT and Hydra), foul language is masked before the transcript is saved and before alert/push notifications are sent.
+  - Whole-word matching so dispatch terms such as assault, assignment, passenger, and street names are not changed.
+  - On by default. Admin → Transcription → Quality can turn it off or add extra blocked words.
+- **Backup transcription provider**
+  - Admin → Transcription → Provider can set a backup STT engine. When the primary call fails (Cloudflare GPU OOM, API 5xx, timeouts), the same audio is sent to the backup. Truncated/invalid audio is not retried. Credentials for both providers show on that page.
+- **Configurable web UI accent color**
+  - Ember red is still the default. Admins can change the public scanner primary color under Options → Branding (presets or custom hex). Listeners can override it for themselves in Settings → Appearance, or follow the site default.
+  - Volume slider, listeners, queue, Transmissions/Channels tabs, weather card, and other scanner chrome follow the chosen color.
+
+### Changed
+
+- **Radio Reference credentials moved to Tools**
+  - Username, password, and enable toggle now live under Admin → Tools → Radio Reference, with the import flow. Removed from Options → Integrations.
+
+### Fixed
+
+- **Scanner LCD — keypad jumps when a talkgroup comes up**
+  - Scanning row, transcript box, talkgroup card, and LIVE/DELAYED slot now keep a reserved height. Going from SCANNING to a live talkgroup (and back) no longer shoves the keypad and weather widget.
+  - Alert cards: keyword chip no longer overlaps the date/time on narrow screens; channel sits on the next line and the play control stays on the right.
+  - Search results table fills the remaining Transmissions panel instead of stopping at a 20-row viewport.
+
+---
+
+## Version 26.09.07 - Released September 6, 2026
+
+### Added
+
+- **Profanity filter on transcripts and alerts**
+  - After transcription (local STT and Hydra), foul language is masked before the transcript is saved and before alert/push notifications are sent.
+  - Whole-word matching so dispatch terms such as assault, assignment, passenger, and street names are not changed.
+  - On by default. Admin → Transcription → Quality can turn it off or add extra blocked words.
+
+### Fixed
+
+- **Scanner LCD — keypad jumps when a talkgroup comes up**
+  - Scanning row, transcript box, talkgroup card, and LIVE/DELAYED slot now keep a reserved height. Going from SCANNING to a live talkgroup (and back) no longer shoves the keypad and weather widget.
+  - Alert cards: keyword chip no longer overlaps the date/time on narrow screens; channel sits on the next line and the play control stays on the right.
+  - Search results table fills the remaining Transmissions panel instead of stopping at a 20-row viewport.
+
+---
+
+## Version 26.09.06 - Released September 5, 2026
+
+### Fixed
+
+- **Duplicate detection — soft RID on radio-timestamp pass**
+  - Radio-timestamp last pass again treats known different unit/radio IDs as not duplicates (same rule as arrival matching). Prevents dropping a second talker whose P25 timestamp falls within the window of a prior call on the same talkgroup.
+
+## Version 26.09.05 - Released September 5, 2026
+
+### Fixed
+
+- **Duplicate detection — hybrid RID handling**
+  - **Arrival** passes (cache + DB): soft radio-ID guard — known different unit IDs are kept so distinct talkers that finish uploading together are not collapsed.
+  - **Radio-timestamp** last pass: ignores RID so same-PTT multi-site copies that disagree on radio ID still drop. Feeder and API key are never part of matching.
+  - Admin Audio Settings copy updated.
+
+- **Livefeed — patched calls stream as one talkgroup**
+  - Formal P25 `patches` no longer fan in as a PATCH-style multi-match to the client. The server picks **one** enabled talkgroup from primary ∪ patches (prefer primary), clears `patches` on the outbound payload, and sends a single CALL. Avoid on the primary stops hearing it as that TG; another selected patch member can still receive it once as that member.
+
+- **Livefeed — universal cross-talkgroup emit dedupe**
+  - When the same PTT is uploaded as separate calls on different talkgroups (same system, same `source`, same radio timestamp), each livefeed client is streamed **once** within a short window. Soft when source is missing (analog / unknown unit). Applies to every system — not limited to a specific county or talkgroup set. Calls remain stored for search/history.
+
+- **Duplicate detection — radio timestamp last pass**
+  - After arrival-time cache/DB checks, a final pass drops same system/talkgroup uploads whose **radio (P25) timestamp** falls within `duplicateRadioTimestampWindow` (default **1200 ms**; 0 disables). Admin Audio Settings exposes the new control.
+
+- **Transcript collector — public self-serve key page removed**
+  - Visitors on `transcripts.thinlineds.com` can browse and download training data, but `/register` no longer mints a key. System admins still request a key from the TLR Transcripts UI to send training clips.
+
+### Added
+
+- **Mobile — Server admin (system admins)**
+  - Scanner Management → scanner settings now has a **Server admin** section for system admins. Systems expand to show their talkgroups. Groups edit talkgroup access and delays. Users open a management screen (profile, group, subscription status, PIN expiration, group/system admin, verified, suspend, password, delete). Uses PIN SSO and merge-only APIs so phones are not IP-locked to `/admin` and full system saves are not required.
+
+### Changed
+
+- **Scanner client — Signal UI**
+  - End-user scanner, incident map, auth/onboarding, and group-admin now use the Signal design system (obsidian, ember, Inter / Space Grotesk). The LCD/hardware look is gone. `/admin` is unchanged.
+  - Alerts list uses keyword-colored chips, glass cards, and a filled Play control so matches are easier to scan.
+
+- **Coverage map rebuilds when operators change coverage**
+  - `www.thinlineradio.com/coverage` now serves a live `/data/coverage.json` from the public directory instead of a dated snapshot. Saving coverage (or registering / going private) invalidates the cache so the map updates on the next load.
+
+---
+
+## Version 26.08.31 - Released August 31, 2026
+
+### Fixed
+
+- **New systems/talkgroups enabled by default / out-of-plan traffic (#283)**
+  - User groups now have an **Auto-enable new systems / talkgroups** toggle (default off). When off, saving freezes All / `*` access to the systems and talkgroups that exist today so later additions stay out of the group until granted.
+  - On startup, existing `talkgroups: "*"` grants are expanded to explicit talkgroup lists when auto-enable is off (empty All is left alone so private systems are not auto-added).
+  - Livefeed maps are scrubbed against the client's scoped systems so stale enabled keys cannot play traffic outside the usergroup plan.
+  - Web and mobile default newly scoped channels off unless the usergroup toggle is on; re-adding a system no longer restores stale `active: true` from local storage.
+
+### Added
+
+- **User Groups — Auto-enable new systems / talkgroups**
+  - Admin checkbox on create/edit group. When on, wildcards keep including future channels and clients may turn them on by default.
+
+---
+
+## Version 26.08.30 - Released August 29, 2026
+
+### Fixed
+
+- **Incident map — geocoding silently disabled by a blank relay gateway URL**
+  - The server only geocodes when the relay's `/api/geocode/status` poll returns both an active subscription **and** a gateway URL. When the relay briefly returned an active status with an empty `gateway_url` (e.g. a missing `nominatim_gateway_*` config on a relay node), the server stopped attempting geocodes entirely — no attempts, no errors — so maps stopped gaining pins fleet-wide.
+  - The server now caches the last-known-good gateway URL and access-granting subscription status and seeds them at startup, so a transient relay misconfiguration or restart no longer disables geocoding. A blank gateway URL is never written over a good one; the live 2-minute poll and the gateway's own per-key allow-list still correct a genuinely lapsed subscription.
+
+### Changed
+
+- **Incident map — keyless basemaps**
+  - Light basemap now uses OpenStreetMap and dark uses ESRI World Dark Gray after CARTO began requiring an API key (which produced watermarked tiles). Client attribution and per-style zoom limits updated accordingly.
+  - Map tile URLs carry a version-based `?v=` cache-bust so browsers drop tiles cached from the previous provider.
+
+---
+
+## Version 26.08.21 - Released August 21, 2026
+
+### Added
+
+- **Admin — live listeners roster (#270)**
+  - Operations → **Listeners** shows live WebSocket sessions grouped by user (anonymous bucket included), with multi-device counts and ~5s refresh.
+  - Users table shows a **Listening** chip when an account is online.
+
+- **Admin — Systems list and reorder (#282)**
+  - **Systems** opens a searchable list instead of jumping into the first system.
+  - Drag-and-drop and Sort A–Z persist via `PUT /api/admin/systems/order`; order-only saves no longer clear unsaved system field edits.
+
+- **Playback — multi-talkgroup filters and duration (#275)**
+  - Archive search can multi-select talkgroups on one system; results include a **Duration** column.
+  - System / talkgroup / group / tag pickers use a scrollable LCD dialog with filter (replacing viewport-clipped menus).
+
+- **Playback — unit alias display (#280)**
+  - Now-playing, recent, and archive show units as `alias | radio ID` (or ID alone) and keep live unit updates in sync across multi-source calls.
+
+### Changed
+
+- **Client — Angular application builder**
+  - Migrated from deprecated `@angular-devkit/build-angular:browser` (Webpack) to `@angular/build:application` (esbuild).
+  - Kept `outputPath.browser` empty so production assets still land in `server/webapp` for Go embed/Docker.
+
+- **Client — Sass module imports**
+  - Replaced deprecated Sass `@import` with `@use` / `@forward` for shared tokens, mixins, and global styles; Google Fonts load via `index.html` instead of Sass `@import url`.
+
+- **Admin Users — status chips and group column (#269)**
+  - PIN column removed from the table; PIN / account expiry and other states show as status chips.
+  - Group column sits closer to User so Status has room; group name comes from `GET /api/admin/users` as `userGroupName` (no wait on a second `/groups` call); redundant Group **Admin** badge removed.
+
+- **Ingest — per-system Auto Populate (#277)**
+  - Talkgroups auto-create only when that system’s Auto Populate is on; global Auto Populate still creates unknown systems only.
+
+### Fixed
+
+- **Auth — Turnstile widget lifecycle (#259)**
+  - Shared `RdioScannerTurnstileComponent` + script service; login, registration, and group-admin each own a widget with distinct actions (`user_login`, `user_registration`, `group_admin_login`).
+  - Email-verification → full registration form remounts Turnstile so Sign Up is no longer stuck disabled.
+  - Invitation CAPTCHA skip uses server access-code `type` (not format guessing); Sign Up no longer checks a nonexistent `invitationCode` control.
+  - Signup email OTP is consumed only after account creation succeeds (CAPTCHA failure no longer burns the code).
+  - Siteverify uses an HTTP timeout and checks action/hostname; enabling Turnstile without both keys is rejected.
+
+- **Docker / CI — Node pin for Angular 22**
+  - Client build stage and workflow now use Node **22.23** (Angular CLI requires ≥22.22.3); `node:22.12` was failing `npm run build` with exit code 3.
+
+- **Duplicate detection — arrival-time cache (#278)**
+  - Keeps arrival-time-only dedup (no PCM hash / radio timestamp restore).
+  - Cache no longer slides its 1s window on hits; similar audio duration is required so busy talkgroups are not sticky-blocked.
+
+- **Alert preferences — tone alerts stuck on “Admin must enable” (#272)**
+  - With bulk tone detection off, leftover bulk tag IDs no longer force-clear per-talkgroup `toneDetectionEnabled` on every system save.
+
+---
+
+## Version 26.08.8 - Released August 6, 2026
+
+### Fixed
+
+- **Docker / CI client build — missing admin Central Management panel**
+  - `.gitignore` was matching any `central-management/` folder, so the admin Operations “leave CM” component was never published to git and Docker `npm run build` failed with a misleading NgModule error.
+  - Ignore is now rooted at `/central-management/` (the separate CM repo only); the admin component is tracked.
+
+---
+
+## Version 26.08.7 - Released August 6, 2026
+
+### Fixed
+
+- **Transcripts — pagination clipped**
+  - Prev / Next and the “Showing …” label no longer sit inside the scrollable list; they stay pinned below the list with padding so buttons are not cut off at the panel bottom.
+
+---
+
+## Version 26.08.6 - Released August 6, 2026
+
+### Changed
+
+- **Client — Angular 21**
+  - Upgraded the scanner web client and Angular Material stack to Angular 21.
+
+- **Incident mapping — master enable switch**
+  - Options → Incident Mapping adds **Enable incident mapping**. When off, the Map tab is hidden and mapping work does not run for listeners.
+  - Defaults **off** for new installs; existing installs that already have geo / mapping setup keep it **on**.
+
+- **Transcription — live feature gating**
+  - Turning transcription off now immediately hides Alerts, Transcripts, and Stats in the player (and related console tabs), without requiring a reload.
+  - Fixed partial options updates so nested transcription config could not overwrite the flat `transcriptionEnabled` flag.
+
+---
+
+## Version 26.08.5 - Released August 5, 2026
+
+### Added
+
+- **Call natures — opt-in phrase learning (#263)**
+  - Mapping toggle **Suggest phrases from transcripts** (default off) queues radio/CAD-style candidates for Accept / Dismiss under each call nature, with optional **Scan recent transcripts** backfill.
+  - Min sightings configurable; Accept appends the phrase and refreshes the match cache.
+
+- **Unit aliases — Accept / Dismiss review (#266)**
+  - Consistent P25 aliases still auto-add to Units / Source; OpenAI / conflict / unknown suggestions queue on the system Units panel for Accept / Dismiss, with optional history scan.
+  - Empty “tags to enable” now enables auto-learn on all talkgroups (selected tags remain a restrictor).
+
+- **Admin Users — bulk delete and last-login sort (#268)**
+  - Multi-select **Delete selected** with the same transactional cleanup as single delete; refuses to remove the last system administrator.
+  - Sort by name or last login (newest / oldest); API returns numeric `lastLoginAt`.
+
+### Fixed
+
+- **Channels — talkgroup labels truncated (#262 / #265)**
+  - Channel Selection sizes talkgroup columns from container width and defaults to a readable single-column list beside the systems rail.
+
+- **Signup — email locked empty after access/invite code (#261 / #264)**
+  - Generic access/invite codes no longer mark Email as Verified/readonly when no address was bound; users can type an email after Validate.
+
+- **Call natures — admin phrases silently dropped on save (#260 / #263)**
+  - Manual phrase saves no longer run through the auto-mining acceptability filter; pending Add-phrase text is committed on Save.
+
+- **Multi-tier — mobile subscribe / unpaid checkout**
+  - Account API exposes unpaid self-billable memberships (`unpaidCheckoutItems`) so mobile hub / subscribe can bill paid tiers even when the primary group is free.
+  - Checkout / settings / mobile-web-hub UX updated for multi-tier unpaid plans.
+
+---
+
+## Version 26.08.1 - Released August 1, 2026
+
+### Fixed
+
+- **Auth signup — multi-tier plan selection gate**
+  - Single public paid group no longer blocks Register with “choose a plan” when the form has no plan radios; plan choice stays on `/setup/plan` after account creation.
+  - Explicit tier/plan selection is required only when two or more public tiers exist (matches the server). Selecting a paid tier with one pricing option auto-picks it; misconfigured paid tiers show a clear warning.
+
+---
+
+## Version 26.07.27 - Released July 27, 2026
+
+### Fixed
+
+- **Multi-tier signup and admin group memberships (#254 / #257)**
+  - Live `auth-screen` signup now lists every public tier, supports multi-select with primary + per-paid plan, and submits `groupIds` / `primaryGroupId` (plus combined Stripe checkout for paid tiers).
+  - When more than one public tier exists, registration requires an explicit tier selection instead of silently assigning a single public group.
+  - Admin user editor persists `userGroupIds` on save/reload, returns memberships from both user-list endpoints, and no longer shows success when the follow-up reload fails.
+  - Self-service `/api/subscription/groups/add` and `/remove` check persistence errors, re-read Stripe after item changes, enforce `MaxUsers`, return canonical `groupIds`, refresh scoped sessions, and serialize per-user tier mutations.
+
+### Changed
+
+- **README — SDRTrunk**
+  - Documented that SDRTrunk supports API ingest (#256).
+
+---
+
+## Version 26.07.26 - Released July 26, 2026
+
+### Added
+
+- **Incident mapping — geocode-anchor gate (chatter tax)**
+  - Before calling nominatim-gateway `/transcript`, TLR now requires a real geocode cue: house+street, numbered route (including `IH`/`LOOP`), typed intersection, or gazetteer place — not bare `STREET` mentions or “en route” status chatter alone.
+  - Cuts wasted gateway quota on MISRN-style clear/status traffic while still sending real address dispatches.
+
+### Fixed
+
+- **Incident mapping — SE↔SOUTHEAST (and all abbrev expansions) false rejects**
+  - Gateway hits like `6246 MINES ROAD SOUTHEAST` were discarded when STT said `SE`, so Trumbull/Howland calls showed no map pin despite a successful geocode.
+  - Alignment now canonicalizes address and transcript together (`SE`≡`SOUTHEAST`, `RD`≡`ROAD`, `AVE`≡`AVENUE`, `N`≡`NORTH`, spaced quadrants, etc.) so OSM/gateway expansions never fail a spoken match.
+  - Fabricated streets that were never spoken still reject.
+
+---
+
+## Version 26.07.25 - Released July 26, 2026
+
+### Fixed
+
+- **Web auth — mobile login/signup layout and scrolling**
+  - Login/signup is usable on phones: no forced horizontal scroll from the desktop scanner shell (`min-width: 1160px`), and document vertical scroll works while auth is shown.
+  - Auth card is edge-to-edge on small screens; tabs use a shorter **Groups** label; Turnstile and registration loading states are clearer.
+  - Sign In stays available immediately (not blocked behind registration-settings load).
+
+---
+
+## Version 26.07.24 - Released July 25, 2026
+
+### Added
+
+- **Call natures — per-category force expiry**
+  - Each call-nature category now has a **Force expire (minutes)** setting (`0` = never), edited from the admin **Options → Incident Mapping → Call Natures** section.
+  - Incidents in a category with a force-expire value are removed from the live incident map that many minutes after dispatch, **overriding** the viewer's selected time range.
+  - Category cards show an **Expires *N* min** badge. Disabled categories never expire incidents. Blank natures (shown on the map as `UNKNOWN PROBLEM`) expire when the `UNKNOWN PROBLEM` category has a force-expire value.
+  - Value is clamped server-side to `0–10080` (7 days); a `since`-less `/api/incidents` request is floored to a 31-day scan window so expiry cannot turn it into a full-history table scan.
+
+- **Incident map — system-admin pin corrections and removal**
+  - System admins (and the admin console) can **correct** a pin's address, nature, and location, or **remove** the plot entirely, from the incident popup on the map.
+  - **Correct Pin** opens an inline editor with **click-to-place** repositioning on the map; **Remove Pin** clears the map plot while keeping the call and its audio.
+  - Backed by `PUT`/`DELETE /api/incidents/pin/{callId}`, gated to system-admin users (or the admin token); corrections are stored with `manual`/`admin` status so they survive the map filter and are distinguishable from geocoded pins.
+
+- **Learned tone patterns — play dispatch audio**
+  - In **Systems → Talkgroups → Analyze tone history**, each learned tone pattern (e.g. a learned A/B pair) now has a **play/stop** control on its transcript samples so an operator can hear the dispatch tone-out and name the tone set correctly before adding it.
+  - Patterns whose calls have no transcript (tone-only) get a single **Play dispatch audio** button that plays a representative call.
+  - Audio streams from the existing admin `/api/admin/call-audio/{callId}` endpoint; playback stops automatically when re-analyzing, adding the tone set, or leaving the editor.
+
+- **Admin → Users — filter by group, subscription, and status** (#236)
+  - Mat-select filters for user group, Stripe subscription state, and account/PIN/verification status, plus Clear filters.
+  - Admin users API now returns `accountExpiresAt` for status filtering.
+
+- **Admin → Systems — persist drag-and-drop order** (#233)
+  - Reordering systems saves via `PUT /api/admin/systems/order` (manual Save and auto-save).
+
+### Fixed
+
+- **Transcription — hallucination Auto-removal mode never fired** (#231)
+  - Admin UI saves `auto-remove` / `learning`, but the server only auto-added when mode was exactly `auto`.
+  - Server now accepts UI values (and legacy `auto` / `manual`); single-system installs no longer require two systems to promote a pattern.
+  - Help text / recommended confidence thresholds aligned with the real 0–10 score scale.
+
+- **Alerts — talkgroup / tone alerts missing from Alerts tab** (#229)
+  - Tone pre-alerts now persist an `alerts` row (and WS notify) so the console Alerts tab matches phone push.
+  - Client fetch race no longer advances `lastFetchTime` on empty results; WS/tab open does a full refresh.
+
+- **Auth — Cloudflare Turnstile `timeout-or-duplicate`** (#239)
+  - Login no longer reuses single-use Turnstile tokens (including sessionStorage); token cleared on submit and widget reset after failures.
+
+- **Admin — confirm before destructive deletes** (#228, #241)
+  - Delete actions across admin config (including systems) require confirmation / type-to-confirm where appropriate.
+
+- **Admin → Alerts — date/time mashup** (#242)
+  - Alert timestamps use a dedicated formatter so date and time no longer collide in the UI.
+
+- **Admin → Systems — invalid talkgroup on edit** (#248)
+  - Talkgroup mat-select options restored correctly when editing (cached groupIds).
+
+- **Admin → Options — auto-learn tone field labels** (#232)
+  - Auto-learn duration/threshold labels remain visible (external labels; removed unsupported `floatLabel="never"` that broke production builds).
+
+- **Transcription — AssemblyAI speech model** (#237)
+  - Speech model is free-text; blank or deprecated values omit `speech_models` so AssemblyAI uses its current default.
+
+- **Incident mapping — phonetic unit / crime-code false pins**
+  - Transcripts like unit/crime-code radio traffic (`OVER 2 KING KING ROBBER …`) no longer geocode through Nominatim into invented streets.
+  - Gateway hits that look like phonetic-alphabet-only “streets” or misaligned extracts are rejected.
+
+---
+
+## Version 26.07.23 - Released July 20, 2026
+
+### Fixed
+
+- **Transcription — tone removal before STT**
+  - Re-enabled cutting sustained dispatch tones out of audio before Whisper/Gemini.
+  - Clips with less than ~2s of audio remaining after tone removal are skipped (tone-only; no hallucinated “beep” transcripts).
+
+- **Transcription — min call duration bypass for tone channels**
+  - Talkgroups with **Tone Detection** enabled now bypass the global minimum call duration, same as **Alerting talkgroup**.
+  - Short voice follow-ups after a tone page (e.g. Champion Off Duty + brief dispatch) can be transcribed again.
+  - Tone-only clips are still skipped after tone removal when almost no speech remains.
+
+---
+
+## Version 26.07.22 - Released July 20, 2026
+
+### Fixed
+
+- **Release packaging — web UI embedded correctly**
+  - 26.07.21 packages could ship without `webapp/index.html`, so the public site returned **HTTP 404** while call-upload (mobile) still worked.
+  - Rebuild ships a complete Angular webapp; use this release on production instead of 26.07.21.
+
+---
+
+## Version 26.07.21 - Released July 20, 2026
+
+### Fixed
+
+- **Incident mapping — drop blank natures with “UNKNOWN PROBLEM” suppress**
+  - The map UI labels calls with no nature as **UNKNOWN PROBLEM**, but the suppress toggle only matched the explicit labels (`UNKNOWN PROBLEM`, `UNKNOWN PROBLEM/UNCLASSIFIED`, etc.).
+  - Blank / unclassified natures are now treated the same: when **Drop UNKNOWN PROBLEM from map and geocoding** is enabled, they are not geocoded and do not receive a map pin.
+  - Admin help text updated to mention blank natures.
+
+---
+
+## Version 26.07.20 - Released July 19, 2026
+
+### Fixed
+
+- **Server — logs category migration no longer blocks startup**
+  - Adding the logs `category` column no longer uses `ADD COLUMN ... NOT NULL DEFAULT` in one step (that form can rewrite the table and rebuild indexes).
+  - On databases with very large log messages, that rewrite could fail with PostgreSQL `SQLSTATE 54000` (`index row requires N bytes, maximum size is 8191`) and prevent the server from starting.
+  - The column is now added as nullable metadata-only, defaulted, backfilled in the background, then set `NOT NULL`. Invalid leftover logs indexes from failed concurrent builds are dropped before retrying the category index.
+
+- **Server — safer late migrations on large PostgreSQL databases**
+  - Late migrations retry on transient connection drops (`unexpected EOF`, recovery mode).
+  - `callUnits.label` is added without a table-rewrite `NOT NULL DEFAULT` step.
+  - Startup no longer builds incident indexes on the `calls` table (optional offline later). On very large `calls` tables, `CREATE INDEX calls_incident_status_idx` could segfault Postgres parallel workers and put the cluster into recovery.
+
+---
+
+## Version 26.07.19 - Released July 19, 2026
+
+### Added
+
+- **Incident mapping — smarter free geocoding (OSM → TIGER → Census)**
+  - Local geocode chain tries imported OSM address points, TIGER/Line house-number interpolation, then the free **US Census** geocoder (cached per system) before giving up.
+  - Dispatch-aware query tuning: city-noise stripping, state-route aliases, street-suffix variants, ASR typo maps (separate from admin STT corrections), and highway intersection bias.
+  - Census matches outside the configured coverage radius are rejected.
+  - Optional **Geocodify** API key (Admin → Incident Mapping) as a cached last-resort fallback for the local engine.
+
+- **Incident mapping — TIGER/Line county import**
+  - Import Census TIGER/Line ADDRFEAT segments per county for house-number interpolation along centerlines.
+
+- **Incident mapping — local zero-cost engine (no OpenAI, no Google)**
+  - New **Local** mapping engine that extracts and geocodes entirely inside ThinLine Radio with no external API calls or per-call costs. Selectable per server in Admin → Options → Incident Mapping (**External** OpenAI + Google remains the default).
+  - Built-in **OpenStreetMap importer** (Overpass) seeds streets, address points, and named places per system from the configured Geo center/radius.
+  - Rule-based extractor for addresses, intersections, natures, common names, and apt/unit — no LLM.
+  - Local geocoder resolves coordinates from imported data (address point → intersection → street centroid). Shared guards still apply for highways, conversational noise, and officer narrative.
+  - Console incident map uses **Leaflet** with light, dark, and satellite basemaps and custom tag-colored pins. Engine-specific external fields are hidden when Local is selected.
+
+- **Incident mapping — transcript extract, geocode, and map display**
+  - Geocoding pipeline runs after transcription when mapping is enabled; stores address and coordinates on calls.
+  - Per-system and per-talkgroup mapping config, known streets/places, STT corrections, geocode cache, and address-point import.
+  - Admin → Options → **Incident Mapping**; console **Map** tab and map-pin icons on alerts; `GET /api/incidents` and admin mapping APIs.
+
+- **Incident mapping — call natures and unknown-pin control**
+  - Admin → **Call Natures** panel for keyword/phrase classification used on map pins.
+  - Optional **suppress unknown nature pins** toggle: when on, catch-all / unclassified natures skip geocode and map pins.
+
+- **Incident mapping — talkgroup and tone-set location assignment**
+  - Assign default locations for systems, talkgroups, and tone sets when transcripts lack a street address.
+
+- **Admin → Thinline Radio Services**
+  - Relay account sign-in, portal deep links to `https://app.thinlineradio.com`, live billing status refresh (poll + focus + post-checkout), and push-plan enforcement notice (effective **August 20, 2026**).
+  - Relay billing webhook (`POST /api/webhook/relay-billing`) keeps TLR subscription state in sync after Stripe plan changes.
+
+- **Admin → External Integrations — Gemini API key**
+  - Shared Gemini key under Integrations (same stored field as transcription); saving the key alone does not enable STT or restart the transcription queue unless Gemini is the active provider.
+
+- **Transcription — Gemini provider**
+  - Gemini speech-to-text option alongside existing Whisper / Hydra paths.
+
+- **Admin → Users — Per-system and per-API-key no-audio alert assignment**
+  - Multi-select **systems** and **API keys** for which a non-admin user can **view** system no-audio and API key/uploader no-audio health alerts.
+  - Optional **Push notifications** checkboxes apply only within those assignments (system admins still receive all health alert push).
+
+- **Admin — Config import review**
+  - Import/export config review and result dialogs with a clearer summary of what will be applied.
+
+### Changed
+
+- **Incident mapping — local engine is rules-only (vLLM removed)**
+  - The **Local** mapping engine no longer calls a self-hosted vLLM/Ollama endpoint for transcript extraction. All local extraction runs through `ExtractLocal` (keyword lists, known streets/places, rule-based address parsers) plus `ApplyExtractGuards` dispatch gating.
+  - Admin → Incident Mapping: removed **Local LLM endpoint** and **Local LLM model** fields; local engine label updated to reflect zero API and zero GPU cost.
+  - Legacy `localLLMURL` / `localLLMModel` keys in saved config are ignored.
+
+- **Incident mapping — nature label quality**
+  - Nature labels are capped and must be anchored in the transcript (rejects invented natures when those words were not spoken).
+  - Local keyword inference prefers the longest matching configured keyword.
+  - OpenAI extraction prompt tightened: short labels only, no invented generic natures.
+
+- **Incident mapping — address extraction robustness**
+  - Better handling of suffixless street names, hyphen-glued house numbers, ambiguous first-token street matches, and unit-location chatter vs direct house+street phrasing.
+  - Fuzzy homonym street snaps are blocked when they would pin the wrong road.
+
+- **System alerts — no-audio visibility**
+  - Non-admin no-audio alert visibility is now driven by admin-assigned system/API key lists on the user (`systemNoAudioAlertSystems`, `apiKeyNoAudioAlertApiKeys`), not scanner or group access scope.
+
+- **Transcription — min call duration bypass**
+  - Short calls bypass the minimum duration floor only for **alerting talkgroups**, not for user alert preferences alone (stops short non-alerting traffic from being transcribed).
+
+- **Nominatim status polling**
+  - Gateway status poll interval reduced from 15 minutes to 2 minutes for faster entitlement feedback in Thinline Radio Services.
+
+### Fixed
+
+- **Incident mapping — local address extraction**
+  - Short house numbers and comma-separated STT phrasing extract correctly for map pins.
+  - Extracted addresses snap to a known street when STT glues a locality onto a gazetteer name.
+  - Built-in fireworks nature markers; caller-reported fireworks no longer mis-map to a generic fire nature.
+  - Push routing for `no_audio` and `api_key_no_audio` alerts respects the same per-user assignments.
+
+---
+
+## Version 26.06.18 - Released June 18, 2026
+
+### Added
+
+- **System alerts — visibility, player UI, and per-user push**
+  - Authenticated users can view system and API key no-audio health alerts via `GET /api/system-alerts` (read-only; dismiss still requires system admin). Manual notices visible to all authenticated users.
+  - Player Alerts tab: **My alerts**, **System**, and **All** views when the user has system alert access; client-side search across my alerts and system alerts.
+  - **Call/transcript alerts** (tone, keyword, transcript) in `GET /api/alerts` are filtered by user and group system/talkgroup access, matching the transcripts list and live call feed; push and preference paths honor the same scope.
+  - System admins continue to receive push for all health alerts.
+  - Admin → Users: **Push: System No Audio** and **Push: API Key No Audio** toggles for targeted push without full system admin access.
+
+- **Player — Console Transmissions tab**
+  - **Recent** and **Search** modes in the console Transmissions panel; archive search is embedded without leaving the console layout.
+
+### Changed
+
+- **Player — Compact alerts and transcripts UI**
+  - Slimmer alert group expansion headers; keyword matches shown as separate outline tags (deduplicated, no glow).
+  - Transcript alerts grouped with tone/keyword alerts in the Alerts tab.
+
+- **Player — Search playback**
+  - Archive search auto-advances through result lists in console and classic layouts; playback list stays in sync when infinite scroll loads more calls.
+
+- **Player — Layout cleanup**
+  - Removed duplicate legacy select component; console and classic player layouts mount exclusively (no dual DOM).
+
+- **Player — Console layout**
+  - New view uses three columns at full height: scanner LCD + controls (left), tab content such as Transmissions and Map (center), recent alerts (right). Side rails no longer stack above the tabs.
+
+### Fixed
+
+- **Admin — CSV talkgroup import**
+  - Tags and groups are resolved by label before write, preventing duplicate-label errors when the client assigns provisional ids.
+  - Talkgroup `groupIds` and `tagId` values are remapped to real database ids after groups/tags save.
+  - Fixed talkgroup group-link cleanup comparing junction-table ids instead of group ids.
+
+- **Call ingestion — auto-populate talkgroups**
+  - Resolves group and tag ids from the database by label before linking new talkgroups, fixing FK errors when in-memory group ids (e.g. 4, 5) no longer exist in the DB.
+
+- **Push notifications — Android pager alerts**
+  - Suppresses conflicting FCM notification sound when a pager alert uses Telecom ringtone / auto-answer (iOS already omitted sound for pager alerts).
+
+- **Alerts — keyword merge**
+  - Case-insensitive deduplication when merging matched keywords on alert records.
+
+---
+
+## Version 26.06.17 - Released June 16, 2026
+
+### Added
+
+- **Admin — Per-system duplicate detection (Issue #225)**
+  - Global **Disable Duplicate Detection** remains the master switch in Options → Audio Settings.
+  - Each system can enable or disable duplicate suppression independently when global detection is on.
+  - Configurable from Options (per-system table), and from individual system settings.
+  - Existing systems default to enabled; partial system/Copilot saves preserve the setting.
+
+---
+
+## Version 26.06.16 - Released June 16, 2026
+
+### Added
+
+- **Admin — Per-system and per-talkgroup call retention**
+  - Global **Prune Days** remains the default; systems and talkgroups can override retention (talkgroup → system → global).
+  - Configurable from Options (per-system table), system settings, and individual talkgroup editors.
+
+- **Admin — API key no-audio monitoring (Issue #171, phase 1)**
+  - Per-API-key toggle and threshold for upload liveness alerts when global system health / no-audio options are enabled.
+  - Tracks last successful ingest per key; raises `api_key_no_audio` system health alerts to system admins.
+
+### Fixed
+
+- **Admin — User Groups “Add System”**
+  - Add System now works when systems list is empty, has placeholder rows, or stale entries; save validation and feedback improved.
+
+- **Admin — Transcription confidence threshold**
+  - Hallucination confidence threshold in Options now persists correctly (form, server config, and detector).
+
+- **Server — API key no-audio monitoring**
+  - Last-upload timestamp recorded only after successful ingest; global option toggles restart monitors without restart; alert dedup no longer collides on similar API key IDs; grace period no longer resets when unrelated keys are saved.
+
+- **Admin — Call retention overrides**
+  - Per-system retention from Options General panel saves correctly; partial system/Copilot saves no longer wipe retention settings on systems or talkgroups.
+
+---
+
+## Version 26.06.15 - Released June 10, 2026
+
+### Fixed
+
+- **Server — PostgreSQL bootstrap no longer re-runs on every restart**
+  - Established databases (options table present) skip full schema DDL and index creation at boot instead of re-executing `calls_idx` and other bootstrap indexes on every cold start.
+  - Fresh installs still run table DDL once, apply indexes outside the bootstrap transaction, and record completion in `rdioScannerMeta`.
+  - Any missing bootstrap indexes are built with `CREATE INDEX CONCURRENTLY` in the background after the server is ready so startup is not blocked on large `calls` tables.
+  - Clearer fatal message when migration fails with `SQLSTATE 57P01` (connection terminated mid-migration).
+
+---
+
+## Version 26.06.14 - Released June 10, 2026
+
+### Fixed
+
+- **Server — Startup no longer blocked before workers and HTTP listen**
+  - Call processing workers and WebSocket client handling start before delayed-call restore, admin scheduler, and DB maintenance tasks.
+  - Delayed-call restore runs in a background goroutine instead of blocking `Controller.Start()`.
+  - Log index build and category backfill deferred until after `Controller.Start()` returns and HTTP is about to listen.
+  - `logs_timestamp_idx` creation moved out of synchronous migration into post-startup background build.
+  - Added `startup:` progress lines to stdout so boot stalls are visible in the console.
+
+---
+
+## Version 26.06.13 - Released June 10, 2026
+
+### Fixed
+
+- **Server — Log category backfill no longer blocks startup**
+  - Column migration stays synchronous; index build and row backfill now run after the server is ready in small throttled batches so call ingest and client connections are not starved for DB pool slots during startup.
+  - Backfill completion is tracked in `rdioScannerMeta` (fixes repeated full backfill on every restart when the legacy `migrations` table was missing).
+  - Progress messages write to stdout only (not re-inserted into the `logs` table during backfill).
+
+- **Server — Automatic PostgreSQL index corruption recovery**
+  - Detects B-tree index corruption (`SQLSTATE XX002`) during `WriteCall`, rebuilds the affected index (`REINDEX CONCURRENTLY` with blocking/drop-recreate fallbacks), and retries the insert once so call ingest self-heals without manual DBA intervention.
+
+---
+
+## Version 26.06.12 - Released June 8, 2026
+
+### Added
+
+- **Admin — Admin Assistant (AI copilot)**
+  - New **Assistant** tab with OpenAI chat backed by server-side tool calling (`POST /api/admin/copilot/chat`).
+  - Reads and changes admin settings with the same data paths as the UI: tags, systems, talkgroups, tone sets, options, users, billing groups, keyword lists, health alerts, logs, calls, Stripe sync, Radio Reference browse/import, and more.
+  - Embedded capabilities catalog (`get_admin_config section=capabilities`) documents every read section, read/write action, payload shapes, workflows, and limitations.
+  - Confirm-before-write flow: destructive or config changes require explicit admin approval (`confirmed: true`).
+  - Tools include log search, health alerts, talkgroup tag audit, tone import parsing, tone history analysis, transcription failure reset, hallucination approve/reject, user invite/transfer, and embedded admin help articles.
+
+- **Admin — Global settings search**
+  - Search bar at the top of admin jumps to Config options panels, config sections, Tools, and the Assistant tab via a searchable settings index.
+
+- **Admin — Config sidebar navigation**
+  - Config tab uses a left sidebar (User Groups, Users, API Keys, Dirwatch, Downstreams, Systems, Groups, Tags, Keyword Lists, Options, Transcript Parser) instead of a flat tab strip.
+
+- **Admin — Log categories**
+  - Server logs are auto-categorized (auth, billing, email, calls, transcription, tones, relay, health, admin, etc.) with regex-based classification and DB migration.
+  - Logs tab adds category filter chips, a category column, and category-aware search API (`GET /api/admin/logs/categories`).
+  - Standard-library `log` output is captured into the admin logs table alongside structured `LogEvent` entries.
+
+- **Admin — Remote admin access control**
+  - **Admin Allowed IPs** option (CIDR or exact IP list) supplements localhost-only access; localhost is always permitted.
+
+- **Admin — OpenAI integration options**
+  - Config → Options → Integrations exposes OpenAI API key, base URL, and chat model used by the Assistant and tone/unit auto-learn naming.
+
+### Changed
+
+- **Admin — Visual refresh**
+  - Shared dark-theme admin styling (`styles.scss`), updated Config/Logs/System Health/Tools layouts, and cleaner section headers and hints across config editors.
+
+- **Admin — Options editor**
+  - Large refactor: collapsible option panels align with the settings search index; improved field grouping for transcription, alerts, email, Stripe, integrations, and audio settings.
+
+- **Admin — Logs tab**
+  - Redesigned table with category chips, improved filters, and pagination UX.
+
+- **Admin — System Health tab**
+  - Simplified layout and styling aligned with the new admin theme.
+
+- **Admin — Config editors**
+  - Dirwatch, keyword lists, systems/talkgroups, tags, groups, API keys, and downstreams updated for sidebar navigation and consistent save/dirty behavior.
+  - Removed duplicate legacy `api-keys` component (consolidated into `apikeys`).
+
+- **Server — Radio Reference import**
+  - Shared `radioReferenceImportToSystemCore` used by both the HTTP handler and Admin Assistant import action.
+
+### Fixed
+
+- **Admin — Save disabled after config import**
+  - Users, user groups, and keyword lists are API-backed shadow arrays in the config form. Invalid imported data (e.g. blank email) silently marked the whole form invalid and disabled Save. Those arrays no longer gate form validity while `getRawValue()` still feeds the full-import save path.
+
+---
+
+## Version 26.06.10 - Released June 7, 2026
+
+### Added
+
+- **Admin — Analyze tone history shows dispatch transcripts**
+  - Each suggested tone set now lists the dispatch voice from the calls that produced it, so you can sanity-check what was actually said before adding the set.
+  - Transcript selection reuses the live tone-alerting voice attachment: if the tone call carries voice it is used directly; otherwise the next voice call on the talkgroup within the pending-tone window is borrowed (the call the tones would have attached to in real time).
+
+### Changed
+
+- **Server — Auto-learn label uses the post-tone dispatch voice**
+  - The OpenAI labeling request now receives the resolved post-tone voice (not the tone-region hallucination) and a stronger prompt: all transcripts belong to one station/unit, so it locks onto the single identifier consistent across them and ignores one-off addresses, patient details, names, and times.
+
+- **Server — Auto-learn frequency tolerance default 10 → 20 Hz**
+  - A learned candidate within 20 Hz of an existing tone set is treated as the same set and skipped. Existing saved configs keep their explicit value.
+
+- **Server — Auto-learn minimum A/B separation 90 → 40 Hz**
+  - Tight but legitimate two-tone pairs (e.g. 1251.4 / 1184.5 Hz, 66.9 Hz apart) can now be auto-learned. Detection/alerting of already-stored tone sets was never affected by this guard.
+
+- **Admin — Tone set editor cleanup**
+  - Removed the unused "Sequence Min Duration" field, moved field descriptors below each input, reduced input height, widened the tone-sets block to full width, and corrected the tolerance hint text.
+
+### Fixed
+
+- **Admin — Unit edit could not be saved**
+  - Editing a unit's label/ID now enables Save immediately. Previously the detached edit form only committed (and marked the config dirty) when the row was collapsed, so Save stayed disabled if you edited and saved directly. Edits also commit on paging/search instead of being dropped.
+
+---
+
+## Version 26.06.09 - Released June 8, 2026
+
+### Fixed
+
+- **Admin — Analyze tone history UI**
+  - Button no longer stays on “Analyzing…” after the request completes (change detection under OnPush parent).
+  - Results render inline under the button instead of a snackbar (stats, partial patterns, suggestion cards).
+
+- **Server — Auto-learn duration windows**
+  - Default A-tone max **1.2 s**, B-tone max **3.3 s** (Lordstown-style paging is ~1.0 s A / ~3.1 s B).
+  - Migrates legacy presets (A max 0.9 s, B max 2.5 s or 4.0 s) on server start.
+
+- **Server — Analyze tone history lookback**
+  - Starts at **7 days / 200 calls per batch**, then expands automatically (14 → 28 → 30 days, up to 2000 calls) when no patterns qualify or partial patterns need more matching calls.
+  - Response includes `lookbackHours` so the UI shows how far back was searched.
+
+### Added
+
+- **Server — `import-lfd-calls` dev tool**
+  - Imports prod-export MP3s into local Postgres for tone-debug (`server/cmd/import-lfd-calls`).
+
+- **Server — Regression tests**
+  - Auto-learn config migration, LFD DB discover, tone history expand logic.
+
+---
+
+## Version 26.06.08 - Released June 7, 2026
+
+### Fixed
+
+- **Server — Tone detection on paging audio (tone-then-voice)**
+  - Shared decode path: bandpass without `dynaudnorm` for auto-learn `Discover`; production `Detect` also runs the deployed dynaudnorm chain and merges results so quiet lead-in tones are not lost when dispatch voice follows on the same clip.
+  - FFT analysis uses a **20 s** window (stacked pages) and a **3 s** peak reference for silence gating so later voice does not raise the noise floor and hide paging tones at the start.
+  - Auto-learn keeps looser `Discover` thresholds (0.4 s min tone, include unmatched frequencies); production `Detect` still requires a match to configured tone-set frequencies.
+
+- **Server — Pending tone stacking**
+  - When multiple tone-only calls queue before a voice dispatch, merged pending tones keep the **most recent tone page** as the primary attach label (voice calls inherit the closest preceding page).
+
+- **Server — Tone auto-learn pairing**
+  - Default A-tone duration window **0.5–1.2 s**, B-tone **1.5–4.0 s**; pairs earliest valid A with the longest following B per call.
+
+### Added
+
+- **Server — Analyze tone history diagnostics**
+  - History analyze logs per-call tone discovery details and includes partial patterns in the API response for admin review.
+
+- **Server — Regression tests**
+  - Production export tests for 78 FD DISP (direct `Detect` vs stored tone frequencies) and LFD sample audio (Discover + learned A/B detect).
+
+---
+
+## Version 26.06.07 - Released June 7, 2026
+
+### Added
+
+- **Admin — Analyze call history (talkgroup)**
+  - **Analyze tone history** scans recent calls on the channel (default: last 7 days, up to 200 calls), runs FFT tone discovery, and groups patterns by frequency signature.
+  - Only returns patterns seen on at least **3 different calls** — same threshold as live auto-learn (`autoLearnToneSetConfig.callsRequired`).
+  - OpenAI suggests department/station labels from transcripts; each qualifying pattern is listed with its own **Add tone set** button (save config to persist).
+  - Skips stacked-tone calls and patterns that already match configured tone sets on the channel.
+
+### Fixed
+
+- **Server — Tone auto-learn at ingest on paging audio**
+  - Auto-learn now runs on **every ingested call** using raw audio when the talkgroup has auto-learn enabled — not only after transcription on voiced calls.
+  - Works when **no tone sets are configured yet** (production tone matching still requires configured sets; auto-learn uses FFT `Discover` independently).
+  - Logs when zero tones are found in a call; post-transcription pass updates the transcript on the same `callId` candidate record.
+
+---
+
+## Version 26.06.06 - Released June 7, 2026
+
+### Fixed
+
+- **Server — Auto-learn runs per talkgroup without system master toggle**
+  - Tone and unit alias auto-learn only required the talkgroup flag at runtime; the system master toggle incorrectly blocked individually enabled channels (e.g. one dispatch TG on a system with bulk rollout off).
+  - System-level auto-learn is now **bulk tag rollout only** — turning it off no longer clears talkgroup flags that were enabled individually or via a prior rollout.
+
+---
+
+## Version 26.06.05 - Released June 6, 2026
+
+### Fixed
+
+- **Server — Auto-learn no longer emails per unit ID or tone pattern**
+  - Review emails with MP3 attachments were sent for every ambiguous unit alias or stacked tone candidate. Removed — confident matches still auto-add; skipped cases are logged only.
+  - Admin UI copy updated to match (logged only, not emailed).
+
+---
+
+## Version 26.06.04 - Released June 6, 2026
+
+### Added
+
+- **Server — Auto-learn tone sets**
+  - System and talkgroup toggles observe paging audio on selected channels and build tone-set candidates after enough matching calls (`autoLearnToneSetConfig.callsRequired`).
+  - Single-tone patterns with consistent frequencies are auto-added; stacked / ambiguous patterns were emailed to system admins for manual review (removed in 26.06.05 — logged only).
+  - **Tag rollout**: enable auto-learn on all talkgroups matching selected tags; optional **auto-off** timer disables rollout on the system and tagged talkgroups when it expires.
+  - OpenAI (when configured) suggests human-readable tone-set labels from observed frequencies and transcripts.
+
+- **Server — Auto-learn unit aliases**
+  - Maps radio `unitRef` values to human labels (e.g. `45012` → `Engine Five`) using P25 radio metadata and voice transcripts.
+  - Consistent P25 alias on every call auto-adds without OpenAI; conflicting aliases or missing metadata trigger an OpenAI naming pass; uncertain results were emailed to system admins (removed in 26.06.05 — logged only).
+  - System/talkgroup toggles, tag rollout, and optional auto-off mirror auto-learn tone sets.
+  - Reuses `autoLearnToneSetConfig.callsRequired` for the observation threshold.
+
+- **Server — Bulk tone detection rollout**
+  - System-level toggle applies production `toneDetectionEnabled` to all talkgroups matching selected tags — useful for enabling tone matching across paging dispatch channels in one step.
+  - Stays on until bulk rollout is turned off manually (auto-off timer removed).
+
+- **Admin — OpenAI integration (External Integrations)**
+  - Server-wide OpenAI API key and base URL for TLR-powered features (tone auto-learn naming, unit alias auto-learn) — separate from speech-to-text transcription.
+  - Selectable chat model (`gpt-5.4-mini`, `gpt-4o-mini`, `gpt-4o`) with per-request cost estimate in the admin UI.
+
+- **Talkgroup — Alerting talkgroup**
+  - Per-talkgroup toggle for dedicated dispatch/page channels: queues transcription when users have alerts enabled (no tone/keyword prefs required), bypasses min call duration, skips tone and keyword matching, and fires **transcript** alerts on voiced calls (with deduplication and alert cooldown).
+
+### Fixed
+
+- **Client — White flash / strip below tab content when switching tabs** ([#213](https://github.com/Thinline-Dynamic-Solutions/ThinLineRadio/issues/213))
+  - Angular Material’s light theme paints tab scroll areas white; short tab content left a white band and a brief flash on tab changes.
+  - Console board tabs and global Material tab bodies now use the dark board surface (`--tlr-board-surface`).
+
+- **Admin — Hallucination Removal Patterns could not be saved** ([#212](https://github.com/Thinline-Dynamic-Solutions/ThinLineRadio/issues/212))
+  - Form stored patterns as a newline string but the textarea getter/setter treated them as an array; saved values did not display and edits did not mark the form dirty.
+  - Bound the field with `formControlName` like other transcription options.
+
+- **Client — Transcripts tab no longer resets filters on every new alert**
+  - Auto-refresh is deferred when filters, pagination, or an in-progress training edit are active; a **“New transcripts are available”** banner lets admins refresh when ready.
+
+- **Server — Approve & Send updates the displayed transcript**
+  - After approving for training, the call’s `transcript` column is updated to the reviewed text (uppercase) so the Transcripts tab shows the training version locally, not just the original STT output.
+
+- **Server — Auto-learn tone sets now queue transcription**
+  - Paging talkgroups with auto-learn enabled (but no user alert prefs) were never transcribed, so pattern discovery could not run. Added `auto_learn_tone_sets` and `auto_learn_unit_aliases` transcription reasons with min-duration bypass.
+
+- **Client — `transcript` alert type in legacy scanner UI**
+  - Alerting-talkgroup transcript alerts now display correctly in the classic/legacy main view (type union and label).
+
+- **Admin — System settings layout / text overflow**
+  - Long toggle descriptions (auto-learn, auto-populate units, transcription prompt hints) no longer squash beside switches; hints wrap below toggles and wide fields span the full grid.
+
+- **Client — App Font applies to scanner only, not admin**
+  - Settings → Display → App Font now scopes custom typography to the scanner shell; admin UI stays on Roboto/Material defaults so configuration pages remain readable.
+
+- **Admin — TLR logo in header**
+  - Replaced the generic `radio` icon with the ThinLine Radio logo in the server administration header.
+
+---
+
+## Version 26.06.03 - Released June 1, 2026
+
+### Fixed
+
+- **Server — Request API Key failed with 500 on production servers**
+  - `Options.WriteKey` used unsafe SQL string interpolation when saving `transcriptionConfig` after collector registration.
+  - Transcription settings containing apostrophes (Whisper prompts, keyterms, etc.) caused the database update to fail even when the collector returned a valid API key.
+  - Now uses parameterized queries (`$1`, `$2`) like the rest of options persistence.
+
+---
+
+## Version 26.06.02 - Released June 1, 2026
+
+### Added
+
+- **Transcript Collector — community Whisper training dataset (data collection)**
+  - New standalone service (`transcript-collector/`) for reviewed dispatch audio + transcripts from ThinLine Radio servers.
+  - Ingest API (`POST /api/v1/submissions`): API-key auth, multipart audio + metadata; **ffmpeg** converts uploads to **16 kHz mono WAV**; writes `data/training/audio/`, matching `.txt` transcripts, and appends **OpenAI/HuggingFace-compatible** `manifest.jsonl`.
+  - Stores reviewed and original transcript text in **lowercase**; rejects duplicate submissions for the same TLR call ID per server.
+  - Tracks **audio duration** (hours/minutes/seconds) globally and per TLR server; admin portal with submissions list, **Servers** tab, training-audio totals, and **Rebuild manifest** from the database.
+  - Self-registration and admin API-key issuance; production URL: `https://transcripts.thinlineds.com`.
+
+- **Client — Transcripts tab: review and send for training**
+  - System admins can **Edit for Training**, save drafts, and **Approve & Send** to the transcript collector (audio playback in-panel).
+  - **Request API Key** registers this TLR server with the collector (no manual URL/key fields in Admin → Options).
+  - **Connected** status, per-server contribution stats, and a **community 5,000-hour** progress bar (all signed-in users on the Transcripts tab).
+  - **Already submitted** calls show a badge and cannot be edited or re-sent; collapsible **Training tips** at the top of the tab (formatting, digits, homophones, etc.).
+
+- **Server — transcript review and collector integration**
+  - Admin API: collector key request/status, approve/send, per-server stats proxy, draft save with `trainingReviewStatus`.
+  - `GET /api/transcripts/training-progress` — global collector training progress for authenticated users.
+  - Transcripts list includes `trainingReviewStatus` and `reviewedTranscript`; approve blocked after submit.
+
+---
+
+## Version 26.06.01 - Released June 1, 2026
+
+### Fixed
+
+- **Server — One pager alert per call when multiple tone/keyword triggers match**
+  - Users subscribed to several tone sets or keyword triggers for the same call no longer receive multiple Android CallKit / Telecom or iOS pager-style alerts for that call.
+  - Regular push notifications still fire for each matching trigger; only the pager-style alert is deduplicated per user+call.
+
+- **Server — Talkgroup alert cooldown respected on all push paths** ([#205](https://github.com/Thinline-Dynamic-Solutions/ThinLineRadio/issues/205))
+  - Pre-alerts, tone alerts, and keyword pushes now honor `alertCooldownSeconds` on the configured talkgroup.
+  - Cooldown tracks the tone-source talkgroup on linked-voice setups (not just the voice talkgroup ID).
+  - Pre-alert and full tone alert use separate cooldown timers so a pre-alert followed by voice still sends both; a second double-page within the window is suppressed.
+  - Duplicate `TriggerToneAlerts` dispatches for the same call (tone detection vs transcription race) are deduplicated.
+
+- **Client — App Font setting applies everywhere** ([#211](https://github.com/Thinline-Dynamic-Solutions/ThinLineRadio/issues/211))
+  - Settings → Display → App Font now updates the entire scanner UI, including Material components, CDK overlays (dropdowns, dialogs, snackbars), and call history (Source column no longer stuck on a separate display font).
+  - Font loads at app bootstrap via `AppFontService`; Material typography uses the `--tlr-font-primary` CSS variable at runtime.
+
+---
+
 ## Version 26.05.009 - Released May 28, 2026
 
 ### Added

@@ -28,6 +28,7 @@ import (
 	"math/big"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -41,6 +42,7 @@ import (
 	checkoutsession "github.com/stripe/stripe-go/v76/checkout/session"
 	"github.com/stripe/stripe-go/v76/customer"
 	"github.com/stripe/stripe-go/v76/subscription"
+	subscriptionitem "github.com/stripe/stripe-go/v76/subscriptionitem"
 	"github.com/stripe/stripe-go/v76/webhook"
 )
 
@@ -107,6 +109,38 @@ func (api *Api) TimeHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"unix_ns":%d}`, time.Now().UnixNano())
 }
 
+// ReadyHandler reports whether the server finished loading configuration.
+// No auth, no DB — used by the web client before opening a websocket after restart.
+func (api *Api) ReadyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "close")
+
+	ready := api.Controller != nil && api.Controller.IsStartupReady()
+	if r.Method == http.MethodHead {
+		if ready {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		return
+	}
+
+	if ready {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"ready":true}`)
+		return
+	}
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprint(w, `{"ready":false}`)
+}
+
 // isMobileAppRequest checks if the request is from a mobile app by examining the User-Agent header
 func (api *Api) isMobileAppRequest(r *http.Request) bool {
 	userAgent := r.Header.Get("User-Agent")
@@ -137,9 +171,10 @@ func (api *Api) isMobileAppRequest(r *http.Request) bool {
 	return false
 }
 
-// verifyTurnstile verifies a Cloudflare Turnstile token using the scanner server's configured keys
-// Mobile apps are exempt from Turnstile verification
-func (api *Api) verifyTurnstile(token, clientIP string, r *http.Request) (bool, error) {
+// verifyTurnstile verifies a Cloudflare Turnstile token using the scanner server's configured keys.
+// Mobile apps are exempt from Turnstile verification.
+// expectedAction, when non-empty, must match the action returned by siteverify (issue #259).
+func (api *Api) verifyTurnstile(token, clientIP string, r *http.Request, expectedAction string) (bool, error) {
 	if !api.Controller.Options.TurnstileEnabled {
 		return true, nil // Turnstile is disabled, so always succeed
 	}
@@ -147,6 +182,10 @@ func (api *Api) verifyTurnstile(token, clientIP string, r *http.Request) (bool, 
 	// Exempt mobile apps from Turnstile verification
 	if api.isMobileAppRequest(r) {
 		return true, nil // Mobile apps are exempt
+	}
+
+	if strings.TrimSpace(token) == "" {
+		return false, nil
 	}
 
 	if api.Controller.Options.TurnstileSecretKey == "" {
@@ -160,15 +199,18 @@ func (api *Api) verifyTurnstile(token, clientIP string, r *http.Request) (bool, 
 		data.Set("remoteip", clientIP)
 	}
 
-	resp, err := http.PostForm("https://challenges.cloudflare.com/turnstile/v0/siteverify", data)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.PostForm("https://challenges.cloudflare.com/turnstile/v0/siteverify", data)
 	if err != nil {
 		return false, fmt.Errorf("failed to verify Turnstile token: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Success bool     `json:"success"`
-		Errors  []string `json:"error-codes"`
+		Success  bool     `json:"success"`
+		Errors   []string `json:"error-codes"`
+		Action   string   `json:"action"`
+		Hostname string   `json:"hostname"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -178,6 +220,23 @@ func (api *Api) verifyTurnstile(token, clientIP string, r *http.Request) (bool, 
 	if !result.Success {
 		log.Printf("Turnstile verification failed: %v", result.Errors)
 		return false, nil
+	}
+
+	if expectedAction != "" && result.Action != "" && result.Action != expectedAction {
+		log.Printf("Turnstile action mismatch: got %q want %q", result.Action, expectedAction)
+		return false, nil
+	}
+
+	if result.Hostname != "" {
+		_, host := getSchemeAndHost(r)
+		expectedHost := host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			expectedHost = h
+		}
+		if !strings.EqualFold(result.Hostname, expectedHost) {
+			log.Printf("Turnstile hostname mismatch: got %q want %q", result.Hostname, expectedHost)
+			return false, nil
+		}
 	}
 
 	return true, nil
@@ -343,6 +402,15 @@ func (api *Api) HandleCall(key string, call *Call, w http.ResponseWriter) {
 	msg := []byte(fmt.Sprintf("Invalid API key for system %v talkgroup %v.\n", systemRef, talkgroupRef))
 
 	if apikey, ok := api.Controller.Apikeys.GetApikey(key); ok {
+		if apikey.IsSite() {
+			allowed, fallback := api.Controller.core().allowSiteUpload(apikey.Id, call.CoreRecordingId)
+			if !allowed {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte("This is a Site Control & Thinline Core key. It only uploads Thinline Core calls the server asks for; use an upload key for other streams.\n"))
+				return
+			}
+			call.CoreFallback = fallback
+		}
 		if apikey.HasAccess(call) {
 			// Store API key ID in call metadata for preferred API key logic
 			apikeyId := apikey.Id
@@ -360,9 +428,17 @@ func (api *Api) HandleCall(key string, call *Call, w http.ResponseWriter) {
 				}
 			}
 
+			if !apikey.IsSite() && call.CoreRecordingId == "" && api.Controller.core().offerOrdinary(call) {
+				w.Write([]byte("Call imported successfully.\n"))
+				return
+			}
+
 			// Use a non-blocking send to avoid deadlocks
 			select {
 			case api.Controller.Ingest <- call:
+				if err := api.Controller.Apikeys.RecordLastCall(api.Controller.Database, apikey.Id, time.Now().UnixMilli()); err != nil {
+					api.Controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to record API key last call time for key %d: %v", apikey.Id, err))
+				}
 			default:
 				w.WriteHeader(http.StatusServiceUnavailable)
 				w.Write([]byte("Server busy, please try again\n"))
@@ -550,6 +626,9 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 		AccessCode       string `json:"accessCode"`       // Unified field for both invitation and registration codes
 		TurnstileToken   string `json:"turnstile_token"`
 		VerificationCode string `json:"verificationCode"` // Email verification code (if emailVerificationRequired)
+		// Multi-tier public signup: the public groups the user chose to join.
+		GroupIds       []uint64 `json:"groupIds"`
+		PrimaryGroupId uint64   `json:"primaryGroupId"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -562,8 +641,10 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 		request.Email = NormalizeEmail(request.Email)
 	}
 
-	// If email verification is required, validate the verification code
-	// Skip this check if an access/invitation code was provided — the code itself proves identity
+	// If email verification is required, validate the verification code.
+	// Do NOT delete the code yet — CAPTCHA or later validation failures must not
+	// consume a valid OTP (issue #259). Delete only after account creation succeeds.
+	emailOTPValidated := false
 	if api.Controller.Options.EmailVerificationRequired && request.AccessCode == "" {
 		if request.VerificationCode == "" {
 			api.exitWithError(w, http.StatusBadRequest, "Email verification code is required")
@@ -582,9 +663,7 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 			api.exitWithError(w, http.StatusBadRequest, "Incorrect verification code")
 			return
 		}
-
-		// Code is valid - delete it from cache
-		signupVerifications.Delete(request.Email)
+		emailOTPValidated = true
 	}
 
 	// Backward compatibility: if accessCode is provided, it takes precedence
@@ -616,7 +695,7 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	// Invitation codes are already validated via email, so CAPTCHA is redundant
 	if api.Controller.Options.TurnstileEnabled && request.InvitationCode == "" {
 		clientIP := GetRemoteAddr(r)
-		valid, err := api.verifyTurnstile(request.TurnstileToken, clientIP, r)
+		valid, err := api.verifyTurnstile(request.TurnstileToken, clientIP, r, "user_registration")
 		if err != nil {
 			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("CAPTCHA verification error: %v", err))
 			return
@@ -649,6 +728,10 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	var targetGroup *UserGroup
 	var regCode *RegistrationCode
 	var invitationId int64
+	// Multi-tier public signup: the full set of chosen public groups (empty for
+	// single-group invitation / code flows).
+	var chosenGroupIds []uint64
+	isMultiGroupSignup := false
 
 	// Check if invitation code is provided (takes precedence over registration code)
 	if request.InvitationCode != "" {
@@ -712,6 +795,37 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		invitationId = invitation.Id
+	} else if api.Controller.Options.PublicRegistrationEnabled && len(request.GroupIds) > 0 {
+		// Multi-tier public signup: user chose a set of public groups. Each must
+		// be public and self-billable ("all_users" billing or free).
+		seen := map[uint64]bool{}
+		for _, gid := range request.GroupIds {
+			if gid == 0 || seen[gid] {
+				continue
+			}
+			g := api.Controller.UserGroups.Get(gid)
+			if g == nil || !g.IsPublicRegistration {
+				api.exitWithError(w, http.StatusBadRequest, "One or more selected tiers are not available for public registration")
+				return
+			}
+			if !g.IsSelfBillable() {
+				api.exitWithError(w, http.StatusBadRequest, fmt.Sprintf("Tier %q cannot be self-selected", g.Name))
+				return
+			}
+			seen[gid] = true
+			chosenGroupIds = append(chosenGroupIds, gid)
+		}
+		if len(chosenGroupIds) == 0 {
+			api.exitWithError(w, http.StatusBadRequest, "Select at least one tier")
+			return
+		}
+		// Primary = requested primary if chosen, else the first chosen tier.
+		primaryId := chosenGroupIds[0]
+		if request.PrimaryGroupId != 0 && seen[request.PrimaryGroupId] {
+			primaryId = request.PrimaryGroupId
+		}
+		targetGroup = api.Controller.UserGroups.Get(primaryId)
+		isMultiGroupSignup = true
 	} else if api.Controller.Options.PublicRegistrationEnabled {
 		// Check if public registration is enabled and has a public group
 		publicGroup := api.Controller.UserGroups.GetPublicRegistrationGroup()
@@ -738,7 +852,15 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			} else {
-				// No code required, use public group
+				// No code required. When more than one public tier exists, the
+				// client must send an explicit groupIds selection (handled by the
+				// earlier multi-tier branch) rather than silently defaulting to
+				// one group — otherwise the tier shown and the tier assigned can
+				// differ once several groups are public.
+				if len(api.Controller.UserGroups.GetPublicRegistrationGroups()) > 1 {
+					api.exitWithError(w, http.StatusBadRequest, "Please select which tier(s) to join")
+					return
+				}
 				targetGroup = publicGroup
 			}
 		} else {
@@ -780,14 +902,31 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check max users limit for the group
-	// This check is enforced regardless of registration code maxUses setting
-	// Even if a code has unlimited uses (maxUses = 0), the group's maxUsers limit still applies
-	if targetGroup.MaxUsers > 0 {
-		currentUserCount := api.Controller.UserGroups.GetUserCount(targetGroup.Id, api.Controller.Users)
-		if currentUserCount >= targetGroup.MaxUsers {
-			api.exitWithError(w, http.StatusForbidden, fmt.Sprintf("Group has reached maximum user limit of %d", targetGroup.MaxUsers))
+	// The membership set: all chosen tiers for a multi-tier signup, else the
+	// single target group.
+	if !isMultiGroupSignup {
+		chosenGroupIds = []uint64{targetGroup.Id}
+	}
+
+	// Check max users limit for each chosen group.
+	// This check is enforced regardless of registration code maxUses setting.
+	for _, gid := range chosenGroupIds {
+		g := api.Controller.UserGroups.Get(gid)
+		if g == nil || g.MaxUsers == 0 {
+			continue
+		}
+		if api.Controller.UserGroups.GetUserCount(gid, api.Controller.Users) >= g.MaxUsers {
+			api.exitWithError(w, http.StatusForbidden, fmt.Sprintf("Tier %q has reached its maximum user limit of %d", g.Name, g.MaxUsers))
 			return
+		}
+	}
+
+	// Any paid, self-billable tier among the chosen set requires completing checkout.
+	anyPaidSelfBillable := false
+	for _, gid := range chosenGroupIds {
+		if g := api.Controller.UserGroups.Get(gid); g != nil && g.BillingEnabled && g.IsSelfBillable() {
+			anyPaidSelfBillable = true
+			break
 		}
 	}
 
@@ -801,6 +940,9 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 		ConnectionLimit: targetGroup.ConnectionLimit, // Inherit group's connection limit
 		CreatedAt:       fmt.Sprintf("%d", time.Now().Unix()),
 	}
+	// Record full membership (primary is folded in). Single-group flows would be
+	// canonicalized to [primary] anyway, but set it explicitly for clarity.
+	user.SetGroupIds(chosenGroupIds)
 
 	if err := user.HashPassword(request.Password); err != nil {
 		api.exitWithError(w, http.StatusInternalServerError, "Failed to hash password")
@@ -812,8 +954,9 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create Stripe customer if Stripe is enabled AND group billing is enabled
-	if api.Controller.Options.StripePaywallEnabled && api.Controller.Options.StripeSecretKey != "" && targetGroup.BillingEnabled {
+	// Create Stripe customer if Stripe is enabled AND billing applies (the primary
+	// group is billing-enabled, or any chosen tier in a multi-tier signup is paid).
+	if api.Controller.Options.StripePaywallEnabled && api.Controller.Options.StripeSecretKey != "" && (targetGroup.BillingEnabled || anyPaidSelfBillable) {
 		stripe.Key = api.Controller.Options.StripeSecretKey
 
 		// Check if group uses shared customer ID for admins
@@ -854,8 +997,21 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	// Sync config to file if enabled
 	api.Controller.SyncConfigToFile()
 
-	// Handle billing setup for new users in billing-enabled groups
-	if targetGroup.BillingEnabled {
+	// Multi-tier signup: if any chosen tier is paid, the user must complete the
+	// combined checkout before gaining access; all-free selections stay active.
+	if isMultiGroupSignup {
+		if anyPaidSelfBillable {
+			user.SubscriptionStatus = "incomplete"
+			user.PinExpiresAt = uint64(time.Now().Unix() - 86400) // expired until checkout completes
+			api.Controller.Users.Update(user)
+			api.Controller.Users.Write(api.Controller.Database)
+			api.Controller.SyncConfigToFile()
+			log.Printf("Multi-tier signup %s: expired PIN pending combined checkout", user.Email)
+		}
+	}
+
+	// Handle billing setup for new users in billing-enabled groups (single-group flows)
+	if !isMultiGroupSignup && targetGroup.BillingEnabled {
 		if targetGroup.BillingMode == "group_admin" && !user.IsGroupAdmin {
 			// For non-admin users in admin-managed billing groups, sync subscription status from admin
 			syncedFromAdmin := false
@@ -920,6 +1076,11 @@ func (api *Api) UserRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verifiedBySignupCode := api.Controller.Options.EmailVerificationRequired && request.AccessCode == ""
+
+	// Consume the signup OTP only after the account exists (issue #259).
+	if emailOTPValidated {
+		signupVerifications.Delete(request.Email)
+	}
 
 	// If user registered via an access/invitation code, mark them as already verified
 	if request.AccessCode != "" {
@@ -1080,7 +1241,7 @@ func (api *Api) UserLoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Turnstile verification (mobile apps are exempt)
 	if api.Controller.Options.TurnstileEnabled {
-		valid, err := api.verifyTurnstile(request.TurnstileToken, clientIP, r)
+		valid, err := api.verifyTurnstile(request.TurnstileToken, clientIP, r, "user_login")
 		if err != nil {
 			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("CAPTCHA verification error: %v", err))
 			return
@@ -1108,6 +1269,11 @@ func (api *Api) UserLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if user.IsSuspended() {
+		api.exitWithError(w, http.StatusForbidden, "Your account has been suspended. Contact support for assistance.")
+		return
+	}
+
 	// Login successful - reset failed attempts
 	api.Controller.LoginAttemptTracker.RecordSuccess(clientIP)
 
@@ -1122,9 +1288,9 @@ func (api *Api) UserLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// when they try to access the service content (calls, etc.)
 
 	// Update last login timestamp
-	user.UpdateLastLogin()
-	api.Controller.Users.Update(user)
-	api.Controller.Users.Write(api.Controller.Database)
+	if err := api.Controller.Users.RecordLastLogin(user, api.Controller.Database); err != nil {
+		log.Printf("failed to record last login for user %s: %v", user.Email, err)
+	}
 
 	// Check if user needs subscription
 	needsSubscription := false
@@ -1149,13 +1315,15 @@ func (api *Api) UserLoginHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message": "Login successful",
 		"user": map[string]interface{}{
-			"id":                 user.Id,
-			"email":              user.Email,
-			"pin":                user.Pin,
-			"subscriptionStatus": user.SubscriptionStatus,
-			"needsSubscription":  needsSubscription,
-			"needsPasswordReset": user.ForcePasswordReset,
-			"systemAdmin":        user.SystemAdmin,
+			"id":                     user.Id,
+			"email":                  user.Email,
+			"pin":                    user.Pin,
+			"subscriptionStatus":     user.SubscriptionStatus,
+			"needsSubscription":      needsSubscription,
+			"needsPasswordReset":     user.ForcePasswordReset,
+			"systemAdmin":            user.SystemAdmin,
+			"publicApiEnabled":       user.PublicApiEnabled,
+			"publicApiCapabilities":  user.PublicApiCaps(),
 		},
 	})
 }
@@ -1318,6 +1486,11 @@ func (api *Api) UserForcePasswordResetHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	if user.IsSuspended() {
+		api.exitWithError(w, http.StatusForbidden, "Your account has been suspended. Contact support for assistance.")
+		return
+	}
+
 	if err := ValidatePassword(request.NewPassword); err != nil {
 		api.exitWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1400,13 +1573,13 @@ func (api *Api) PostVerifyPlanContextHandler(w http.ResponseWriter, r *http.Requ
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"requiresPlanSelection":   requires,
-		"pricingOptions":          options,
-		"stripePublishableKey":    api.Controller.Options.StripePublishableKey,
-		"branding":                branding,
-		"email":                   user.Email,
-		"iosAppStoreUrl":          api.Controller.Options.EffectiveIOSAppStoreURL(),
-		"androidPlayStoreUrl":     api.Controller.Options.EffectiveAndroidPlayStoreURL(),
+		"requiresPlanSelection": requires,
+		"pricingOptions":        options,
+		"stripePublishableKey":  api.Controller.Options.StripePublishableKey,
+		"branding":              branding,
+		"email":                 user.Email,
+		"iosAppStoreUrl":        api.Controller.Options.EffectiveIOSAppStoreURL(),
+		"androidPlayStoreUrl":   api.Controller.Options.EffectiveAndroidPlayStoreURL(),
 	})
 }
 
@@ -1726,14 +1899,14 @@ func (api *Api) UserVerifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	requiresPlan, pricingOptions := api.postVerifyRequiresPlanSelection(user)
 	resp := map[string]interface{}{
-		"message":                 "Email verified successfully",
-		"verified":                true,
-		"email":                   user.Email,
-		"requiresPlanSelection":   requiresPlan,
-		"stripePublishableKey":    api.Controller.Options.StripePublishableKey,
-		"pricingOptions":          pricingOptions,
-		"iosAppStoreUrl":          api.Controller.Options.EffectiveIOSAppStoreURL(),
-		"androidPlayStoreUrl":     api.Controller.Options.EffectiveAndroidPlayStoreURL(),
+		"message":               "Email verified successfully",
+		"verified":              true,
+		"email":                 user.Email,
+		"requiresPlanSelection": requiresPlan,
+		"stripePublishableKey":  api.Controller.Options.StripePublishableKey,
+		"pricingOptions":        pricingOptions,
+		"iosAppStoreUrl":        api.Controller.Options.EffectiveIOSAppStoreURL(),
+		"androidPlayStoreUrl":   api.Controller.Options.EffectiveAndroidPlayStoreURL(),
 	}
 	if !requiresPlan {
 		resp["pricingOptions"] = []PricingOption{}
@@ -2054,6 +2227,28 @@ func (api *Api) handleSubscriptionEvent(rawData []byte, status string) {
 		if user.PinExpiresAt > 0 {
 			log.Printf("Set PIN expiration to %d (Unix timestamp) for status: %s", user.PinExpiresAt, status)
 		}
+	}
+
+	// Reconcile paid ("all_users" billing) memberships with the subscription so
+	// Billing-Portal add/remove syncs back into userGroupIds. On cancellation,
+	// drop those paid memberships (free/group_admin memberships are preserved).
+	if status == "canceled" || status == "incomplete_expired" {
+		for _, gid := range user.GroupIds() {
+			if g := api.Controller.UserGroups.Get(gid); g != nil && g.BillingEnabled && g.BillingMode == "all_users" {
+				user.RemoveGroup(gid)
+			}
+		}
+	} else {
+		recSub := sub
+		if recSub.Items == nil || len(recSub.Items.Data) == 0 {
+			stripe.Key = api.Controller.Options.StripeSecretKey
+			if stripe.Key != "" {
+				if fetched, err := subscription.Get(subData.ID, nil); err == nil {
+					recSub = fetched
+				}
+			}
+		}
+		api.reconcilePaidMembershipsFromSubscription(user, recSub)
 	}
 
 	// Save changes to database
@@ -2421,6 +2616,60 @@ func (api *Api) resolveUserFromCheckoutSession(session *stripe.CheckoutSession) 
 }
 
 // Handle checkout session completed
+// groupForPriceId returns the billing-enabled group whose pricing options
+// include the given Stripe price. Price IDs are required to be unique per group.
+func (api *Api) groupForPriceId(priceId string) *UserGroup {
+	if priceId == "" {
+		return nil
+	}
+	for _, g := range api.Controller.UserGroups.GetAll() {
+		if g == nil || !g.BillingEnabled {
+			continue
+		}
+		for _, opt := range g.GetPricingOptions() {
+			if opt.PriceId == priceId {
+				return g
+			}
+		}
+	}
+	return nil
+}
+
+// reconcilePaidMembershipsFromSubscription rewrites the user's paid
+// ("all_users" billing) memberships to exactly match the line items on their
+// combined subscription, preserving free and group_admin memberships. Call
+// after any subscription change (checkout, add/remove, webhook).
+func (api *Api) reconcilePaidMembershipsFromSubscription(user *User, sub *stripe.Subscription) {
+	if user == nil || sub == nil {
+		return
+	}
+	paid := map[uint64]bool{}
+	if sub.Items != nil {
+		for _, item := range sub.Items.Data {
+			if item == nil || item.Price == nil {
+				continue
+			}
+			if g := api.groupForPriceId(item.Price.ID); g != nil && g.BillingMode == "all_users" {
+				paid[g.Id] = true
+			}
+		}
+	}
+	// Keep every membership that is NOT an all_users-billing group (free +
+	// group_admin), then re-add exactly the groups still on the subscription.
+	next := []uint64{}
+	for _, gid := range user.GroupIds() {
+		g := api.Controller.UserGroups.Get(gid)
+		if g != nil && g.BillingEnabled && g.BillingMode == "all_users" {
+			continue
+		}
+		next = append(next, gid)
+	}
+	for gid := range paid {
+		next = append(next, gid)
+	}
+	user.SetGroupIds(next)
+}
+
 func (api *Api) handleCheckoutSessionCompleted(event stripe.Event) {
 	var session stripe.CheckoutSession
 	err := json.Unmarshal(event.Data.Raw, &session)
@@ -2561,19 +2810,23 @@ func (api *Api) handleCheckoutSessionCompleted(event stripe.Event) {
 		return
 	}
 
-	// If user already has a subscription, cancel it before setting the new one
+	// If the user has a different prior subscription, cancel it ONLY when it is
+	// not still active/trialing — a valid combined subscription must not be nuked
+	// on a return checkout. (Adding tiers to an active sub goes through the
+	// self-service add endpoint, not a fresh checkout.)
+	// Reaching a fresh Checkout means a replace (first-time subscribe, lapsed
+	// re-subscribe, or Change Plan) — self-service tier ADDs never come through
+	// Checkout for a user with an active subscription (they use the add endpoint
+	// / subscription items). So always cancel any different prior subscription to
+	// avoid orphaning it and double-billing.
 	oldSubscriptionId := user.StripeSubscriptionId
 	if oldSubscriptionId != "" && oldSubscriptionId != subscriptionID {
-		log.Printf("User has existing subscription %s, canceling it before setting new subscription %s", oldSubscriptionId, subscriptionID)
 		stripe.Key = api.Controller.Options.StripeSecretKey
 		if stripe.Key != "" {
-			// Cancel the old subscription immediately (they're switching plans)
-			_, err := subscription.Cancel(oldSubscriptionId, nil)
-			if err != nil {
+			if _, err := subscription.Cancel(oldSubscriptionId, nil); err != nil {
 				log.Printf("Warning: Failed to cancel old subscription %s for user %s: %v", oldSubscriptionId, user.Email, err)
-				// Continue anyway - we'll still set the new subscription
 			} else {
-				log.Printf("Successfully canceled old subscription %s for user %s", oldSubscriptionId, user.Email)
+				log.Printf("Canceled prior subscription %s for user %s before activating new %s", oldSubscriptionId, user.Email, subscriptionID)
 			}
 		}
 	}
@@ -2595,6 +2848,8 @@ func (api *Api) handleCheckoutSessionCompleted(event stripe.Event) {
 		} else {
 			log.Printf("DEBUG: ⚠ Warning: Subscription %s has no CurrentPeriodEnd set", subscriptionID)
 		}
+		// Sync paid memberships from the (possibly multi-item) subscription.
+		api.reconcilePaidMembershipsFromSubscription(user, sub)
 	} else {
 		log.Printf("DEBUG: ⚠ No subscription object available for PIN expiration calculation")
 	}
@@ -2636,7 +2891,11 @@ func (api *Api) CreateCheckoutSessionHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	var request struct {
-		PriceId    string `json:"priceId"`
+		PriceId string `json:"priceId"` // legacy single-tier form
+		Items   []struct {
+			GroupId uint64 `json:"groupId"`
+			PriceId string `json:"priceId"`
+		} `json:"items"` // multi-tier form: one entry per paid group
 		Email      string `json:"email"`
 		SuccessUrl string `json:"successUrl"`
 		CancelUrl  string `json:"cancelUrl"`
@@ -2663,91 +2922,127 @@ func (api *Api) CreateCheckoutSessionHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Get group and determine which price ID to use: group price ID is required
-	group := api.Controller.UserGroups.Get(user.UserGroupId)
-	if group == nil || !group.BillingEnabled {
-		api.exitWithError(w, http.StatusBadRequest, "User is not in a billing-enabled group")
+	// Normalize the legacy single priceId into one item on the user's primary group.
+	type checkoutReqItem struct {
+		groupId uint64
+		priceId string
+	}
+	reqItems := []checkoutReqItem{}
+	for _, it := range request.Items {
+		reqItems = append(reqItems, checkoutReqItem{groupId: it.GroupId, priceId: it.PriceId})
+	}
+	if len(reqItems) == 0 && request.PriceId != "" {
+		reqItems = append(reqItems, checkoutReqItem{groupId: user.UserGroupId, priceId: request.PriceId})
+	}
+	if len(reqItems) == 0 {
+		api.exitWithError(w, http.StatusBadRequest, "Nothing to checkout")
 		return
 	}
 
-	priceId := request.PriceId
-	if priceId == "" {
-		api.exitWithError(w, http.StatusBadRequest, "Price ID is required")
-		return
+	// Validate every item: group must be a self-billable, billing-enabled group
+	// whose pricing options include the price. Reject duplicate prices (they map
+	// ambiguously back to groups). Determine tax (automatic wins) and trial (max).
+	lineItems := []*stripe.CheckoutSessionLineItemParams{}
+	anyAutomaticTax := false
+	maxTrialDays := 0
+	seenPrice := map[string]bool{}
+	groupIds := []string{}
+	type resolvedLine struct {
+		group   *UserGroup
+		priceId string
+		taxMode string
 	}
-
-	// Validate that the requested price ID is one of the valid pricing options for this group
-	pricingOptions := group.GetPricingOptions()
-	validPriceId := false
-	for _, option := range pricingOptions {
-		if option.PriceId == priceId {
-			validPriceId = true
-			break
+	resolved := []resolvedLine{}
+	for _, it := range reqItems {
+		group := api.Controller.UserGroups.Get(it.groupId)
+		if group == nil || !group.BillingEnabled || !group.IsSelfBillable() {
+			api.exitWithError(w, http.StatusBadRequest, "Invalid or non-self-billable tier in checkout")
+			return
 		}
-	}
-
-	if !validPriceId {
-		api.exitWithError(w, http.StatusBadRequest, "Invalid price ID for this group")
-		return
-	}
-
-	log.Printf("Using price ID %s for user %s (group: %s)", priceId, request.Email, group.Name)
-
-	// Determine tax mode — fall back to legacy collectSalesTax if taxMode not yet set
-	taxMode := group.TaxMode
-	if taxMode == "" {
-		if group.CollectSalesTax {
-			taxMode = "automatic"
-		} else {
-			taxMode = "none"
+		trialDays := -1
+		for _, o := range group.GetPricingOptions() {
+			if o.PriceId == it.priceId {
+				trialDays = o.TrialDays
+				break
+			}
 		}
+		if trialDays < 0 {
+			api.exitWithError(w, http.StatusBadRequest, fmt.Sprintf("Invalid price ID for tier %q", group.Name))
+			return
+		}
+		if seenPrice[it.priceId] {
+			api.exitWithError(w, http.StatusBadRequest, "Duplicate price in checkout")
+			return
+		}
+		seenPrice[it.priceId] = true
+
+		taxMode := group.TaxMode
+		if taxMode == "" {
+			if group.CollectSalesTax {
+				taxMode = "automatic"
+			} else {
+				taxMode = "none"
+			}
+		}
+		if taxMode == "automatic" {
+			anyAutomaticTax = true
+		}
+		if trialDays > maxTrialDays {
+			maxTrialDays = trialDays
+		}
+		resolved = append(resolved, resolvedLine{group: group, priceId: it.priceId, taxMode: taxMode})
+		groupIds = append(groupIds, fmt.Sprintf("%d", group.Id))
 	}
 
-	// Build line item — tax rates are attached here for fixed mode
-	lineItem := &stripe.CheckoutSessionLineItemParams{
-		Price:    stripe.String(priceId),
-		Quantity: stripe.Int64(1),
+	for _, rl := range resolved {
+		li := &stripe.CheckoutSessionLineItemParams{
+			Price:    stripe.String(rl.priceId),
+			Quantity: stripe.Int64(1),
+		}
+		// Automatic tax wins: when any tier is automatic, do not attach per-line
+		// fixed rates (Stripe cannot mix automatic and manual tax on one sub).
+		if !anyAutomaticTax && rl.taxMode == "fixed" && rl.group.StripeTaxRateId != "" {
+			li.TaxRates = stripe.StringSlice([]string{rl.group.StripeTaxRateId})
+		}
+		lineItems = append(lineItems, li)
 	}
-	if taxMode == "fixed" && group.StripeTaxRateId != "" {
-		lineItem.TaxRates = stripe.StringSlice([]string{group.StripeTaxRateId})
-	}
+
+	log.Printf("Creating combined checkout for user %s: %d line item(s), groups=[%s]", request.Email, len(lineItems), strings.Join(groupIds, ","))
 
 	// Create Stripe Checkout Session
 	params := &stripe.CheckoutSessionParams{
 		PaymentMethodTypes: stripe.StringSlice([]string{
 			"card",
 		}),
-		LineItems:  []*stripe.CheckoutSessionLineItemParams{lineItem},
+		LineItems:  lineItems,
 		Mode:       stripe.String(string(stripe.CheckoutSessionModeSubscription)),
 		SuccessURL: stripe.String(request.SuccessUrl),
 		CancelURL:  stripe.String(request.CancelUrl),
 		Locale:     stripe.String("en"),
 		AutomaticTax: &stripe.CheckoutSessionAutomaticTaxParams{
-			Enabled: stripe.Bool(taxMode == "automatic"),
+			Enabled: stripe.Bool(anyAutomaticTax),
 		},
 	}
 	params.ClientReferenceID = stripe.String(fmt.Sprintf("%d", user.Id))
 	params.Metadata = map[string]string{
 		"rdio_user_id":    fmt.Sprintf("%d", user.Id),
 		"rdio_user_email": user.Email,
+		"rdio_group_ids":  strings.Join(groupIds, ","),
 	}
 
 	// Automatic tax requires a billing address from the customer
-	if taxMode == "automatic" {
+	if anyAutomaticTax {
 		params.CustomerUpdate = &stripe.CheckoutSessionCustomerUpdateParams{
 			Address: stripe.String("auto"),
 		}
 	}
 
-	// Add trial period if configured for this pricing option
-	for _, option := range pricingOptions {
-		if option.PriceId == priceId && option.TrialDays > 0 {
-			params.SubscriptionData = &stripe.CheckoutSessionSubscriptionDataParams{
-				TrialPeriodDays: stripe.Int64(int64(option.TrialDays)),
-			}
-			log.Printf("Adding %d day trial period for price %s", option.TrialDays, priceId)
-			break
+	// Trial is subscription-level: use the longest trial among selected tiers.
+	if maxTrialDays > 0 {
+		params.SubscriptionData = &stripe.CheckoutSessionSubscriptionDataParams{
+			TrialPeriodDays: stripe.Int64(int64(maxTrialDays)),
 		}
+		log.Printf("Adding %d day trial period (max across tiers)", maxTrialDays)
 	}
 
 	// Use existing Stripe customer ID if available, otherwise use email
@@ -2853,6 +3148,10 @@ func (api *Api) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 				sinceTimestamp = v
 			}
 		}
+		// scope=all is every radio-transmission alert this account can hear.
+		// Personal tone/keyword preferences are not applied. System health
+		// alerts stay on /api/system-alerts.
+		includeAllTransmissions := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("scope")), "all")
 
 		// Get user's alert preferences from cache
 		type userPref struct {
@@ -2897,7 +3196,7 @@ func (api *Api) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Query all alerts (no userId filter) with system, talkgroup labels, call transcripts, and tone sequence
-		query := fmt.Sprintf(`SELECT a."alertId", a."callId", a."systemId", a."talkgroupId", a."alertType", a."toneDetected", a."toneSetId", a."keywordsMatched", a."transcriptSnippet", a."createdAt", s."label" as "systemLabel", s."systemRef" as "systemRef", t."label" as "talkgroupLabel", t."name" as "talkgroupName", c."transcript" as "callTranscript", c."transcriptionStatus" as "callTranscriptionStatus", c."toneSequence" as "callToneSequence", c."timestamp" as "callTimestamp", c."alertSummary" as "callAlertSummary" FROM "alerts" a LEFT JOIN "systems" s ON s."systemId" = a."systemId" LEFT JOIN "talkgroups" t ON t."talkgroupId" = a."talkgroupId" LEFT JOIN "calls" c ON c."callId" = a."callId" %s ORDER BY a."createdAt" DESC LIMIT %d`, whereClause, maxAlerts)
+		query := fmt.Sprintf(`SELECT a."alertId", a."callId", a."systemId", a."talkgroupId", a."alertType", a."toneDetected", a."toneSetId", a."keywordsMatched", a."transcriptSnippet", a."createdAt", s."label" as "systemLabel", s."systemRef" as "systemRef", t."label" as "talkgroupLabel", t."name" as "talkgroupName", c."transcript" as "callTranscript", c."transcriptionStatus" as "callTranscriptionStatus", c."toneSequence" as "callToneSequence", c."timestamp" as "callTimestamp", c."alertSummary" as "callAlertSummary", c."incidentAddress", c."incidentLat", c."incidentLon", c."incidentNature", c."incidentGeocodeStatus" FROM "alerts" a LEFT JOIN "systems" s ON s."systemId" = a."systemId" LEFT JOIN "talkgroups" t ON t."talkgroupId" = a."talkgroupId" LEFT JOIN "calls" c ON c."callId" = a."callId" %s ORDER BY a."createdAt" DESC LIMIT %d`, whereClause, maxAlerts)
 		rows, err := api.Controller.Database.Sql.Query(query)
 		if err != nil {
 			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("failed to query alerts: %v", err))
@@ -2928,9 +3227,35 @@ func (api *Api) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 				callToneSequence        sql.NullString
 				callTimestamp           sql.NullInt64
 				callAlertSummary        sql.NullString
+				incidentAddress         sql.NullString
+				incidentLat             sql.NullFloat64
+				incidentLon             sql.NullFloat64
+				incidentNature          sql.NullString
+				incidentGeocodeStatus   sql.NullString
 			)
 
-			if err := rows.Scan(&alertId, &callId, &systemId, &talkgroupId, &alertType, &toneDetected, &toneSetId, &keywordsMatched, &transcriptSnippet, &createdAt, &systemLabel, &systemRef, &talkgroupLabel, &talkgroupName, &callTranscript, &callTranscriptionStatus, &callToneSequence, &callTimestamp, &callAlertSummary); err != nil {
+			if err := rows.Scan(&alertId, &callId, &systemId, &talkgroupId, &alertType, &toneDetected, &toneSetId, &keywordsMatched, &transcriptSnippet, &createdAt, &systemLabel, &systemRef, &talkgroupLabel, &talkgroupName, &callTranscript, &callTranscriptionStatus, &callToneSequence, &callTimestamp, &callAlertSummary, &incidentAddress, &incidentLat, &incidentLon, &incidentNature, &incidentGeocodeStatus); err != nil {
+				continue
+			}
+
+			system, sysOk := api.Controller.Systems.GetSystemById(systemId)
+			if !sysOk {
+				continue
+			}
+			talkgroup, tgOk := system.Talkgroups.GetTalkgroupById(talkgroupId)
+			if !tgOk {
+				continue
+			}
+
+			minimalCall := &Call{
+				Id:        callId,
+				System:    system,
+				Talkgroup: talkgroup,
+			}
+			if callTimestamp.Valid {
+				minimalCall.Timestamp = time.UnixMilli(callTimestamp.Int64)
+			}
+			if !api.Controller.userHasAccess(client.User, minimalCall) {
 				continue
 			}
 
@@ -3041,6 +3366,19 @@ func (api *Api) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 			if callAlertSummary.Valid && callAlertSummary.String != "" {
 				alertMap["alertSummary"] = callAlertSummary.String
 			}
+			if incidentAddress.Valid && incidentAddress.String != "" {
+				alertMap["incidentAddress"] = incidentAddress.String
+			}
+			if incidentLat.Valid && incidentLon.Valid && incidentLat.Float64 != 0 {
+				alertMap["incidentLat"] = incidentLat.Float64
+				alertMap["incidentLon"] = incidentLon.Float64
+			}
+			if incidentNature.Valid && incidentNature.String != "" {
+				alertMap["incidentNature"] = incidentNature.String
+			}
+			if incidentGeocodeStatus.Valid && incidentGeocodeStatus.String != "" {
+				alertMap["incidentGeocodeStatus"] = incidentGeocodeStatus.String
+			}
 			if toneSetId != "" {
 				alertMap["toneSetId"] = toneSetId
 			}
@@ -3051,193 +3389,183 @@ func (api *Api) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 				alertMap["matchedToneSetNames"] = matchedToneSetNames // All matched tone sets (for backward compatibility)
 			}
 
-			// Filter alert based on user preferences only (no access restrictions for alerts)
+			// Filter by user/group access, then alert preferences (tone/keyword/transcript).
+			// scope=all skips the preference match and keeps access plus delay.
 			prefKey := fmt.Sprintf("%d-%d", systemId, talkgroupId)
 			pref, hasPreference := preferences[prefKey]
 
-			if !hasPreference {
-				// User has no preference for this system/talkgroup, skip this alert
-				continue
-			}
-
-			// Check if alerts are enabled for this preference
-			if !pref.alertEnabled {
-				// User has disabled alerts for this system/talkgroup, skip this alert
-				continue
-			}
-
-			// Check if alert matches user's preferences
-			matchesPreference := false
-
-			if alertType == "tone" {
-				// For tone alerts: user must have toneAlerts enabled
-				if pref.toneAlerts {
-					// If user has specific toneSetIds, check if this alert's toneSetId matches
-					if len(pref.toneSetIds) > 0 {
-						// User wants specific tone sets - check if this alert's toneSetId is in the list
-						for _, userToneSetId := range pref.toneSetIds {
-							if userToneSetId == toneSetId {
-								matchesPreference = true
-								break
-							}
-						}
-					} else {
-						// User wants all tone sets
-						matchesPreference = true
-					}
+			matchesPreference := includeAllTransmissions
+			if !includeAllTransmissions {
+				if !hasPreference {
+					// User has no preference for this system/talkgroup, skip this alert
+					continue
 				}
-			} else if alertType == "keyword" {
-				// For keyword alerts: user must have keywordAlerts enabled
-				if pref.keywordAlerts {
-					// Parse alert's keywords
-					var alertKeywords []string
-					if keywordsMatched != "" && keywordsMatched != "[]" {
-						json.Unmarshal([]byte(keywordsMatched), &alertKeywords)
-					}
 
-					// Check if any alert keyword matches user's keywords
-					matchesKeywords := false
-					for _, alertKw := range alertKeywords {
-						for _, userKw := range pref.keywords {
-							if strings.EqualFold(alertKw, userKw) {
-								matchesKeywords = true
-								break
+				// Check if alerts are enabled for this preference
+				if !pref.alertEnabled {
+					// User has disabled alerts for this system/talkgroup, skip this alert
+					continue
+				}
+			}
+
+			if !includeAllTransmissions {
+				if alertType == "tone" {
+					// For tone alerts: user must have toneAlerts enabled
+					if pref.toneAlerts {
+						// If user has specific toneSetIds, check if this alert's toneSetId matches
+						if len(pref.toneSetIds) > 0 {
+							// User wants specific tone sets - check if this alert's toneSetId is in the list
+							for _, userToneSetId := range pref.toneSetIds {
+								if userToneSetId == toneSetId {
+									matchesPreference = true
+									break
+								}
 							}
-						}
-						if matchesKeywords {
-							break
+						} else {
+							// User wants all tone sets
+							matchesPreference = true
 						}
 					}
+				} else if alertType == "keyword" {
+					// For keyword alerts: user must have keywordAlerts enabled
+					if pref.keywordAlerts {
+						// Parse alert's keywords
+						var alertKeywords []string
+						if keywordsMatched != "" && keywordsMatched != "[]" {
+							json.Unmarshal([]byte(keywordsMatched), &alertKeywords)
+						}
 
-					// If no direct keyword match, check keyword lists
-					if !matchesKeywords && len(pref.keywordListIds) > 0 {
-						// Load keyword lists from cache and check if alert keywords match
-						for _, listId := range pref.keywordListIds {
-							list := api.Controller.KeywordListsCache.GetList(listId)
-							if list != nil {
-								// Check if any alert keyword matches list keywords
-								for _, alertKw := range alertKeywords {
-									for _, listKw := range list.Keywords {
-										if strings.EqualFold(alertKw, listKw) {
-											matchesKeywords = true
-											break
-										}
-									}
-									if matchesKeywords {
-										break
-									}
+						// Check if any alert keyword matches user's keywords
+						matchesKeywords := false
+						for _, alertKw := range alertKeywords {
+							for _, userKw := range pref.keywords {
+								if strings.EqualFold(alertKw, userKw) {
+									matchesKeywords = true
+									break
 								}
 							}
 							if matchesKeywords {
 								break
 							}
 						}
-					}
 
-					matchesPreference = matchesKeywords
-				}
-			} else if alertType == "tone+keyword" {
-				// For tone+keyword alerts: must match both tone and keyword preferences
-				toneMatches := false
-				keywordMatches := false
-
-				// Check tone match
-				if pref.toneAlerts {
-					if len(pref.toneSetIds) > 0 {
-						for _, userToneSetId := range pref.toneSetIds {
-							if userToneSetId == toneSetId {
-								toneMatches = true
-								break
-							}
-						}
-					} else {
-						toneMatches = true
-					}
-				}
-
-				// Check keyword match
-				if pref.keywordAlerts {
-					var alertKeywords []string
-					if keywordsMatched != "" && keywordsMatched != "[]" {
-						json.Unmarshal([]byte(keywordsMatched), &alertKeywords)
-					}
-
-					// Check direct keywords
-					for _, alertKw := range alertKeywords {
-						for _, userKw := range pref.keywords {
-							if strings.EqualFold(alertKw, userKw) {
-								keywordMatches = true
-								break
-							}
-						}
-						if keywordMatches {
-							break
-						}
-					}
-
-					// Check keyword lists using cache
-					if !keywordMatches && len(pref.keywordListIds) > 0 {
-						for _, listId := range pref.keywordListIds {
-							// Get from cache instead of database
-							list := api.Controller.KeywordListsCache.GetList(listId)
-							if list != nil {
-								for _, alertKw := range alertKeywords {
-									for _, listKw := range list.Keywords {
-										if strings.EqualFold(alertKw, listKw) {
-											keywordMatches = true
+						// If no direct keyword match, check keyword lists
+						if !matchesKeywords && len(pref.keywordListIds) > 0 {
+							// Load keyword lists from cache and check if alert keywords match
+							for _, listId := range pref.keywordListIds {
+								list := api.Controller.KeywordListsCache.GetList(listId)
+								if list != nil {
+									// Check if any alert keyword matches list keywords
+									for _, alertKw := range alertKeywords {
+										for _, listKw := range list.Keywords {
+											if strings.EqualFold(alertKw, listKw) {
+												matchesKeywords = true
+												break
+											}
+										}
+										if matchesKeywords {
 											break
 										}
 									}
-									if keywordMatches {
-										break
-									}
+								}
+								if matchesKeywords {
+									break
+								}
+							}
+						}
+
+						matchesPreference = matchesKeywords
+					}
+				} else if alertType == "tone+keyword" {
+					// For tone+keyword alerts: must match both tone and keyword preferences
+					toneMatches := false
+					keywordMatches := false
+
+					// Check tone match
+					if pref.toneAlerts {
+						if len(pref.toneSetIds) > 0 {
+							for _, userToneSetId := range pref.toneSetIds {
+								if userToneSetId == toneSetId {
+									toneMatches = true
+									break
+								}
+							}
+						} else {
+							toneMatches = true
+						}
+					}
+
+					// Check keyword match
+					if pref.keywordAlerts {
+						var alertKeywords []string
+						if keywordsMatched != "" && keywordsMatched != "[]" {
+							json.Unmarshal([]byte(keywordsMatched), &alertKeywords)
+						}
+
+						// Check direct keywords
+						for _, alertKw := range alertKeywords {
+							for _, userKw := range pref.keywords {
+								if strings.EqualFold(alertKw, userKw) {
+									keywordMatches = true
+									break
 								}
 							}
 							if keywordMatches {
 								break
 							}
 						}
-					}
-				}
 
-				matchesPreference = toneMatches && keywordMatches
+						// Check keyword lists using cache
+						if !keywordMatches && len(pref.keywordListIds) > 0 {
+							for _, listId := range pref.keywordListIds {
+								// Get from cache instead of database
+								list := api.Controller.KeywordListsCache.GetList(listId)
+								if list != nil {
+									for _, alertKw := range alertKeywords {
+										for _, listKw := range list.Keywords {
+											if strings.EqualFold(alertKw, listKw) {
+												keywordMatches = true
+												break
+											}
+										}
+										if keywordMatches {
+											break
+										}
+									}
+								}
+								if keywordMatches {
+									break
+								}
+							}
+						}
+					}
+
+					matchesPreference = toneMatches && keywordMatches
+				} else if alertType == "transcript" {
+					// Alerting-talkgroup transcript alerts: alertEnabled on this talkgroup
+					// is enough (no tone/keyword prefs required).
+					matchesPreference = true
+				}
 			}
 
-			// Only add alert if it matches user's preferences
+			// Only add alert if it matches user's preferences.
+			// scope=all already set matchesPreference and skipped this block.
 			if !matchesPreference {
 				continue
 			}
 
 			// Check if alert is still delayed for this user (respects group delays)
 			if callTimestamp.Valid && client.User != nil {
-				// Get system and talkgroup to build call object for delay check
-				system, _ := api.Controller.Systems.GetSystemById(systemId)
-				var talkgroup *Talkgroup
-				if system != nil {
-					talkgroup, _ = system.Talkgroups.GetTalkgroupById(talkgroupId)
-				}
+				// Get user's effective delay (includes group delays)
+				defaultDelay := api.Controller.Options.DefaultSystemDelay
+				effectiveDelay := api.Controller.userEffectiveDelay(client.User, minimalCall, defaultDelay)
 
-				if system != nil && talkgroup != nil {
-					// Create minimal call object for delay check
-					callTimestampTime := time.UnixMilli(callTimestamp.Int64)
-					minimalCall := &Call{
-						Id:        callId,
-						System:    system,
-						Talkgroup: talkgroup,
-						Timestamp: callTimestampTime,
-					}
-
-					// Get user's effective delay (includes group delays)
-					defaultDelay := api.Controller.Options.DefaultSystemDelay
-					effectiveDelay := api.Controller.userEffectiveDelay(client.User, minimalCall, defaultDelay)
-
-					// Check if call is still delayed
-					if effectiveDelay > 0 {
-						delayCompletionTime := callTimestampTime.Add(time.Duration(effectiveDelay) * time.Minute)
-						if time.Now().Before(delayCompletionTime) {
-							// Alert is still delayed for this user, skip it
-							continue
-						}
+				// Check if call is still delayed
+				if effectiveDelay > 0 {
+					delayCompletionTime := minimalCall.Timestamp.Add(time.Duration(effectiveDelay) * time.Minute)
+					if time.Now().Before(delayCompletionTime) {
+						// Alert is still delayed for this user, skip it
+						continue
 					}
 				}
 			}
@@ -3275,8 +3603,8 @@ func (api *Api) AlertsHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				toneGroupMap[toneSetKey] = append(toneGroupMap[toneSetKey], alert)
-			} else if alertType == "keyword" {
-				// Group keyword alerts by channel (system + talkgroup)
+			} else if alertType == "keyword" || alertType == "transcript" {
+				// Group keyword and alerting-talkgroup transcript alerts by channel
 				systemLabel, _ := alert["systemLabel"].(string)
 				if systemLabel == "" {
 					systemId, _ := alert["systemId"].(uint64)
@@ -3497,7 +3825,7 @@ func (api *Api) TranscriptsHandler(w http.ResponseWriter, r *http.Request) {
 
 	for chunk := 0; uint(len(results)) < limit && chunk < maxChunks; chunk++ {
 		query := fmt.Sprintf(
-			`SELECT c."callId", c."systemId", c."talkgroupId", c."transcriptionStatus", c."transcript", c."timestamp", c."alertSummary", s."label" as "systemLabel", t."label" as "talkgroupLabel", t."name" as "talkgroupName" `+
+			`SELECT c."callId", c."systemId", c."talkgroupId", c."transcriptionStatus", c."transcript", COALESCE(c."reviewedTranscript", ''), COALESCE(c."trainingReviewStatus", ''), c."timestamp", c."alertSummary", s."label" as "systemLabel", t."label" as "talkgroupLabel", t."name" as "talkgroupName" `+
 				`FROM "calls" c `+
 				`LEFT JOIN "delayed" AS d ON d."callId" = c."callId" `+
 				`LEFT JOIN "systems" s ON s."systemId" = c."systemId" `+
@@ -3517,19 +3845,21 @@ func (api *Api) TranscriptsHandler(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			rowCount++
 			var (
-				callId              uint64
-				sysId               uint64
-				tgId                uint64
-				transcriptionStatus sql.NullString
-				transcript          sql.NullString
-				callTimestamp       sql.NullInt64
-				alertSummary        sql.NullString
-				systemLabel         sql.NullString
-				talkgroupLabel      sql.NullString
-				talkgroupName       sql.NullString
+				callId               uint64
+				sysId                uint64
+				tgId                 uint64
+				transcriptionStatus  sql.NullString
+				transcript           sql.NullString
+				reviewedTranscript   sql.NullString
+				trainingReviewStatus sql.NullString
+				callTimestamp        sql.NullInt64
+				alertSummary         sql.NullString
+				systemLabel          sql.NullString
+				talkgroupLabel       sql.NullString
+				talkgroupName        sql.NullString
 			)
 
-			if err := rows.Scan(&callId, &sysId, &tgId, &transcriptionStatus, &transcript, &callTimestamp, &alertSummary, &systemLabel, &talkgroupLabel, &talkgroupName); err != nil {
+			if err := rows.Scan(&callId, &sysId, &tgId, &transcriptionStatus, &transcript, &reviewedTranscript, &trainingReviewStatus, &callTimestamp, &alertSummary, &systemLabel, &talkgroupLabel, &talkgroupName); err != nil {
 				continue
 			}
 
@@ -3593,6 +3923,12 @@ func (api *Api) TranscriptsHandler(w http.ResponseWriter, r *http.Request) {
 			if talkgroupName.Valid {
 				entry["talkgroupName"] = talkgroupName.String
 			}
+			if reviewedTranscript.Valid && reviewedTranscript.String != "" {
+				entry["reviewedTranscript"] = reviewedTranscript.String
+			}
+			if trainingReviewStatus.Valid && trainingReviewStatus.String != "" {
+				entry["trainingReviewStatus"] = trainingReviewStatus.String
+			}
 			results = append(results, entry)
 			if uint(len(results)) >= limit {
 				break
@@ -3628,6 +3964,37 @@ func (api *Api) TranscriptsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// TranscriptsTrainingProgressHandler returns community-wide Whisper training progress from the transcript collector.
+func (api *Api) TranscriptsTrainingProgressHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	client := api.getClient(r)
+	if client == nil || client.User == nil {
+		api.exitWithError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	collectorURL := defaultTranscriptCollectorURL
+	api.Controller.Options.mutex.Lock()
+	if u := strings.TrimSpace(api.Controller.Options.TranscriptionConfig.CollectorURL); u != "" {
+		collectorURL = u
+	}
+	api.Controller.Options.mutex.Unlock()
+
+	progress, err := fetchCollectorGlobalProgress(collectorURL)
+	if err != nil {
+		log.Printf("TranscriptsTrainingProgressHandler: %v", err)
+		api.exitWithError(w, http.StatusBadGateway, "could not load training progress")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(progress)
+}
+
 // AlertPreferencesHandler handles GET/PUT /api/alerts/preferences
 func (api *Api) AlertPreferencesHandler(w http.ResponseWriter, r *http.Request) {
 	client := api.getClient(r)
@@ -3645,11 +4012,21 @@ func (api *Api) AlertPreferencesHandler(w http.ResponseWriter, r *http.Request) 
 		for _, pref := range cachedPrefs {
 			// Look up systemRef and talkgroupRef from in-memory Systems
 			var systemRef, talkgroupRef uint
-			if system, ok := api.Controller.Systems.GetSystemById(pref.SystemId); ok {
-				systemRef = system.SystemRef
-				if talkgroup, ok := system.Talkgroups.GetTalkgroupById(pref.TalkgroupId); ok {
-					talkgroupRef = talkgroup.TalkgroupRef
-				}
+			system, sysOk := api.Controller.Systems.GetSystemById(pref.SystemId)
+			if !sysOk {
+				continue
+			}
+			systemRef = system.SystemRef
+			talkgroup, tgOk := system.Talkgroups.GetTalkgroupById(pref.TalkgroupId)
+			if !tgOk {
+				continue
+			}
+			talkgroupRef = talkgroup.TalkgroupRef
+			if !api.Controller.userHasAccess(client.User, &Call{
+				System:    system,
+				Talkgroup: talkgroup,
+			}) {
+				continue
 			}
 
 			prefMap := map[string]any{
@@ -3773,9 +4150,11 @@ func (api *Api) AlertPreferencesHandler(w http.ResponseWriter, r *http.Request) 
 					}
 				}
 			}
+			_, hasNotificationSound := pref["notificationSound"]
 			if v, ok := pref["notificationSound"].(string); ok {
 				notificationSound = v
 			}
+			_, hasToneSetSounds := pref["toneSetSounds"]
 			if v, ok := pref["toneSetSounds"].(map[string]any); ok {
 				toneSetSounds = make(map[string]string)
 				for k, val := range v {
@@ -3784,9 +4163,11 @@ func (api *Api) AlertPreferencesHandler(w http.ResponseWriter, r *http.Request) 
 					}
 				}
 			}
+			_, hasPagerAlert := pref["pagerAlert"]
 			if v, ok := pref["pagerAlert"].(bool); ok {
 				pagerAlert = v
 			}
+			_, hasToneSetPagerAlerts := pref["toneSetPagerAlerts"]
 			if v, ok := pref["toneSetPagerAlerts"].(map[string]any); ok {
 				toneSetPagerAlerts = make(map[string]bool)
 				for k, val := range v {
@@ -3865,9 +4246,11 @@ func (api *Api) AlertPreferencesHandler(w http.ResponseWriter, r *http.Request) 
 			}
 
 			// Upsert preference using verified database talkgroupId
-			query := fmt.Sprintf(`INSERT INTO "userAlertPreferences" ("userId", "systemId", "talkgroupId", "alertEnabled", "toneAlerts", "keywordAlerts", "keywords", "keywordListIds", "toneSetIds", "notificationSound", "toneSetSounds", "pagerAlert", "toneSetPagerAlerts") VALUES (%d, %d, %d, %t, %t, %t, $1, $2, $3, $4, $5, %t, $6) ON CONFLICT ("userId", "systemId", "talkgroupId") DO UPDATE SET "alertEnabled" = %t, "toneAlerts" = %t, "keywordAlerts" = %t, "keywords" = $1, "keywordListIds" = $2, "toneSetIds" = $3, "notificationSound" = $4, "toneSetSounds" = $5, "pagerAlert" = %t, "toneSetPagerAlerts" = $6`, client.User.Id, systemId, dbTalkgroupId, alertEnabled, toneAlerts, keywordAlerts, pagerAlert, alertEnabled, toneAlerts, keywordAlerts, pagerAlert)
+			// A preferences save that omits sound or pager fields must not wipe
+			// values set elsewhere. An explicit empty string still means default.
+			query := fmt.Sprintf(`INSERT INTO "userAlertPreferences" ("userId", "systemId", "talkgroupId", "alertEnabled", "toneAlerts", "keywordAlerts", "keywords", "keywordListIds", "toneSetIds", "notificationSound", "toneSetSounds", "pagerAlert", "toneSetPagerAlerts") VALUES (%d, %d, %d, %t, %t, %t, $1, $2, $3, $4, $5, %t, $6) ON CONFLICT ("userId", "systemId", "talkgroupId") DO UPDATE SET "alertEnabled" = %t, "toneAlerts" = %t, "keywordAlerts" = %t, "keywords" = $1, "keywordListIds" = $2, "toneSetIds" = $3, "notificationSound" = CASE WHEN $7 THEN $4 ELSE "userAlertPreferences"."notificationSound" END, "toneSetSounds" = CASE WHEN $8 THEN $5 ELSE "userAlertPreferences"."toneSetSounds" END, "pagerAlert" = CASE WHEN $9 THEN %t ELSE "userAlertPreferences"."pagerAlert" END, "toneSetPagerAlerts" = CASE WHEN $10 THEN $6 ELSE "userAlertPreferences"."toneSetPagerAlerts" END`, client.User.Id, systemId, dbTalkgroupId, alertEnabled, toneAlerts, keywordAlerts, pagerAlert, alertEnabled, toneAlerts, keywordAlerts, pagerAlert)
 
-			if _, err := tx.Exec(query, string(keywordsJson), string(keywordListIdsJson), string(toneSetIdsJson), notificationSound, string(toneSetSoundsJson), string(toneSetPagerAlertsJson)); err != nil {
+			if _, err := tx.Exec(query, string(keywordsJson), string(keywordListIdsJson), string(toneSetIdsJson), notificationSound, string(toneSetSoundsJson), string(toneSetPagerAlertsJson), hasNotificationSound, hasToneSetSounds, hasPagerAlert, hasToneSetPagerAlerts); err != nil {
 				api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("failed to update preference: %v", err))
 				return
 			}
@@ -4345,16 +4728,67 @@ func (api *Api) AccountGetHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Get current subscription price ID from Stripe if user has an active subscription
+	// Get subscription line items from Stripe: the first price (legacy
+	// currentPriceId) and the full set of billed price IDs (for per-group state).
+	subPriceIds := map[string]bool{}
 	if user.StripeSubscriptionId != "" && api.Controller.Options.StripeSecretKey != "" {
 		stripe.Key = api.Controller.Options.StripeSecretKey
 		sub, err := subscription.Get(user.StripeSubscriptionId, nil)
-		if err == nil && len(sub.Items.Data) > 0 {
-			// Get the price ID from the first subscription item
-			currentPriceId = sub.Items.Data[0].Price.ID
+		if err == nil && sub.Items != nil {
+			for i, item := range sub.Items.Data {
+				if item == nil || item.Price == nil {
+					continue
+				}
+				if i == 0 {
+					currentPriceId = item.Price.ID
+				}
+				subPriceIds[item.Price.ID] = true
+			}
 		} else if err != nil {
-			log.Printf("Failed to fetch subscription %s to get price ID: %v", user.StripeSubscriptionId, err)
+			log.Printf("Failed to fetch subscription %s to get price IDs: %v", user.StripeSubscriptionId, err)
 		}
+	}
+
+	// Per-group membership list (all tiers the user belongs to).
+	memberships := []map[string]interface{}{}
+	for _, gid := range user.GroupIds() {
+		g := api.Controller.UserGroups.Get(gid)
+		if g == nil {
+			continue
+		}
+		// Which of this group's prices is on the subscription (if any).
+		priceId := ""
+		for _, o := range g.GetPricingOptions() {
+			if subPriceIds[o.PriceId] {
+				priceId = o.PriceId
+				break
+			}
+		}
+		memberships = append(memberships, map[string]interface{}{
+			"groupId":        g.Id,
+			"name":           g.Name,
+			"billingEnabled": g.BillingEnabled,
+			"selfBillable":   g.IsSelfBillable(),
+			"paid":           priceId != "",
+			"priceId":        priceId,
+			"isPrimary":      g.Id == user.UserGroupId,
+			"pricingOptions": g.GetPricingOptions(),
+		})
+	}
+
+	// Public self-billable tiers the user has not joined yet (for the add picker).
+	availableTiers := []map[string]interface{}{}
+	for _, g := range api.Controller.UserGroups.GetPublicRegistrationGroups() {
+		if g == nil || user.IsMemberOf(g.Id) || !g.IsSelfBillable() {
+			continue
+		}
+		availableTiers = append(availableTiers, map[string]interface{}{
+			"groupId":        g.Id,
+			"name":           g.Name,
+			"description":    g.Description,
+			"billingEnabled": g.BillingEnabled,
+			"pricingOptions": g.GetPricingOptions(),
+		})
 	}
 
 	// Get pricing options from user's group if billing is enabled
@@ -4364,6 +4798,36 @@ func (api *Api) AccountGetHandler(w http.ResponseWriter, r *http.Request) {
 		if group != nil && group.BillingEnabled {
 			pricingOptions = group.GetPricingOptions()
 		}
+	}
+
+	// Multi-tier: billing is also required when any self-billable paid membership
+	// is unpaid (price not on the Stripe subscription). Primary-group-only
+	// billingRequired left free-primary + unpaid paid-tier users unable to
+	// Subscribe on mobile hub / native app.
+	unpaidCheckoutItems := []map[string]interface{}{}
+	for _, m := range memberships {
+		billingEnabled, _ := m["billingEnabled"].(bool)
+		selfBillable, _ := m["selfBillable"].(bool)
+		paid, _ := m["paid"].(bool)
+		if !billingEnabled || !selfBillable || paid {
+			continue
+		}
+		opts, _ := m["pricingOptions"].([]PricingOption)
+		if len(opts) == 0 {
+			continue
+		}
+		billingRequired = true
+		// Legacy pricingOptions: if primary has none, expose unpaid-tier plans
+		// so older clients still show something to pick.
+		if len(pricingOptions) == 0 {
+			pricingOptions = opts
+		}
+		gid, _ := m["groupId"].(uint64)
+		unpaidCheckoutItems = append(unpaidCheckoutItems, map[string]interface{}{
+			"groupId":        gid,
+			"name":           m["name"],
+			"pricingOptions": opts,
+		})
 	}
 
 	// Return user account info (excluding sensitive data)
@@ -4390,7 +4854,380 @@ func (api *Api) AccountGetHandler(w http.ResponseWriter, r *http.Request) {
 		"billingRequired":           billingRequired,
 		"pinExpired":                user.PinExpired(),
 		"pinExpiresAt":              user.PinExpiresAt,
+		"memberships":               memberships,
+		"availableTiers":            availableTiers,
+		"unpaidCheckoutItems":       unpaidCheckoutItems,
 	})
+}
+
+// userFromRequestPin resolves the authenticated user from a ?pin= query param
+// or a Bearer token.
+func (api *Api) userFromRequestPin(r *http.Request) *User {
+	pin := r.URL.Query().Get("pin")
+	if pin == "" {
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			pin = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+	}
+	if pin == "" {
+		return nil
+	}
+	return api.Controller.Users.GetUserByPin(pin)
+}
+
+// SubscriptionGroupAddHandler adds a paid, self-billable public tier to the
+// user's combined subscription. With an active subscription the item is added
+// server-side with proration (charging the saved card); otherwise a combined
+// checkout URL is returned for the client to complete.
+// keyedMutex serializes operations per key (here, per user id) so concurrent
+// tier add/remove requests for the same user cannot interleave Stripe changes
+// with membership writes.
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[uint64]*sync.Mutex
+}
+
+func (k *keyedMutex) lock(id uint64) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = map[uint64]*sync.Mutex{}
+	}
+	mu, ok := k.m[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		k.m[id] = mu
+	}
+	k.mu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// tierMutations serializes self-service tier changes per user.
+var tierMutations keyedMutex
+
+// persistTierMembership saves a membership change and reports whether it was
+// durably written. Tier add/remove must not report success when the canonical
+// membership failed to persist (Stripe may already have been changed, so the
+// caller needs to surface the mismatch rather than silently diverge). Uses a
+// targeted single-row update rather than rewriting every user.
+func (api *Api) persistTierMembership(user *User) error {
+	if err := api.Controller.Users.Update(user); err != nil {
+		return err
+	}
+	if err := api.Controller.Users.WriteSubscriptionState(user, api.Controller.Database); err != nil {
+		return err
+	}
+	api.Controller.SyncConfigToFile()
+	// Push refreshed scoped channels to any live sessions for this user.
+	api.Controller.Clients.RefreshConfigForGroup(api.Controller, user.UserGroupId)
+	return nil
+}
+
+func (api *Api) SubscriptionGroupAddHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		api.exitWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	user := api.userFromRequestPin(r)
+	if user == nil {
+		api.exitWithError(w, http.StatusUnauthorized, "PIN required")
+		return
+	}
+	// Serialize tier mutations for this user so concurrent add/remove requests
+	// cannot interleave Stripe changes with membership writes.
+	unlock := tierMutations.lock(user.Id)
+	defer unlock()
+
+	var request struct {
+		GroupId uint64 `json:"groupId"`
+		PriceId string `json:"priceId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		api.exitWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+
+	group := api.Controller.UserGroups.Get(request.GroupId)
+	if group == nil || !group.IsPublicRegistration || !group.IsSelfBillable() {
+		api.exitWithError(w, http.StatusBadRequest, "Tier is not available for self-service subscription")
+		return
+	}
+
+	// Free tier: membership-only, no Stripe.
+	if !group.BillingEnabled {
+		if user.IsMemberOf(request.GroupId) {
+			api.exitWithError(w, http.StatusBadRequest, "You already have this tier")
+			return
+		}
+		if group.MaxUsers > 0 && api.Controller.UserGroups.GetUserCount(group.Id, api.Controller.Users) >= group.MaxUsers {
+			api.exitWithError(w, http.StatusForbidden, "This tier is full")
+			return
+		}
+		user.AddGroup(request.GroupId)
+		if err := api.persistTierMembership(user); err != nil {
+			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save membership: %v", err))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"added": true, "groupIds": user.GroupIds()})
+		return
+	}
+
+	if group.BillingMode != "all_users" {
+		api.exitWithError(w, http.StatusBadRequest, "Tier is not available for self-service subscription")
+		return
+	}
+	validPrice := false
+	for _, o := range group.GetPricingOptions() {
+		if o.PriceId == request.PriceId {
+			validPrice = true
+			break
+		}
+	}
+	if !validPrice {
+		api.exitWithError(w, http.StatusBadRequest, "Invalid price for tier")
+		return
+	}
+	// Already a paid member? (Membership without a subscription item is stale and
+	// allowed to proceed so it can be (re)billed.)
+	if user.IsMemberOf(request.GroupId) && api.userPaysForGroup(user, group) {
+		api.exitWithError(w, http.StatusBadRequest, "You are already subscribed to this tier")
+		return
+	}
+	// Block paid self-add when the user's customer is a group-shared customer.
+	if primary := api.Controller.UserGroups.Get(user.UserGroupId); primary != nil && primary.BillingMode == "group_admin" {
+		api.exitWithError(w, http.StatusBadRequest, "Your billing is managed by a group admin; paid tiers cannot be self-added")
+		return
+	}
+
+	// Paid tiers honor the group's user cap too (free tiers check above).
+	if group.MaxUsers > 0 && !user.IsMemberOf(group.Id) &&
+		api.Controller.UserGroups.GetUserCount(group.Id, api.Controller.Users) >= group.MaxUsers {
+		api.exitWithError(w, http.StatusForbidden, "This tier is full")
+		return
+	}
+
+	stripe.Key = api.Controller.Options.StripeSecretKey
+	if stripe.Key == "" {
+		api.exitWithError(w, http.StatusBadRequest, "Billing is not configured")
+		return
+	}
+
+	// Branch A: active/trialing subscription → add a line item with proration.
+	if user.StripeSubscriptionId != "" {
+		if sub, err := subscription.Get(user.StripeSubscriptionId, nil); err == nil &&
+			(sub.Status == "active" || sub.Status == "trialing") {
+			if _, err := subscriptionitem.New(&stripe.SubscriptionItemParams{
+				Subscription:      stripe.String(sub.ID),
+				Price:             stripe.String(request.PriceId),
+				Quantity:          stripe.Int64(1),
+				ProrationBehavior: stripe.String("create_prorations"),
+			}); err != nil {
+				api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add tier: %v", err))
+				return
+			}
+			// Re-read the subscription so membership is reconciled from the
+			// post-change line items. Never reconcile from the pre-change object:
+			// that would drop the tier we just added and leave Stripe billing a
+			// tier the user cannot access.
+			updated, e := subscription.Get(sub.ID, nil)
+			if e != nil {
+				api.exitWithError(w, http.StatusInternalServerError,
+					fmt.Sprintf("Tier was added to billing but could not be confirmed: %v", e))
+				return
+			}
+			sub = updated
+			api.reconcilePaidMembershipsFromSubscription(user, sub)
+			user.PinExpiresAt = api.calculatePinExpiration(sub, false)
+			if err := api.persistTierMembership(user); err != nil {
+				api.exitWithError(w, http.StatusInternalServerError,
+					fmt.Sprintf("Tier was added to billing but saving your membership failed: %v", err))
+				return
+			}
+			log.Printf("Added tier %q to user %s via subscription item (proration)", group.Name, user.Email)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"added": true, "groupIds": user.GroupIds()})
+			return
+		}
+	}
+
+	// Branch B: no active subscription → client must complete a combined checkout
+	// (via /api/stripe/create-checkout-session with items).
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"added":         false,
+		"needsCheckout": true,
+		"groupId":       group.Id,
+		"priceId":       request.PriceId,
+		"email":         user.Email,
+	})
+}
+
+// userPaysForGroup reports whether one of the group's prices is on the user's
+// current subscription.
+func (api *Api) userPaysForGroup(user *User, group *UserGroup) bool {
+	if user == nil || group == nil || user.StripeSubscriptionId == "" || api.Controller.Options.StripeSecretKey == "" {
+		return false
+	}
+	stripe.Key = api.Controller.Options.StripeSecretKey
+	sub, err := subscription.Get(user.StripeSubscriptionId, nil)
+	if err != nil || sub.Items == nil {
+		return false
+	}
+	priceSet := map[string]bool{}
+	for _, o := range group.GetPricingOptions() {
+		priceSet[o.PriceId] = true
+	}
+	for _, item := range sub.Items.Data {
+		if item != nil && item.Price != nil && priceSet[item.Price.ID] {
+			return true
+		}
+	}
+	return false
+}
+
+// SubscriptionGroupRemoveHandler removes a paid tier: it deletes the matching
+// subscription item (proration) or cancels the whole subscription when it is the
+// last item.
+func (api *Api) SubscriptionGroupRemoveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		api.exitWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	user := api.userFromRequestPin(r)
+	if user == nil {
+		api.exitWithError(w, http.StatusUnauthorized, "PIN required")
+		return
+	}
+	unlock := tierMutations.lock(user.Id)
+	defer unlock()
+
+	var request struct {
+		GroupId uint64 `json:"groupId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		api.exitWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	group := api.Controller.UserGroups.Get(request.GroupId)
+	if group == nil || !group.IsSelfBillable() {
+		api.exitWithError(w, http.StatusBadRequest, "Tier cannot be self-removed")
+		return
+	}
+	if !user.IsMemberOf(request.GroupId) {
+		api.exitWithError(w, http.StatusBadRequest, "You are not a member of this tier")
+		return
+	}
+	// The primary/home group cannot be self-removed if it is the user's only tier.
+	if user.UserGroupId == request.GroupId && len(user.GroupIds()) <= 1 {
+		api.exitWithError(w, http.StatusBadRequest, "You cannot leave your only tier")
+		return
+	}
+
+	// Free tier: membership-only removal, no Stripe.
+	if !group.BillingEnabled {
+		user.RemoveGroup(request.GroupId)
+		if err := api.persistTierMembership(user); err != nil {
+			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save membership: %v", err))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"removed": true, "groupIds": user.GroupIds()})
+		return
+	}
+
+	if group.BillingMode != "all_users" {
+		api.exitWithError(w, http.StatusBadRequest, "Tier cannot be self-removed")
+		return
+	}
+	if user.StripeSubscriptionId == "" || api.Controller.Options.StripeSecretKey == "" {
+		// No active subscription — just drop the (unbilled) membership.
+		user.RemoveGroup(request.GroupId)
+		if err := api.persistTierMembership(user); err != nil {
+			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save membership: %v", err))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"removed": true, "groupIds": user.GroupIds()})
+		return
+	}
+
+	stripe.Key = api.Controller.Options.StripeSecretKey
+	sub, err := subscription.Get(user.StripeSubscriptionId, nil)
+	if err != nil || sub.Items == nil {
+		api.exitWithError(w, http.StatusBadRequest, "Could not load subscription")
+		return
+	}
+	// Find the subscription item whose price belongs to the group.
+	priceSet := map[string]bool{}
+	for _, o := range group.GetPricingOptions() {
+		priceSet[o.PriceId] = true
+	}
+	var itemId string
+	for _, item := range sub.Items.Data {
+		if item != nil && item.Price != nil && priceSet[item.Price.ID] {
+			itemId = item.ID
+			break
+		}
+	}
+	if itemId == "" {
+		api.exitWithError(w, http.StatusBadRequest, "This tier is not on your subscription")
+		return
+	}
+
+	if len(sub.Items.Data) <= 1 {
+		// Last item → cancel the whole subscription.
+		if _, err := subscription.Cancel(sub.ID, nil); err != nil {
+			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to cancel subscription: %v", err))
+			return
+		}
+		user.StripeSubscriptionId = ""
+		user.SubscriptionStatus = "canceled"
+		user.RemoveGroup(request.GroupId)
+		// Drop any remaining paid all_users memberships (none are billed anymore).
+		for _, gid := range user.GroupIds() {
+			if g := api.Controller.UserGroups.Get(gid); g != nil && g.BillingEnabled && g.BillingMode == "all_users" {
+				user.RemoveGroup(gid)
+			}
+		}
+		if err := api.persistTierMembership(user); err != nil {
+			api.exitWithError(w, http.StatusInternalServerError,
+				fmt.Sprintf("Subscription was canceled but saving your membership failed: %v", err))
+			return
+		}
+		log.Printf("Removed last tier %q for user %s → subscription canceled", group.Name, user.Email)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"removed": true, "canceled": true, "groupIds": user.GroupIds()})
+		return
+	}
+
+	// Not the last item → delete just this item with proration.
+	if _, err := subscriptionitem.Del(itemId, &stripe.SubscriptionItemParams{
+		ProrationBehavior: stripe.String("create_prorations"),
+	}); err != nil {
+		api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove tier: %v", err))
+		return
+	}
+	// Re-read so membership reflects the post-deletion line items; reconciling
+	// from the stale object would leave the removed tier in place locally.
+	updated, e := subscription.Get(sub.ID, nil)
+	if e != nil {
+		api.exitWithError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Tier was removed from billing but could not be confirmed: %v", e))
+		return
+	}
+	sub = updated
+	api.reconcilePaidMembershipsFromSubscription(user, sub)
+	user.PinExpiresAt = api.calculatePinExpiration(sub, false)
+	if err := api.persistTierMembership(user); err != nil {
+		api.exitWithError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Tier was removed from billing but saving your membership failed: %v", err))
+		return
+	}
+	log.Printf("Removed tier %q from user %s via subscription item deletion", group.Name, user.Email)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"removed": true, "groupIds": user.GroupIds()})
 }
 
 // AccountRequestEmailChangeVerificationHandler handles POST requests to request email change verification code
@@ -5019,6 +5856,9 @@ func (api *Api) BillingPortalSessionHandler(w http.ResponseWriter, r *http.Reque
 		Customer:  stripe.String(user.StripeCustomerId),
 		ReturnURL: stripe.String(request.ReturnURL),
 	}
+	if cfgID := strings.TrimSpace(api.Controller.Options.StripeBillingPortalConfigurationId); cfgID != "" {
+		params.Configuration = stripe.String(cfgID)
+	}
 
 	portalSession, err := billingportalsession.New(params)
 	if err != nil {
@@ -5064,7 +5904,7 @@ func (api *Api) GroupAdminLoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Turnstile verification (mobile apps are exempt)
 	if api.Controller.Options.TurnstileEnabled {
-		valid, err := api.verifyTurnstile(request.TurnstileToken, clientIP, r)
+		valid, err := api.verifyTurnstile(request.TurnstileToken, clientIP, r, "group_admin_login")
 		if err != nil {
 			api.exitWithError(w, http.StatusInternalServerError, fmt.Sprintf("CAPTCHA verification error: %v", err))
 			return
@@ -5103,9 +5943,9 @@ func (api *Api) GroupAdminLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user.UpdateLastLogin()
-	api.Controller.Users.Update(user)
-	api.Controller.Users.Write(api.Controller.Database)
+	if err := api.Controller.Users.RecordLastLogin(user, api.Controller.Database); err != nil {
+		log.Printf("failed to record last login for group admin %s: %v", user.Email, err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -5245,7 +6085,7 @@ func (api *Api) GroupAdminRemoveUserHandler(w http.ResponseWriter, r *http.Reque
 	// Move user to public registration group or remove group assignment
 	publicGroup := api.Controller.UserGroups.GetPublicRegistrationGroup()
 	if publicGroup != nil {
-		targetUser.UserGroupId = publicGroup.Id
+		targetUser.SetGroupIds([]uint64{publicGroup.Id})
 		// Clear user's individual delay settings - they will use the group's delay settings
 		api.clearUserDelayValues(targetUser)
 		// Sync user's connection limit with the group's connection limit
@@ -5523,7 +6363,7 @@ func (api *Api) GroupAdminAddUserHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Add user to group
-	user.UserGroupId = group.Id
+	user.SetGroupIds([]uint64{group.Id})
 	// Clear user's individual delay settings - they will use the group's delay settings
 	api.clearUserDelayValues(user)
 	// Sync user's connection limit with the group's connection limit
@@ -5622,7 +6462,7 @@ func (api *Api) GroupAdminAddExistingUserHandler(w http.ResponseWriter, r *http.
 	}
 
 	// Move user to new group
-	user.UserGroupId = group.Id
+	user.SetGroupIds([]uint64{group.Id})
 	// Clear user's individual delay settings - they will use the group's delay settings
 	api.clearUserDelayValues(user)
 	api.Controller.Users.Update(user)
@@ -6340,25 +7180,26 @@ func (api *Api) AdminGroupsHandler(w http.ResponseWriter, r *http.Request) {
 	groupList := []map[string]interface{}{}
 	for _, group := range groups {
 		groupList = append(groupList, map[string]interface{}{
-			"id":                    group.Id,
-			"name":                  group.Name,
-			"description":           group.Description,
-			"systemAccess":          group.SystemAccess,
-			"delay":                 group.Delay,
-			"systemDelays":          group.SystemDelays,
-			"talkgroupDelays":       group.TalkgroupDelays,
-			"connectionLimit":       group.ConnectionLimit,
-			"maxUsers":              group.MaxUsers,
-			"billingEnabled":        group.BillingEnabled,
-			"stripePriceId":         group.StripePriceId,
-			"pricingOptions":        group.GetPricingOptions(),
-			"billingMode":           group.BillingMode,
-			"collectSalesTax":       group.CollectSalesTax,
-			"taxMode":               group.TaxMode,
-			"stripeTaxRateId":       group.StripeTaxRateId,
-			"isPublicRegistration":  group.IsPublicRegistration,
-			"allowAddExistingUsers": group.AllowAddExistingUsers,
-			"createdAt":             group.CreatedAt,
+			"id":                      group.Id,
+			"name":                    group.Name,
+			"description":             group.Description,
+			"systemAccess":            group.SystemAccess,
+			"delay":                   group.Delay,
+			"systemDelays":            group.SystemDelays,
+			"talkgroupDelays":         group.TalkgroupDelays,
+			"connectionLimit":         group.ConnectionLimit,
+			"maxUsers":                group.MaxUsers,
+			"billingEnabled":          group.BillingEnabled,
+			"stripePriceId":           group.StripePriceId,
+			"pricingOptions":          group.GetPricingOptions(),
+			"billingMode":             group.BillingMode,
+			"collectSalesTax":         group.CollectSalesTax,
+			"taxMode":                 group.TaxMode,
+			"stripeTaxRateId":         group.StripeTaxRateId,
+			"isPublicRegistration":    group.IsPublicRegistration,
+			"allowAddExistingUsers":   group.AllowAddExistingUsers,
+			"autoEnableNewTalkgroups": group.AutoEnableNewTalkgroups,
+			"createdAt":               group.CreatedAt,
 		})
 	}
 
@@ -6387,23 +7228,24 @@ func (api *Api) AdminCreateGroupHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var request struct {
-		Name                  string          `json:"name"`
-		Description           string          `json:"description"`
-		SystemAccess          string          `json:"systemAccess"`
-		Delay                 int             `json:"delay"`
-		SystemDelays          string          `json:"systemDelays"`
-		TalkgroupDelays       string          `json:"talkgroupDelays"`
-		ConnectionLimit       uint            `json:"connectionLimit"`
-		MaxUsers              uint            `json:"maxUsers"`
-		BillingEnabled        bool            `json:"billingEnabled"`
-		StripePriceId         string          `json:"stripePriceId"`
-		PricingOptions        []PricingOption `json:"pricingOptions"`
-		BillingMode           string          `json:"billingMode"`
-		CollectSalesTax       bool            `json:"collectSalesTax"`
-		TaxMode               string          `json:"taxMode"`
-		StripeTaxRateId       string          `json:"stripeTaxRateId"`
-		IsPublicRegistration  bool            `json:"isPublicRegistration"`
-		AllowAddExistingUsers bool            `json:"allowAddExistingUsers"`
+		Name                    string          `json:"name"`
+		Description             string          `json:"description"`
+		SystemAccess            string          `json:"systemAccess"`
+		Delay                   int             `json:"delay"`
+		SystemDelays            string          `json:"systemDelays"`
+		TalkgroupDelays         string          `json:"talkgroupDelays"`
+		ConnectionLimit         uint            `json:"connectionLimit"`
+		MaxUsers                uint            `json:"maxUsers"`
+		BillingEnabled          bool            `json:"billingEnabled"`
+		StripePriceId           string          `json:"stripePriceId"`
+		PricingOptions          []PricingOption `json:"pricingOptions"`
+		BillingMode             string          `json:"billingMode"`
+		CollectSalesTax         bool            `json:"collectSalesTax"`
+		TaxMode                 string          `json:"taxMode"`
+		StripeTaxRateId         string          `json:"stripeTaxRateId"`
+		IsPublicRegistration    bool            `json:"isPublicRegistration"`
+		AllowAddExistingUsers   bool            `json:"allowAddExistingUsers"`
+		AutoEnableNewTalkgroups bool            `json:"autoEnableNewTalkgroups"`
 		// Group admin assignment
 		AssignExistingUserAsAdmin bool   `json:"assignExistingUserAsAdmin"`
 		GroupAdminUserId          uint64 `json:"groupAdminUserId"`
@@ -6451,16 +7293,8 @@ func (api *Api) AdminCreateGroupHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// If setting as public registration, unset any existing public registration group
-	if request.IsPublicRegistration {
-		existingPublic := api.Controller.UserGroups.GetPublicRegistrationGroup()
-		if existingPublic != nil {
-			existingPublic.IsPublicRegistration = false
-			api.Controller.UserGroups.Update(existingPublic, api.Controller.Database)
-			// Sync config to file if enabled
-			api.Controller.SyncConfigToFile()
-		}
-	}
+	// Multiple public registration tiers are supported — no longer unset the
+	// existing public group when flagging this one public.
 
 	// Set default billing mode if not provided
 	billingMode := request.BillingMode
@@ -6469,25 +7303,27 @@ func (api *Api) AdminCreateGroupHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	group := &UserGroup{
-		Name:                  request.Name,
-		Description:           request.Description,
-		SystemAccess:          request.SystemAccess,
-		Delay:                 request.Delay,
-		SystemDelays:          request.SystemDelays,
-		TalkgroupDelays:       request.TalkgroupDelays,
-		ConnectionLimit:       request.ConnectionLimit,
-		MaxUsers:              request.MaxUsers,
-		BillingEnabled:        request.BillingEnabled,
-		StripePriceId:         request.StripePriceId,
-		PricingOptions:        pricingOptionsJSON,
-		BillingMode:           billingMode,
-		CollectSalesTax:       request.CollectSalesTax,
-		TaxMode:               request.TaxMode,
-		StripeTaxRateId:       request.StripeTaxRateId,
-		IsPublicRegistration:  request.IsPublicRegistration,
-		AllowAddExistingUsers: request.AllowAddExistingUsers,
-		CreatedAt:             time.Now().Unix(),
+		Name:                    request.Name,
+		Description:             request.Description,
+		SystemAccess:            request.SystemAccess,
+		Delay:                   request.Delay,
+		SystemDelays:            request.SystemDelays,
+		TalkgroupDelays:         request.TalkgroupDelays,
+		ConnectionLimit:         request.ConnectionLimit,
+		MaxUsers:                request.MaxUsers,
+		BillingEnabled:          request.BillingEnabled,
+		StripePriceId:           request.StripePriceId,
+		PricingOptions:          pricingOptionsJSON,
+		BillingMode:             billingMode,
+		CollectSalesTax:         request.CollectSalesTax,
+		TaxMode:                 request.TaxMode,
+		StripeTaxRateId:         request.StripeTaxRateId,
+		IsPublicRegistration:    request.IsPublicRegistration,
+		AllowAddExistingUsers:   request.AllowAddExistingUsers,
+		AutoEnableNewTalkgroups: request.AutoEnableNewTalkgroups,
+		CreatedAt:               time.Now().Unix(),
 	}
+	group.NormalizeSystemAccess(api.Controller.Systems)
 
 	if err := api.Controller.UserGroups.Add(group, api.Controller.Database); err != nil {
 		api.exitWithError(w, http.StatusInternalServerError, "Failed to create group")
@@ -6510,7 +7346,7 @@ func (api *Api) AdminCreateGroupHandler(w http.ResponseWriter, r *http.Request) 
 
 		// Ensure user is in the group
 		if user.UserGroupId != group.Id {
-			user.UserGroupId = group.Id
+			user.SetGroupIds([]uint64{group.Id})
 			// Clear user's individual delay settings - they will use the group's delay settings
 			api.clearUserDelayValues(user)
 		}
@@ -6704,24 +7540,25 @@ func (api *Api) AdminUpdateGroupHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var request struct {
-		Id                    uint64          `json:"id"`
-		Name                  string          `json:"name"`
-		Description           string          `json:"description"`
-		SystemAccess          string          `json:"systemAccess"`
-		Delay                 int             `json:"delay"`
-		SystemDelays          string          `json:"systemDelays"`
-		TalkgroupDelays       string          `json:"talkgroupDelays"`
-		ConnectionLimit       uint            `json:"connectionLimit"`
-		MaxUsers              uint            `json:"maxUsers"`
-		BillingEnabled        bool            `json:"billingEnabled"`
-		StripePriceId         string          `json:"stripePriceId"`
-		PricingOptions        []PricingOption `json:"pricingOptions"`
-		BillingMode           string          `json:"billingMode"`
-		CollectSalesTax       bool            `json:"collectSalesTax"`
-		TaxMode               string          `json:"taxMode"`
-		StripeTaxRateId       string          `json:"stripeTaxRateId"`
-		IsPublicRegistration  bool            `json:"isPublicRegistration"`
-		AllowAddExistingUsers bool            `json:"allowAddExistingUsers"`
+		Id                      uint64          `json:"id"`
+		Name                    string          `json:"name"`
+		Description             string          `json:"description"`
+		SystemAccess            string          `json:"systemAccess"`
+		Delay                   int             `json:"delay"`
+		SystemDelays            string          `json:"systemDelays"`
+		TalkgroupDelays         string          `json:"talkgroupDelays"`
+		ConnectionLimit         uint            `json:"connectionLimit"`
+		MaxUsers                uint            `json:"maxUsers"`
+		BillingEnabled          bool            `json:"billingEnabled"`
+		StripePriceId           string          `json:"stripePriceId"`
+		PricingOptions          []PricingOption `json:"pricingOptions"`
+		BillingMode             string          `json:"billingMode"`
+		CollectSalesTax         bool            `json:"collectSalesTax"`
+		TaxMode                 string          `json:"taxMode"`
+		StripeTaxRateId         string          `json:"stripeTaxRateId"`
+		IsPublicRegistration    bool            `json:"isPublicRegistration"`
+		AllowAddExistingUsers   bool            `json:"allowAddExistingUsers"`
+		AutoEnableNewTalkgroups bool            `json:"autoEnableNewTalkgroups"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -6761,16 +7598,8 @@ func (api *Api) AdminUpdateGroupHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// If setting as public registration, unset any existing public registration group
-	if request.IsPublicRegistration && !group.IsPublicRegistration {
-		existingPublic := api.Controller.UserGroups.GetPublicRegistrationGroup()
-		if existingPublic != nil && existingPublic.Id != group.Id {
-			existingPublic.IsPublicRegistration = false
-			api.Controller.UserGroups.Update(existingPublic, api.Controller.Database)
-			// Sync config to file if enabled
-			api.Controller.SyncConfigToFile()
-		}
-	}
+	// Multiple public registration tiers are supported — no longer unset any
+	// other public group when flagging this one public.
 
 	oldBillingEnabled := group.BillingEnabled
 
@@ -6793,6 +7622,8 @@ func (api *Api) AdminUpdateGroupHandler(w http.ResponseWriter, r *http.Request) 
 	group.StripeTaxRateId = request.StripeTaxRateId
 	group.IsPublicRegistration = request.IsPublicRegistration
 	group.AllowAddExistingUsers = request.AllowAddExistingUsers
+	group.AutoEnableNewTalkgroups = request.AutoEnableNewTalkgroups
+	group.NormalizeSystemAccess(api.Controller.Systems)
 
 	if err := api.Controller.UserGroups.Update(group, api.Controller.Database); err != nil {
 		api.exitWithError(w, http.StatusInternalServerError, "Failed to update group")
@@ -6897,7 +7728,7 @@ func (api *Api) AdminAssignGroupAdminHandler(w http.ResponseWriter, r *http.Requ
 
 	// Ensure user is in the group
 	if user.UserGroupId != group.Id {
-		user.UserGroupId = group.Id
+		user.SetGroupIds([]uint64{group.Id})
 		// Clear user's individual delay settings - they will use the group's delay settings
 		api.clearUserDelayValues(user)
 	}
@@ -7668,7 +8499,7 @@ func (api *Api) AdminTransferUserHandler(w http.ResponseWriter, r *http.Request)
 	if targetUser.IsGroupAdmin {
 		targetUser.IsGroupAdmin = false
 	}
-	targetUser.UserGroupId = toGroup.Id
+	targetUser.SetGroupIds([]uint64{toGroup.Id})
 	// Clear user's individual delay settings - they will use the group's delay settings
 	api.clearUserDelayValues(targetUser)
 	// Sync user's connection limit with the group's connection limit
@@ -7738,7 +8569,7 @@ func (api *Api) GroupAdminRequestTransferHandler(w http.ResponseWriter, r *http.
 
 		// Update user group
 		oldGroupId := targetUser.UserGroupId
-		targetUser.UserGroupId = toGroup.Id
+		targetUser.SetGroupIds([]uint64{toGroup.Id})
 		// Remove group admin status if user was a group admin in the old group
 		if targetUser.IsGroupAdmin && oldGroupId > 0 {
 			targetUser.IsGroupAdmin = false
@@ -7805,7 +8636,7 @@ func (api *Api) GroupAdminRequestTransferHandler(w http.ResponseWriter, r *http.
 
 		// Update user group
 		oldGroupId := targetUser.UserGroupId
-		targetUser.UserGroupId = toGroup.Id
+		targetUser.SetGroupIds([]uint64{toGroup.Id})
 		// Remove group admin status if user was a group admin in the old group
 		if targetUser.IsGroupAdmin && oldGroupId > 0 {
 			targetUser.IsGroupAdmin = false
@@ -7928,7 +8759,7 @@ func (api *Api) GroupAdminApproveTransferHandler(w http.ResponseWriter, r *http.
 
 		// Update user group
 		oldGroupId := targetUser.UserGroupId
-		targetUser.UserGroupId = group.Id
+		targetUser.SetGroupIds([]uint64{group.Id})
 		// Remove group admin status if user was a group admin in the old group
 		if targetUser.IsGroupAdmin && oldGroupId > 0 {
 			targetUser.IsGroupAdmin = false
@@ -8076,7 +8907,7 @@ func (api *Api) GroupAdminApproveTransferLinkHandler(w http.ResponseWriter, r *h
 
 	// Update user group
 	oldGroupId := targetUser.UserGroupId
-	targetUser.UserGroupId = toGroup.Id
+	targetUser.SetGroupIds([]uint64{toGroup.Id})
 	// Remove group admin status if user was a group admin in the old group
 	if targetUser.IsGroupAdmin && oldGroupId > 0 {
 		targetUser.IsGroupAdmin = false
@@ -8532,7 +9363,7 @@ func (api *Api) UserTransferToPublicHandler(w http.ResponseWriter, r *http.Reque
 
 	// Update user group
 	oldGroupId := user.UserGroupId
-	user.UserGroupId = publicGroup.Id
+	user.SetGroupIds([]uint64{publicGroup.Id})
 	// Remove group admin status if user was a group admin in the old group
 	if user.IsGroupAdmin && oldGroupId > 0 {
 		user.IsGroupAdmin = false
@@ -8569,80 +9400,90 @@ func (api *Api) PublicRegistrationInfoHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	publicGroup := api.Controller.UserGroups.GetPublicRegistrationGroup()
-	if publicGroup == nil {
+	publicGroups := api.Controller.UserGroups.GetPublicRegistrationGroups()
+	if len(publicGroups) == 0 {
 		api.exitWithError(w, http.StatusNotFound, "Public registration group not found")
 		return
 	}
 
-	// Get pricing options
-	pricingOptions := publicGroup.GetPricingOptions()
+	// Build a tier per public group with pricing + an access summary.
+	tiers := make([]map[string]interface{}, 0, len(publicGroups))
+	for _, g := range publicGroups {
+		channels := api.groupAvailableChannels(g)
+		talkgroupCount := 0
+		for _, sys := range channels {
+			if tgs, ok := sys["talkgroups"].([]map[string]interface{}); ok {
+				talkgroupCount += len(tgs)
+			}
+		}
+		tiers = append(tiers, map[string]interface{}{
+			"groupId":        g.Id,
+			"name":           g.Name,
+			"description":    g.Description,
+			"billingEnabled": g.BillingEnabled,
+			"billingMode":    g.BillingMode,
+			"selfBillable":   g.IsSelfBillable(),
+			"pricingOptions": g.GetPricingOptions(),
+			"systemCount":    len(channels),
+			"talkgroupCount": talkgroupCount,
+		})
+	}
 
+	// Legacy top-level fields (first tier) for clients that predate multi-tier.
+	first := publicGroups[0]
 	response := map[string]interface{}{
-		"name":           publicGroup.Name,
-		"description":    publicGroup.Description,
-		"billingEnabled": publicGroup.BillingEnabled,
-		"pricingOptions": pricingOptions,
+		"name":           first.Name,
+		"description":    first.Description,
+		"billingEnabled": first.BillingEnabled,
+		"pricingOptions": first.GetPricingOptions(),
+		"tiers":          tiers,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-// PublicRegistrationChannelsHandler returns available systems/channels for the public registration group
-func (api *Api) PublicRegistrationChannelsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		api.exitWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	publicGroup := api.Controller.UserGroups.GetPublicRegistrationGroup()
-	if publicGroup == nil {
-		api.exitWithError(w, http.StatusNotFound, "Public registration group not found")
-		return
-	}
-
-	// Get all systems
-	allSystems := api.Controller.Systems.List
+// groupAvailableChannels returns the systems (each with its accessible
+// talkgroups) that the given group grants, sorted for display.
+func (api *Api) groupAvailableChannels(group *UserGroup) []map[string]interface{} {
 	availableSystems := []map[string]interface{}{}
-
-	for _, system := range allSystems {
-		// Check if this system is accessible to the public group
-		if publicGroup.HasSystemAccess(uint64(system.SystemRef)) {
-			// Get talkgroups for this system, filtered by group access
-			talkgroups := []map[string]interface{}{}
-			for _, tg := range system.Talkgroups.List {
-				// Check if this talkgroup is accessible
-				if publicGroup.HasTalkgroupAccess(uint64(system.SystemRef), tg.TalkgroupRef) {
-					// Get tag for sorting
-					tagLabel := ""
-					if tg.TagId > 0 {
-						if tag, ok := api.Controller.Tags.GetTagById(tg.TagId); ok {
-							tagLabel = tag.Label
-						}
-					}
-					talkgroups = append(talkgroups, map[string]interface{}{
-						"id":          tg.TalkgroupRef,
-						"label":       tg.Label,
-						"name":        tg.Name,
-						"description": tg.Name,  // Use name as description
-						"tag":         tagLabel, // Alpha tag
-					})
+	if group == nil {
+		return availableSystems
+	}
+	for _, system := range api.Controller.Systems.List {
+		if !group.HasSystemAccess(uint64(system.SystemRef)) {
+			continue
+		}
+		talkgroups := []map[string]interface{}{}
+		for _, tg := range system.Talkgroups.List {
+			if tg.Hidden {
+				continue
+			}
+			if !group.HasTalkgroupAccess(uint64(system.SystemRef), tg.TalkgroupRef) {
+				continue
+			}
+			tagLabel := ""
+			if tg.TagId > 0 {
+				if tag, ok := api.Controller.Tags.GetTagById(tg.TagId); ok {
+					tagLabel = tag.Label
 				}
 			}
-
-			// Only add system if it has accessible talkgroups
-			if len(talkgroups) > 0 {
-				availableSystems = append(availableSystems, map[string]interface{}{
-					"id":         system.SystemRef,
-					"label":      system.Label,
-					"talkgroups": talkgroups,
-				})
-			}
+			talkgroups = append(talkgroups, map[string]interface{}{
+				"id":          tg.TalkgroupRef,
+				"label":       tg.Label,
+				"name":        tg.Name,
+				"description": tg.Name,
+				"tag":         tagLabel,
+			})
+		}
+		if len(talkgroups) > 0 {
+			availableSystems = append(availableSystems, map[string]interface{}{
+				"id":         system.SystemRef,
+				"label":      system.Label,
+				"talkgroups": talkgroups,
+			})
 		}
 	}
-
-	// Sort systems by label, then sort talkgroups by tag then label
 	for _, sys := range availableSystems {
 		if talkgroups, ok := sys["talkgroups"].([]map[string]interface{}); ok {
 			sort.Slice(talkgroups, func(i, j int) bool {
@@ -8651,22 +9492,44 @@ func (api *Api) PublicRegistrationChannelsHandler(w http.ResponseWriter, r *http
 				if tagI != tagJ {
 					return tagI < tagJ
 				}
-				labelI := talkgroups[i]["label"].(string)
-				labelJ := talkgroups[j]["label"].(string)
-				return labelI < labelJ
+				return talkgroups[i]["label"].(string) < talkgroups[j]["label"].(string)
 			})
 		}
 	}
-
-	// Sort systems by label
 	sort.Slice(availableSystems, func(i, j int) bool {
-		labelI := availableSystems[i]["label"].(string)
-		labelJ := availableSystems[j]["label"].(string)
-		return labelI < labelJ
+		return availableSystems[i]["label"].(string) < availableSystems[j]["label"].(string)
 	})
+	return availableSystems
+}
+
+// PublicRegistrationChannelsHandler returns available systems/channels for a
+// public registration tier. Pass ?groupId= to target a specific tier; without
+// it, the first public group is summarized (back-compat).
+func (api *Api) PublicRegistrationChannelsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		api.exitWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var group *UserGroup
+	if v := strings.TrimSpace(r.URL.Query().Get("groupId")); v != "" {
+		if id, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if g := api.Controller.UserGroups.Get(id); g != nil && g.IsPublicRegistration {
+				group = g
+			}
+		}
+	}
+	if group == nil {
+		group = api.Controller.UserGroups.GetPublicRegistrationGroup()
+	}
+	if group == nil {
+		api.exitWithError(w, http.StatusNotFound, "Public registration group not found")
+		return
+	}
 
 	response := map[string]interface{}{
-		"systems": availableSystems,
+		"groupId": group.Id,
+		"systems": api.groupAvailableChannels(group),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -8680,9 +9543,25 @@ func (api *Api) RegistrationSettingsHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	cmEnabled := api.Controller.Options.CentralManagementEnabled &&
+		strings.TrimSpace(api.Controller.Options.CentralManagementURL) != ""
 	response := map[string]interface{}{
-		"publicRegistrationEnabled": api.Controller.Options.PublicRegistrationEnabled,
-		"emailVerificationRequired": api.Controller.Options.EmailVerificationRequired,
+		"publicRegistrationEnabled":  api.Controller.Options.PublicRegistrationEnabled,
+		"emailVerificationRequired":  api.Controller.Options.EmailVerificationRequired,
+		"centralManagementEnabled":   cmEnabled,
+		"centralManagementPortalUrl": "",
+	}
+	if cmEnabled {
+		response["centralManagementPortalUrl"] = strings.TrimRight(strings.TrimSpace(api.Controller.Options.CentralManagementURL), "/")
+		response["centralManagementServerName"] = strings.TrimSpace(api.Controller.Options.CentralManagementServerName)
+		if branding := strings.TrimSpace(api.Controller.Options.Branding); branding != "" {
+			response["scannerName"] = branding
+		} else if name, ok := response["centralManagementServerName"].(string); ok && name != "" {
+			response["scannerName"] = name
+		}
+		// CM-managed scanners always allow AlertPage signup on the auth screen.
+		response["publicRegistrationEnabled"] = true
+		response["emailVerificationRequired"] = false
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -8787,7 +9666,21 @@ func (api *Api) ValidateAccessCodeHandler(w http.ResponseWriter, r *http.Request
 	api.exitWithError(w, http.StatusBadRequest, "Invalid or expired code")
 }
 
-// SystemAlertsHandler handles GET/POST for system alerts (system admins only)
+// isSystemAlertVisibleToUser returns whether an alert should appear in GET /api/system-alerts for the user.
+func isSystemAlertVisibleToUser(alertType string, systemAdmin bool) bool {
+	if systemAdmin {
+		return true
+	}
+	switch alertType {
+	case "manual", "no_audio", "no_audio_received", "api_key_no_audio", "tone_detection_issue",
+		"sdrtrunk_control_lost", "sdrtrunk_tuner_error", "sdrtrunk_uploader_error", "sdrtrunk_offline", "sdrtrunk_sample_overflow":
+		return true
+	default:
+		return false
+	}
+}
+
+// SystemAlertsHandler handles GET/POST for system alerts
 func (api *Api) SystemAlertsHandler(w http.ResponseWriter, r *http.Request) {
 	client := api.getClient(r)
 	if client == nil || client.User == nil {
@@ -8814,26 +9707,19 @@ func (api *Api) SystemAlertsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Filter alerts based on user role
-		// Regular users only see "manual" alerts (sent by system admins)
-		// System admins see all alerts (including health monitoring)
+		// Filter by alert type and user/group system/talkgroup access.
 		filteredAlerts := []*SystemAlert{}
 		for _, alert := range alerts {
-			if client.User.SystemAdmin {
-				// System admins see all alerts
+			if api.Controller.userHasSystemAlertAccess(client.User, alert) {
 				filteredAlerts = append(filteredAlerts, alert)
-			} else {
-				// Regular users only see manual alerts
-				if alert.AlertType == "manual" {
-					filteredAlerts = append(filteredAlerts, alert)
-				}
 			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"alerts":        filteredAlerts,
-			"isSystemAdmin": client.User.SystemAdmin,
+			"alerts":              filteredAlerts,
+			"isSystemAdmin":       client.User.SystemAdmin,
+			"canViewSystemAlerts": api.Controller.userCanViewSystemAlerts(client.User),
 		})
 
 	case http.MethodPost:
@@ -8952,369 +9838,6 @@ func (api *Api) SystemAlertDismissHandler(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"message": "alert dismissed successfully",
-	})
-}
-
-// StatsHandler handles GET /api/stats — returns call activity stats for the dashboard
-func (api *Api) StatsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		api.exitWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	client := api.getClient(r)
-	if client == nil || client.User == nil {
-		api.exitWithError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-
-	db := api.Controller.Database.Sql
-	now := time.Now().UnixMilli()
-	oneHourAgo := now - 60*60*1000
-	twentyFourHoursAgo := now - 24*60*60*1000
-	sevenDaysAgo := now - 7*24*60*60*1000
-	midnightToday := func() int64 {
-		t := time.Now()
-		midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-		return midnight.UnixMilli()
-	}()
-
-	// ── Optional system filter ─────────────────────────────────────────────
-	var systemFilter string
-	var systemFilterArgs []interface{}
-	if sid := r.URL.Query().Get("systemId"); sid != "" {
-		if id, err := strconv.Atoi(sid); err == nil {
-			systemFilter = fmt.Sprintf(` AND c."systemId" = %d`, id)
-		}
-	}
-	_ = systemFilterArgs // unused but kept for clarity
-
-	// ── 0. Available systems (for frontend dropdown) ───────────────────────
-	type SystemItem struct {
-		Id    int64  `json:"id"`
-		Label string `json:"label"`
-	}
-	var availableSystems []SystemItem
-	sysRows, err := db.Query(`SELECT "systemId", "label" FROM "systems" ORDER BY "label" ASC`)
-	if err == nil {
-		defer sysRows.Close()
-		for sysRows.Next() {
-			var s SystemItem
-			if sysRows.Scan(&s.Id, &s.Label) == nil {
-				availableSystems = append(availableSystems, s)
-			}
-		}
-	}
-	if availableSystems == nil {
-		availableSystems = []SystemItem{}
-	}
-
-	// ── 1. Calls per minute – last 60 minutes ──────────────────────────────
-	type MinuteBucket struct {
-		Minute int64 `json:"minute"`
-		Count  int   `json:"count"`
-	}
-	var callsPerMinute []MinuteBucket
-
-	cpmRows, err := db.Query(`
-		SELECT (c.timestamp / 60000) * 60000 AS minute, COUNT(*) AS count
-		FROM calls c
-		WHERE c.timestamp >= $1`+systemFilter+`
-		GROUP BY minute
-		ORDER BY minute ASC`, oneHourAgo)
-	if err == nil {
-		defer cpmRows.Close()
-		for cpmRows.Next() {
-			var b MinuteBucket
-			if cpmRows.Scan(&b.Minute, &b.Count) == nil {
-				callsPerMinute = append(callsPerMinute, b)
-			}
-		}
-	}
-	if callsPerMinute == nil {
-		callsPerMinute = []MinuteBucket{}
-	}
-
-	// ── 2. Top 10 talkgroups – last 24 hours ──────────────────────────────
-	type LabelCount struct {
-		Label string `json:"label"`
-		Count int    `json:"count"`
-	}
-	var topTalkgroups []LabelCount
-
-	tgRows, err := db.Query(`
-		SELECT COALESCE(t.label, CONCAT('TG ', t."talkgroupRef")), COUNT(*) AS count
-		FROM calls c
-		JOIN talkgroups t ON t."talkgroupId" = c."talkgroupId"
-		WHERE c.timestamp >= $1`+systemFilter+`
-		GROUP BY t."talkgroupId", t.label, t."talkgroupRef"
-		ORDER BY count DESC
-		LIMIT 10`, twentyFourHoursAgo)
-	if err == nil {
-		defer tgRows.Close()
-		for tgRows.Next() {
-			var s LabelCount
-			if tgRows.Scan(&s.Label, &s.Count) == nil {
-				topTalkgroups = append(topTalkgroups, s)
-			}
-		}
-	}
-	if topTalkgroups == nil {
-		topTalkgroups = []LabelCount{}
-	}
-
-	// ── 3. Calls by hour of day – last 7 days ─────────────────────────────
-	type HourBucket struct {
-		Hour  int `json:"hour"`
-		Count int `json:"count"`
-	}
-	hourMap := make(map[int]int)
-	for h := 0; h < 24; h++ {
-		hourMap[h] = 0
-	}
-
-	hourRows, err := db.Query(`
-		SELECT EXTRACT(HOUR FROM to_timestamp(c.timestamp / 1000)) AS hour, COUNT(*) AS count
-		FROM calls c
-		WHERE c.timestamp >= $1`+systemFilter+`
-		GROUP BY hour
-		ORDER BY hour ASC`, sevenDaysAgo)
-	if err == nil {
-		defer hourRows.Close()
-		for hourRows.Next() {
-			var hour int
-			var count int
-			if hourRows.Scan(&hour, &count) == nil {
-				hourMap[hour] = count
-			}
-		}
-	}
-	callsByHour := make([]HourBucket, 24)
-	for h := 0; h < 24; h++ {
-		callsByHour[h] = HourBucket{Hour: h, Count: hourMap[h]}
-	}
-
-	// ── 4. Top 10 tone set names by dispatch count – last 24 hours ────────
-	// Uses the alerts table (toneSetId + talkgroup toneSets JSON) to resolve
-	// the human-readable tone set label (e.g. "Station 7 Medic").
-	var topDepartmentsByTone []LabelCount
-
-	// Build system filter using systemId from alerts table
-	toneSystemFilter := ""
-	if sid := r.URL.Query().Get("systemId"); sid != "" {
-		if id, err2 := strconv.Atoi(sid); err2 == nil {
-			toneSystemFilter = fmt.Sprintf(` AND a."systemId" = %d`, id)
-		}
-	}
-
-	toneRows, err := db.Query(`
-		SELECT
-		    COALESCE(
-		        NULLIF(
-		            (SELECT elem->>'label'
-		             FROM jsonb_array_elements(
-		                 CASE
-		                     WHEN t."toneSets" IS NOT NULL AND t."toneSets" <> '' AND t."toneSets" <> '[]'
-		                     THEN t."toneSets"::jsonb
-		                     ELSE '[]'::jsonb
-		                 END
-		             ) AS elem
-		             WHERE elem->>'id' = a."toneSetId"
-		             LIMIT 1),
-		            ''
-		        ),
-		        NULLIF(t.label, ''),
-		        CONCAT('TG ', t."talkgroupRef")
-		    ) AS tone_set_name,
-		    COUNT(a."alertId") AS count
-		FROM alerts a
-		JOIN talkgroups t ON t."talkgroupId" = a."talkgroupId"
-		WHERE a."createdAt" >= $1
-		  AND a."toneDetected" = true`+toneSystemFilter+`
-		GROUP BY a."toneSetId", t."talkgroupId", t."toneSets", t.label, t."talkgroupRef"
-		ORDER BY count DESC
-		LIMIT 10`, twentyFourHoursAgo)
-	if err == nil {
-		defer toneRows.Close()
-		for toneRows.Next() {
-			var s LabelCount
-			if toneRows.Scan(&s.Label, &s.Count) == nil {
-				topDepartmentsByTone = append(topDepartmentsByTone, s)
-			}
-		}
-	} else {
-		log.Printf("StatsHandler: topDepartmentsByTone query error: %v", err)
-	}
-	if topDepartmentsByTone == nil {
-		topDepartmentsByTone = []LabelCount{}
-	}
-
-	// ── 5. Simple counters ─────────────────────────────────────────────────
-	var totalCallsToday, callsLastMinute, callsLastHour int
-
-	todayQ := `SELECT COUNT(*) FROM calls c WHERE c.timestamp >= $1` + systemFilter
-	db.QueryRow(todayQ, midnightToday).Scan(&totalCallsToday)
-
-	minQ := `SELECT COUNT(*) FROM calls c WHERE c.timestamp >= $1` + systemFilter
-	db.QueryRow(minQ, now-60*1000).Scan(&callsLastMinute)
-
-	hourQ := `SELECT COUNT(*) FROM calls c WHERE c.timestamp >= $1` + systemFilter
-	db.QueryRow(hourQ, now-60*60*1000).Scan(&callsLastHour)
-
-	// ── 6. Incident summary (today, by sub-category derived from transcripts) ─
-	// Each transcript is matched to the FIRST keyword group that applies
-	// (priority order: most specific → least specific).
-	// Sub-category → parent-category mapping is resolved in Go after the query.
-	subcategoryToCategory := map[string]string{
-		"Structure Fire":       "Fire",
-		"Brush / Wildland":     "Fire",
-		"Vehicle Fire":         "Fire",
-		"Fire Alarm":           "Fire",
-		"Fire (General)":       "Fire",
-		"Carbon Monoxide":      "Hazmat",
-		"Gas Leak":             "Hazmat",
-		"Chemical / Spill":     "Hazmat",
-		"Cardiac / Breathing":  "Medical / EMS",
-		"Trauma / Injury":      "Medical / EMS",
-		"Overdose / Substance": "Medical / EMS",
-		"General Medical":      "Medical / EMS",
-		"Violent Crime":        "Crime",
-		"Property Crime":       "Crime",
-		"Suspicious":           "Crime",
-		"MVA / Crash":          "Traffic",
-		"Traffic Stop / Plate": "Traffic",
-		"Road Hazard":          "Traffic",
-		"Domestic":             "Disturbance",
-		"Disturbance":          "Disturbance",
-	}
-
-	categoryOrder := []string{"Fire", "Hazmat", "Medical / EMS", "Crime", "Traffic", "Disturbance"}
-
-	type IncidentSub struct {
-		Label string `json:"label"`
-		Count int    `json:"count"`
-	}
-	type IncidentCat struct {
-		Category      string        `json:"category"`
-		Count         int           `json:"count"`
-		Subcategories []IncidentSub `json:"subcategories"`
-	}
-
-	incidentSystemFilter := ""
-	if sid := r.URL.Query().Get("systemId"); sid != "" {
-		if id, err3 := strconv.Atoi(sid); err3 == nil {
-			incidentSystemFilter = fmt.Sprintf(` AND c."systemId" = %d`, id)
-		}
-	}
-
-	incidentQuery := `
-		WITH filtered_calls AS (
-		    SELECT c.transcript
-		    FROM calls c
-		    WHERE c.timestamp >= EXTRACT(EPOCH FROM date_trunc('day', NOW())) * 1000
-		      AND c.transcript != ''
-		      AND c."transcriptionStatus" = 'completed'
-		      ` + incidentSystemFilter + `
-		),
-		categorized AS (
-		    SELECT
-		        CASE
-		            WHEN transcript ILIKE ANY(ARRAY['%structure fire%','%working fire%','%house fire%','%garage fire%','%apartment fire%','%residential fire%','%commercial fire%','%warehouse fire%','%fully involved%','%smoke showing%','%basement fire%','%attic fire%','%kitchen fire%','%bedroom fire%','%office fire%'])
-		                THEN 'Structure Fire'
-		            WHEN transcript ILIKE ANY(ARRAY['%brush fire%','%grass fire%','%wildland%','%barn fire%','%field fire%'])
-		                THEN 'Brush / Wildland'
-		            WHEN transcript ILIKE ANY(ARRAY['%vehicle fire%','%car fire%','%truck fire%'])
-		                THEN 'Vehicle Fire'
-		            WHEN transcript ILIKE ANY(ARRAY['%fire alarm%','%alarm activation%','%fire investigation%','%rekindle%','%dumpster fire%'])
-		                THEN 'Fire Alarm'
-		            WHEN transcript ILIKE ANY(ARRAY['%smoke%','%flames%','%burning%'])
-		                THEN 'Fire (General)'
-		            WHEN transcript ILIKE ANY(ARRAY['%carbon monoxide%','%co alarm%'])
-		                THEN 'Carbon Monoxide'
-		            WHEN transcript ILIKE ANY(ARRAY['%gas leak%','%natural gas%','%propane%','%ammonia%'])
-		                THEN 'Gas Leak'
-		            WHEN transcript ILIKE ANY(ARRAY['%hazmat%','%chemical%','%spill%','%unknown substance%','%fumes%','%strange odor%','%unknown odor%'])
-		                THEN 'Chemical / Spill'
-		            WHEN transcript ILIKE ANY(ARRAY['%cardiac%','%not breathing%','%chest pain%','%respiratory%','%cpr%','%stopped breathing%'])
-		                THEN 'Cardiac / Breathing'
-		            WHEN transcript ILIKE ANY(ARRAY['%trauma%','%injured%','%bleeding%','%laceration%','%fracture%'])
-		                THEN 'Trauma / Injury'
-		            WHEN transcript ILIKE ANY(ARRAY['%overdose%','%narcan%','%bad drugs%','%intoxicated%'])
-		                THEN 'Overdose / Substance'
-		            WHEN transcript ILIKE ANY(ARRAY['%squad%','%patient%','%medical%','%ems%','%ambulance%','%sick%','%medication%','%pass out%','%stomach pain%'])
-		                THEN 'General Medical'
-		            WHEN transcript ILIKE ANY(ARRAY['%shooting%','%shots fired%','%shot fired%','%gunshot%','%armed%','%assault%','%battery%','%robbery%','%homicide%','%stabbing%','%weapon%','%gun%'])
-		                THEN 'Violent Crime'
-		            WHEN transcript ILIKE ANY(ARRAY['%stolen%','%theft%','%burglary%','%larceny%','%shoplifting%','%breaking in%','%vandalism%'])
-		                THEN 'Property Crime'
-		            WHEN transcript ILIKE ANY(ARRAY['%suspicious%','%warrant%'])
-		                THEN 'Suspicious'
-		            WHEN transcript ILIKE ANY(ARRAY['%accident%','%crash%','%collision%','%mva%','%rollover%'])
-		                THEN 'MVA / Crash'
-		            WHEN transcript ILIKE ANY(ARRAY['%traffic stop%','%plate%','%registered to%','%comes back to%','%return clean%','%registered owner%'])
-		                THEN 'Traffic Stop / Plate'
-		            WHEN transcript ILIKE ANY(ARRAY['%erratic%','%speeding%','%road blocked%','%wires down%','%broken down%','%broke down%'])
-		                THEN 'Road Hazard'
-		            WHEN transcript ILIKE ANY(ARRAY['%domestic%'])
-		                THEN 'Domestic'
-		            WHEN transcript ILIKE ANY(ARRAY['%disturbance%','%argument%','%fighting%','%irate%','%unwanted%','%trespass%','%refusing%','%wilding out%','%attacking%'])
-		                THEN 'Disturbance'
-		            ELSE NULL
-		        END AS subcategory
-		    FROM filtered_calls
-		)
-		SELECT subcategory, COUNT(*) AS count
-		FROM categorized
-		WHERE subcategory IS NOT NULL
-		GROUP BY subcategory
-		ORDER BY count DESC`
-
-	// Build category map
-	catMap := make(map[string]*IncidentCat)
-	for _, c := range categoryOrder {
-		catMap[c] = &IncidentCat{Category: c, Count: 0, Subcategories: []IncidentSub{}}
-	}
-
-	incRows, err := db.Query(incidentQuery)
-	if err != nil {
-		log.Printf("StatsHandler: incident query error: %v", err)
-	} else {
-		defer incRows.Close()
-		for incRows.Next() {
-			var subLabel string
-			var subCount int
-			if incRows.Scan(&subLabel, &subCount) == nil {
-				if parentCat, ok := subcategoryToCategory[subLabel]; ok {
-					if cat, ok2 := catMap[parentCat]; ok2 {
-						cat.Subcategories = append(cat.Subcategories, IncidentSub{Label: subLabel, Count: subCount})
-						cat.Count += subCount
-					}
-				}
-			}
-		}
-	}
-
-	// Build ordered slice, only include categories with data
-	incidentSummary := []IncidentCat{}
-	for _, catName := range categoryOrder {
-		if cat := catMap[catName]; cat.Count > 0 {
-			incidentSummary = append(incidentSummary, *cat)
-		}
-	}
-
-	// ── Response ───────────────────────────────────────────────────────────
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"availableSystems":     availableSystems,
-		"callsPerMinute":       callsPerMinute,
-		"topTalkgroups":        topTalkgroups,
-		"callsByHour":          callsByHour,
-		"topDepartmentsByTone": topDepartmentsByTone,
-		"totalCallsToday":      totalCallsToday,
-		"callsLastMinute":      callsLastMinute,
-		"callsLastHour":        callsLastHour,
-		"incidentSummary":      incidentSummary,
-		"generatedAt":          now,
 	})
 }
 

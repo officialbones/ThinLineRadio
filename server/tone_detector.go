@@ -43,6 +43,7 @@ type Tone struct {
 	EndTime   float64 `json:"endTime"`   // seconds from start of audio
 	Duration  float64 `json:"duration"`  // seconds
 	ToneType  string  `json:"toneType"`  // Type of tone: "A", "B", "Long", or "" if matched multiple/none
+	Magnitude float64 `json:"magnitude,omitempty"` // FFT peak magnitude (internal scoring; not persisted)
 }
 
 // ToneSet represents a configured set of tones for a talkgroup
@@ -58,6 +59,12 @@ type ToneSet struct {
 	DownstreamEnabled bool   `json:"downstreamEnabled"` // Forward alerts for this tone set to an external endpoint
 	DownstreamURL     string `json:"downstreamURL"`     // Destination URL (TonesToActive server)
 	DownstreamAPIKey  string `json:"downstreamAPIKey"`  // API key sent in X-API-Key header
+	// Incident mapping jurisdiction (takes priority over parent talkgroup geo when this tone set matches)
+	GeoCity         string  `json:"geoCity"`
+	GeoLat          float64 `json:"geoLat"`
+	GeoLon          float64 `json:"geoLon"`
+	GeoRadiusMiles  float64 `json:"geoRadiusMiles"`
+	LocationContext string  `json:"locationContext"`
 }
 
 // ToneSpec defines the expected frequency and duration ranges for a tone
@@ -117,7 +124,7 @@ func NewToneDetector() *ToneDetector {
 	return &ToneDetector{
 		SampleRate:      16000, // 16kHz sample rate (can capture up to 8kHz via Nyquist, enough for 0-5000 Hz)
 		WindowSize:      2048,  // FFT window size
-		MinToneDuration: 0.6,   // Minimum 600ms to be considered a tone
+		MinToneDuration: 0.4,   // Minimum 400ms (Lordstown A-tones on compressed dispatch MP3)
 		FrequencyRange: struct {
 			Min float64
 			Max float64
@@ -134,65 +141,16 @@ func (detector *ToneDetector) Detect(audio []byte, audioMime string, toneSets []
 		return &ToneSequence{Tones: []Tone{}, HasTones: false}, nil
 	}
 
-	// Convert audio to WAV PCM format using ffmpeg with stdin/stdout pipes (no temp files)
-	// Bandpass 200-3000 Hz isolates typical paging tones and reduces noise/DC offset
-	// This significantly improves detection on analog conventional channels
-	ffArgs := []string{
-		"-i", "pipe:0", // Read from stdin
-		"-ar", "16000", // 16kHz sample rate (can capture up to 8kHz via Nyquist, sufficient for 0-5000 Hz)
-		"-ac", "1", // Mono
-		"-af", "highpass=f=200,lowpass=f=3000,dynaudnorm", // Bandpass filter + dynamic normalization
-		"-f", "wav",
-		"-loglevel", "error",
-		"pipe:1", // Write to stdout
-	}
-
-	ffCmd := exec.Command("ffmpeg", ffArgs...)
-
-	// Set up pipes
-	stdin, err := ffCmd.StdinPipe()
+	samples, sampleRate, err := detector.decodeAudioForDetect(audio)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stdin pipe: %v", err)
-	}
-
-	var wavData bytes.Buffer
-	var ffErr bytes.Buffer
-	ffCmd.Stdout = &wavData
-	ffCmd.Stderr = &ffErr
-
-	// Start ffmpeg
-	if err := ffCmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start ffmpeg: %v", err)
-	}
-
-	// Write audio data to stdin in a goroutine
-	go func() {
-		defer stdin.Close()
-		stdin.Write(audio)
-	}()
-
-	// Wait for ffmpeg to complete
-	if err := ffCmd.Wait(); err != nil {
-		return nil, fmt.Errorf("ffmpeg conversion failed: %v, stderr: %s", err, ffErr.String())
-	}
-
-	// Get the WAV data from stdout
-	if wavData.Len() == 0 {
-		return nil, fmt.Errorf("ffmpeg produced no output")
-	}
-
-	// Parse WAV and extract PCM samples
-	samples, sampleRate, err := detector.parseWAV(wavData.Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse WAV: %v", err)
+		return nil, err
 	}
 
 	if len(samples) < 100 {
 		return &ToneSequence{Tones: []Tone{}, HasTones: false}, nil
 	}
 
-	// Perform FFT analysis to detect tones
-	detectedTones := detector.analyzeFrequencies(samples, sampleRate, toneSets)
+	detectedTones := detector.analyzeFrequencies(samples, sampleRate, toneSets, false)
 
 	// Log tone detection analysis
 	fmt.Printf("tone detection: analyzed %d samples at %d Hz, found %d potential tone detections\n", len(samples), sampleRate, len(detectedTones))
@@ -208,8 +166,10 @@ func (detector *ToneDetector) Detect(audio []byte, audioMime string, toneSets []
 		Duration: float64(len(samples)) / float64(sampleRate),
 	}
 
-	// Identify ATone, BTone, LongTone based on what they matched in the tone sets
-	// Use the ToneType field that was set during matching
+	// Identify ATone, BTone, LongTone from tone-set match or sequential order.
+	sort.Slice(detectedTones, func(i, j int) bool {
+		return detectedTones[i].StartTime < detectedTones[j].StartTime
+	})
 	for i := range detectedTones {
 		tone := &detectedTones[i]
 		switch tone.ToneType {
@@ -227,8 +187,218 @@ func (detector *ToneDetector) Detect(audio []byte, audioMime string, toneSets []
 			}
 		}
 	}
+	if sequence.ATone == nil && len(detectedTones) > 0 {
+		sequence.ATone = &detectedTones[0]
+	}
+	if sequence.BTone == nil && len(detectedTones) > 1 {
+		sequence.BTone = &detectedTones[1]
+	}
 
 	return sequence, nil
+}
+
+// toneAnalysisMaxSeconds caps FFT analysis for auto-learn on long stacked-page clips.
+const toneAnalysisMaxSeconds = 20.0
+
+// tonePeakReferenceSeconds: silence gate uses early paging audio only so later dispatch
+// voice on the same clip does not hide quiet lead-in tones.
+const tonePeakReferenceSeconds = 3.0
+
+// Shared detection gates for production Detect and auto-learn Discover.
+// The STFT engine parameters (window, hop, force-split, tolerance) live in tone_stft.go.
+const (
+	toneDetectMinDurationSec     = 0.4
+	toneDetectSilenceBelowGlobal = -42.0
+	toneDetectSNRAboveNoise      = 3.0
+	toneDetectMagnitudeThreshold = 0.008
+	toneDetectPagingPadSec       = 0.2
+	toneDetectPagingGateDB       = -38.0
+	toneDetectHarmonicOnsetSec   = 0.2 // same-onset window for harmonic artifact rejection
+)
+
+// cropSamplesToPagingRegion trims leading/trailing silence using a short-hop energy envelope.
+func cropSamplesToPagingRegion(samples []float64, sampleRate int) []float64 {
+	const envWindow = 512
+	const envHop = 128
+	if len(samples) < envWindow*2 {
+		return samples
+	}
+
+	type envFrame struct {
+		start int
+		rms   float64
+	}
+	var frames []envFrame
+	global := 0.0
+	for start := 0; start+envWindow <= len(samples); start += envHop {
+		var sum float64
+		for i := start; i < start+envWindow; i++ {
+			v := samples[i]
+			sum += v * v
+		}
+		rms := math.Sqrt(sum / float64(envWindow))
+		if rms > global {
+			global = rms
+		}
+		frames = append(frames, envFrame{start: start, rms: rms})
+	}
+	if global < 1e-20 || len(frames) == 0 {
+		return samples
+	}
+
+	threshold := global * math.Pow(10, toneDetectPagingGateDB/20.0)
+	first, last := -1, -1
+	for i, f := range frames {
+		if f.rms >= threshold {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first < 0 {
+		return samples
+	}
+
+	startSample := frames[first].start
+	endSample := frames[last].start + envWindow
+	pad := int(toneDetectPagingPadSec * float64(sampleRate))
+	startSample -= pad
+	endSample += pad
+	if startSample < 0 {
+		startSample = 0
+	}
+	if endSample > len(samples) {
+		endSample = len(samples)
+	}
+	if endSample <= startSample {
+		return samples
+	}
+	return samples[startSample:endSample]
+}
+
+type toneFreqDetection struct {
+	frequency float64
+	startTime float64
+	endTime   float64
+	magnitude float64
+}
+
+type mergedDetection struct {
+	frequency   float64
+	startTime   float64
+	endTime     float64
+	magnitude   float64
+	count       int
+	freqHistory []float64
+}
+
+func pruneHarmonicMergedDetections(merged []mergedDetection) []mergedDetection {
+	if len(merged) < 2 {
+		return merged
+	}
+	drop := make([]bool, len(merged))
+	for i := range merged {
+		for j := range merged {
+			if i == j || drop[j] {
+				continue
+			}
+			loFreq, hiFreq := merged[i].frequency, merged[j].frequency
+			lo, hi := merged[i], merged[j]
+			idxHi := j
+			if loFreq > hiFreq {
+				lo, hi = merged[j], merged[i]
+				idxHi = i
+			}
+			if hi.frequency <= lo.frequency+5 {
+				continue
+			}
+			if math.Abs(hi.startTime-lo.startTime) > toneDetectHarmonicOnsetSec {
+				continue
+			}
+			if !tonesTimeOverlap(
+				Tone{StartTime: lo.startTime, EndTime: lo.endTime},
+				Tone{StartTime: hi.startTime, EndTime: hi.endTime},
+				0.1,
+			) {
+				continue
+			}
+			for _, n := range []float64{2, 3, 4} {
+				if isIntegerHarmonicRatio(hi.frequency, lo.frequency, n) && hi.magnitude <= lo.magnitude*1.15 {
+					drop[idxHi] = true
+					break
+				}
+			}
+		}
+	}
+	out := make([]mergedDetection, 0, len(merged))
+	for i, md := range merged {
+		if !drop[i] {
+			out = append(out, md)
+		}
+	}
+	return out
+}
+
+// decodeAudioForDetect decodes call audio to mono PCM for production Detect and auto-learn Discover.
+func (detector *ToneDetector) decodeAudioForDetect(audio []byte) ([]float64, int, error) {
+	ffArgs := []string{
+		"-i", "pipe:0",
+		"-ar", "16000",
+		"-ac", "1",
+		"-af", "highpass=f=200,lowpass=f=3000,dynaudnorm",
+		"-f", "wav",
+		"-loglevel", "error",
+		"pipe:1",
+	}
+
+	ffCmd := exec.Command("ffmpeg", ffArgs...)
+	stdin, err := ffCmd.StdinPipe()
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create stdin pipe: %v", err)
+	}
+
+	var wavData bytes.Buffer
+	var ffErr bytes.Buffer
+	ffCmd.Stdout = &wavData
+	ffCmd.Stderr = &ffErr
+
+	if err := ffCmd.Start(); err != nil {
+		return nil, 0, fmt.Errorf("failed to start ffmpeg: %v", err)
+	}
+
+	go func() {
+		defer stdin.Close()
+		stdin.Write(audio)
+	}()
+
+	if err := ffCmd.Wait(); err != nil {
+		return nil, 0, fmt.Errorf("ffmpeg conversion failed: %v, stderr: %s", err, ffErr.String())
+	}
+
+	if wavData.Len() == 0 {
+		return nil, 0, fmt.Errorf("ffmpeg produced no output")
+	}
+
+	return detector.parseWAV(wavData.Bytes())
+}
+
+// Discover analyzes audio and returns all sustained tones (matched or not) for auto-learn.
+func (detector *ToneDetector) Discover(audio []byte, audioMime string) ([]Tone, error) {
+	if len(audio) < 1000 {
+		return []Tone{}, nil
+	}
+
+	samples, sampleRate, err := detector.decodeAudioForDetect(audio)
+	if err != nil {
+		return nil, err
+	}
+	if len(samples) < 100 {
+		return []Tone{}, nil
+	}
+
+	// Same decode and FFT analysis as production Detect; includeUnmatched returns tones without a tone-set match.
+	return detector.analyzeFrequencies(samples, sampleRate, nil, true), nil
 }
 
 // parseWAV parses WAV file and returns PCM samples and sample rate
@@ -299,329 +469,35 @@ func parabolicInterpolate(yMinus, y0, yPlus float64) float64 {
 	return 0.5 * (yMinus - yPlus) / denom
 }
 
-// analyzeFrequencies performs FFT analysis to detect sustained tones
-// Enhanced with dynamic noise floor estimation, parabolic interpolation, and force-split detection
-// Techniques inspired by icad_tone_detection (thegreatcodeholio) for improved analog channel detection
-func (detector *ToneDetector) analyzeFrequencies(samples []float64, sampleRate int, toneSets []ToneSet) []Tone {
-	windowSize := 2048     // FFT window size
-	hopSize := 512         // Slide window by this much
-	minToneDuration := 0.6 // Minimum 600ms to be considered a tone
-	toneRange := detector.FrequencyRange
-
-	if toneRange.Min == 0 {
-		toneRange.Min = 0.0 // Can detect from 0 Hz
-	}
-	if toneRange.Max == 0 {
-		toneRange.Max = 5000.0 // Up to 5000 Hz
+// analyzeFrequencies detects sustained paging tones via the single STFT engine
+// (analyzeSTFTTones) and optionally matches them against configured tone sets.
+func (detector *ToneDetector) analyzeFrequencies(samples []float64, sampleRate int, toneSets []ToneSet, includeUnmatched bool) []Tone {
+	maxSamples := int(toneAnalysisMaxSeconds * float64(sampleRate))
+	if maxSamples > 0 && len(samples) > maxSamples {
+		samples = samples[:maxSamples]
 	}
 
-	// Track detected frequencies over time
-	type freqDetection struct {
-		frequency float64
-		startTime float64
-		endTime   float64
-		magnitude float64
-	}
-
-	detections := make(map[int][]freqDetection) // frequency bin -> detections
-
-	// For dynamic noise floor estimation
-	var framePeaks []float64
-
-	// First pass: collect frame peaks for noise floor estimation
-	numWindows := (len(samples) - windowSize) / hopSize
-	for win := 0; win < numWindows; win++ {
-		start := win * hopSize
-		end := start + windowSize
-		if end > len(samples) {
-			break
-		}
-
-		window := samples[start:end]
-
-		// Apply window function (Hann window) to reduce spectral leakage
-		windowed := make([]float64, len(window))
-		for i := range window {
-			hann := 0.5 * (1.0 - math.Cos(2.0*math.Pi*float64(i)/float64(len(window)-1)))
-			windowed[i] = window[i] * hann
-		}
-
-		// Perform DFT (Discrete Fourier Transform)
-		magnitudes := detector.dft(windowed, sampleRate)
-
-		// Find peak magnitude in tone range for this frame
-		var framePeak float64
-		for bin, mag := range magnitudes {
-			freq := float64(bin) * float64(sampleRate) / float64(windowSize)
-			if freq >= toneRange.Min && freq <= toneRange.Max && mag > framePeak {
-				framePeak = mag
-			}
-		}
-		framePeaks = append(framePeaks, framePeak)
-	}
-
-	// Calculate dynamic noise floor (20th percentile method from icad_tone_detection)
-	if len(framePeaks) == 0 {
+	minToneDuration := toneDetectMinDurationSec
+	gates := detector.computeToneAnalysisGates(samples, sampleRate)
+	if gates.globalPeak < 1e-20 {
 		return []Tone{}
 	}
+	fmt.Printf("tone detection: global peak=%.4f, noise floor=%.1f dB, q20=%.1f dB\n", gates.globalPeak, gates.noiseFloorDB, gates.q20)
 
-	// Find global peak
-	globalPeak := 0.0
-	for _, peak := range framePeaks {
-		if peak > globalPeak {
-			globalPeak = peak
-		}
-	}
+	work := cropSamplesToPagingRegion(samples, sampleRate)
+	mergedDetections := detector.analyzeSTFTTones(work, sampleRate, gates)
+	mergedDetections = pruneHarmonicMergedDetections(mergedDetections)
 
-	if globalPeak < 1e-20 {
-		return []Tone{}
-	}
-
-	// Calculate relative dB for each frame
-	relativeDB := make([]float64, len(framePeaks))
-	for i, peak := range framePeaks {
-		relativeDB[i] = 20.0 * math.Log10(math.Max(peak, 1e-20)/globalPeak)
-	}
-
-	// Sort to find 20th percentile
-	sortedDB := make([]float64, len(relativeDB))
-	copy(sortedDB, relativeDB)
-	sort.Float64s(sortedDB)
-	q20Index := int(float64(len(sortedDB)) * 0.20)
-	q20 := sortedDB[q20Index]
-
-	// Calculate noise floor as median of values below q20
-	var belowQ20 []float64
-	for _, db := range relativeDB {
-		if db <= q20 {
-			belowQ20 = append(belowQ20, db)
-		}
-	}
-
-	noiseFloorDB := -60.0
-	if len(belowQ20) > 0 {
-		sort.Float64s(belowQ20)
-		noiseFloorDB = belowQ20[len(belowQ20)/2]
-	}
-
-	// Silence gating thresholds (from icad_tone_detection defaults)
-	silenceBelowGlobalDB := -28.0 // Frame must be within 28 dB of global peak
-	snrAboveNoiseDB := 6.0        // Frame must be 6 dB above noise floor
-
-	fmt.Printf("tone detection: global peak=%.4f, noise floor=%.1f dB, q20=%.1f dB\n", globalPeak, noiseFloorDB, q20)
-
-	// Second pass: analyze in sliding windows with noise gating
-	for win := 0; win < numWindows; win++ {
-		start := win * hopSize
-		end := start + windowSize
-		if end > len(samples) {
-			break
-		}
-
-		window := samples[start:end]
-		windowStartTime := float64(start) / float64(sampleRate)
-		windowEndTime := float64(end) / float64(sampleRate) // Actual end time of window
-
-		// Check if this frame passes noise gate
-		frameDB := relativeDB[win]
-		isSilent := frameDB < silenceBelowGlobalDB || frameDB < (noiseFloorDB+snrAboveNoiseDB)
-		if isSilent {
-			continue // Skip silent frames
-		}
-
-		// Apply window function (Hann window) to reduce spectral leakage
-		windowed := make([]float64, len(window))
-		for i := range window {
-			hann := 0.5 * (1.0 - math.Cos(2.0*math.Pi*float64(i)/float64(len(window)-1)))
-			windowed[i] = window[i] * hann
-		}
-
-		// Perform DFT (Discrete Fourier Transform)
-		magnitudes := detector.dft(windowed, sampleRate)
-
-		// Find peaks in tone range with parabolic interpolation
-		// Use peak detection to only capture local maxima (avoids detecting every bin above threshold)
-		for bin, mag := range magnitudes {
-			freq := float64(bin) * float64(sampleRate) / float64(windowSize)
-
-			// Basic magnitude check (much lower threshold now that we have noise gating)
-			if freq >= toneRange.Min && freq <= toneRange.Max && mag > 0.02 {
-				// Check if this is a local maximum (peak detection)
-				// A bin is a peak if it's larger than its neighbors
-				isLocalMax := true
-				if bin > 0 && magnitudes[bin-1] >= mag {
-					isLocalMax = false
-				}
-				if bin < len(magnitudes)-1 && magnitudes[bin+1] > mag {
-					isLocalMax = false
-				}
-
-				// Only process local maxima to avoid detecting noise/harmonics
-				if !isLocalMax {
-					continue
-				}
-
-				// Parabolic interpolation for sub-bin accuracy
-				binMinus := bin - 1
-				binPlus := bin + 1
-				if binMinus >= 0 && binPlus < len(magnitudes) {
-					magMinus := magnitudes[binMinus]
-					magPlus := magnitudes[binPlus]
-					delta := parabolicInterpolate(magMinus, mag, magPlus)
-					delta = math.Max(-0.5, math.Min(0.5, delta)) // Clamp to [-0.5, 0.5]
-					// Apply sub-bin correction
-					binWidth := float64(sampleRate) / float64(windowSize)
-					freq += delta * binWidth
-				}
-				// Check if this frequency is close to any existing detection (within ±15 Hz) and overlaps in time
-				// This prevents creating separate detections for the same tone detected at slightly different frequencies
-				found := false
-				for freqBin, detectionList := range detections {
-					binFreq := float64(freqBin * 10) // Approximate frequency for this bin
-					if math.Abs(freq-binFreq) <= 15.0 {
-						// Check if any detection in this bin overlaps with current window
-						for i := range detectionList {
-							// Check if windows overlap (current window overlaps with detection time range)
-							if windowStartTime <= detectionList[i].endTime && windowEndTime >= detectionList[i].startTime {
-								// Same tone detected - extend the detection
-								if windowEndTime > detectionList[i].endTime {
-									detectionList[i].endTime = windowEndTime
-								}
-								if windowStartTime < detectionList[i].startTime {
-									detectionList[i].startTime = windowStartTime
-								}
-								if mag > detectionList[i].magnitude {
-									detectionList[i].magnitude = mag
-									detectionList[i].frequency = freq // Update to closer frequency
-								}
-								found = true
-								break
-							}
-						}
-						if found {
-							break
-						}
-					}
-				}
-
-				if !found {
-					// Create new detection - use frequency bin but track actual frequency
-					freqBin := int(freq / 10.0)
-					if detections[freqBin] == nil {
-						detections[freqBin] = []freqDetection{}
-					}
-
-					detections[freqBin] = append(detections[freqBin], freqDetection{
-						frequency: freq,
-						startTime: windowStartTime,
-						endTime:   windowEndTime, // Use actual window end time
-						magnitude: mag,
-					})
-				}
-			}
-		}
-	}
-
-	// Merge nearby frequency detections to avoid duplicate detections of the same tone
-	// Group detections by similar frequency and time overlap
-	type mergedDetection struct {
-		frequency   float64   // Average frequency
-		startTime   float64   // Earliest start
-		endTime     float64   // Latest end
-		magnitude   float64   // Highest magnitude
-		count       int       // Number of detections merged
-		freqHistory []float64 // Track frequency progression for force-split detection
-	}
-
-	mergedDetections := []mergedDetection{}
-
-	// Force-split parameters (from icad_tone_detection)
-	forceSplitStepHz := 18.0 // Force split if frequency jumps > 18 Hz between consecutive detections
-	splitLookahead := 2      // Number of frames to look ahead to confirm split
-
-	for _, detectionList := range detections {
-		for _, det := range detectionList {
-			duration := det.endTime - det.startTime
-
-			if duration >= minToneDuration {
-				// Try to merge with existing merged detection
-				merged := false
-				for i := range mergedDetections {
-					md := &mergedDetections[i]
-					freqDiff := math.Abs(det.frequency - md.frequency)
-
-					// Check for force-split condition: large frequency jump indicates different tone
-					forceSplit := false
-					if len(md.freqHistory) >= splitLookahead {
-						// Calculate recent median frequency
-						recentFreqs := md.freqHistory[len(md.freqHistory)-splitLookahead:]
-						sort.Float64s(recentFreqs)
-						recentMedian := recentFreqs[len(recentFreqs)/2]
-
-						// If frequency jumps too much from recent median, force split
-						if math.Abs(det.frequency-recentMedian) > forceSplitStepHz {
-							forceSplit = true
-						}
-					}
-
-					// Only merge if frequencies are within ±20 Hz (increased for analog drift) AND times overlap AND no force-split
-					// Increased from ±15 Hz to ±20 Hz to handle analog channel frequency drift
-					// For A-tones: typically 300-600 Hz range, ±20 Hz covers drift + Doppler
-					// For B-tones: typically 1000-1200 Hz range, ±20 Hz covers drift + Doppler
-					// We use a small tolerance (0.1s) to handle cases where one tone ends exactly when another starts
-					// (could be the same tone with a tiny gap), but we don't merge tones that are clearly separate
-					timeOverlap := (det.startTime <= md.endTime+0.1 && det.endTime >= md.startTime-0.1)
-
-					// Only merge if frequencies are close AND times overlap AND no force-split
-					// This prevents merging separate tone sets in stacked tone scenarios
-					if freqDiff <= 20.0 && timeOverlap && !forceSplit {
-						// Merge: use weighted average frequency, extend time range, use max magnitude
-						oldFreq := md.frequency
-						totalCount := md.count + 1
-						md.frequency = (md.frequency*float64(md.count) + det.frequency) / float64(totalCount)
-						if det.startTime < md.startTime {
-							md.startTime = det.startTime
-						}
-						if det.endTime > md.endTime {
-							md.endTime = det.endTime
-						}
-						if det.magnitude > md.magnitude {
-							md.magnitude = det.magnitude
-						}
-						md.count = totalCount
-						md.freqHistory = append(md.freqHistory, det.frequency)
-						fmt.Printf("merged tone %.1f Hz (%.2fs) with existing %.1f Hz -> %.1f Hz (merged %d detections, time: %.2f-%.2fs)\n",
-							det.frequency, det.endTime-det.startTime, oldFreq, md.frequency, totalCount, md.startTime, md.endTime)
-						merged = true
-						break
-					}
-				}
-
-				if !merged {
-					// Create new merged detection
-					mergedDetections = append(mergedDetections, mergedDetection{
-						frequency:   det.frequency,
-						startTime:   det.startTime,
-						endTime:     det.endTime,
-						magnitude:   det.magnitude,
-						count:       1,
-						freqHistory: []float64{det.frequency},
-					})
-				}
-			}
-		}
-	}
-
-	// Convert merged detections to tones (filter by duration and match against tone sets)
 	var tones []Tone
-	var allDetections []freqDetection // For logging all detected frequencies (before merging)
-
-	// Log all raw detections for debugging
-	for _, detectionList := range detections {
-		for _, det := range detectionList {
-			if det.endTime-det.startTime >= minToneDuration {
-				allDetections = append(allDetections, det)
-			}
+	var allDetections []toneFreqDetection
+	for _, md := range mergedDetections {
+		if md.endTime-md.startTime >= minToneDuration {
+			allDetections = append(allDetections, toneFreqDetection{
+				frequency: md.frequency,
+				startTime: md.startTime,
+				endTime:   md.endTime,
+				magnitude: md.magnitude,
+			})
 		}
 	}
 
@@ -726,6 +602,23 @@ func (detector *ToneDetector) analyzeFrequencies(samples []float64, sampleRate i
 				EndTime:   md.endTime,
 				Duration:  duration,
 				ToneType:  toneType,
+				Magnitude: md.magnitude,
+			})
+		} else if includeUnmatched {
+			seqType := ""
+			switch len(tones) {
+			case 0:
+				seqType = "A"
+			case 1:
+				seqType = "B"
+			}
+			tones = append(tones, Tone{
+				Frequency: md.frequency,
+				StartTime: md.startTime,
+				EndTime:   md.endTime,
+				Duration:  duration,
+				ToneType:  seqType,
+				Magnitude: md.magnitude,
 			})
 		} else {
 			// Log what we were looking for vs what was detected
@@ -1313,6 +1206,59 @@ func (detector *ToneDetector) RemoveTonesFromAudio(audio []byte, audioMime strin
 	return filteredAudioBytes, nil
 }
 
+const (
+	// residualSpeechMinDB is the frame RMS (dBFS) a frame must reach to count as speech after tone removal.
+	// On real Trumbull dispatch calls the leftover of a tone-only page peaks around -34..-37 dB while
+	// speech sits around -3 dB, so -28 dB leaves ~25 dB of margin on both sides.
+	residualSpeechMinDB = -28.0
+
+	// MinResidualSpeechSeconds is how much non-tonal, speech-level audio must remain after tone
+	// removal before the clip is worth sending to speech-to-text. Below this, STT only sees silence
+	// and static and hallucinates filler ("you", "Thank you.") that then masquerades as the call.
+	MinResidualSpeechSeconds = 0.4
+)
+
+// ResidualSpeechSeconds estimates how many seconds of speech-like audio are in a 16-bit PCM WAV
+// (as produced by RemoveTonesFromAudio): frames that are loud enough AND not spectrally pure.
+// Tone remnants that survived removal are loud but tonal, so they do not count as speech.
+func (detector *ToneDetector) ResidualSpeechSeconds(wav []byte) (float64, error) {
+	samples, sampleRate, err := detector.parseWAV(wav)
+	if err != nil {
+		return 0, err
+	}
+
+	const windowSize = 2048
+	const hopSize = 512
+	if len(samples) < windowSize {
+		return 0, nil
+	}
+
+	speechFrames := 0
+	for start := 0; start+windowSize <= len(samples); start += hopSize {
+		frame := samples[start : start+windowSize]
+
+		var sumSq float64
+		for _, s := range frame {
+			sumSq += s * s
+		}
+		rmsDB := 20.0 * math.Log10(math.Max(math.Sqrt(sumSq/float64(windowSize)), 1e-6))
+		if rmsDB < residualSpeechMinDB {
+			continue
+		}
+
+		windowed := make([]float64, windowSize)
+		for i, s := range frame {
+			windowed[i] = s * 0.5 * (1.0 - math.Cos(2.0*math.Pi*float64(i)/float64(windowSize-1)))
+		}
+		if spectralTonality(detector.dft(windowed, sampleRate), windowSize, sampleRate) >= minTranscriptionToneTonality {
+			continue
+		}
+		speechFrames++
+	}
+
+	return float64(speechFrames*hopSize) / float64(sampleRate), nil
+}
+
 // calculateTotalToneDuration calculates total duration of all tones
 func calculateTotalToneDuration(tones []Tone) float64 {
 	total := 0.0
@@ -1391,6 +1337,68 @@ func (detector *ToneDetector) DetectAllTonesForTranscription(audio []byte, audio
 	fmt.Printf("transcription tone detection: found %d sustained tones to remove before transcription\n", len(detectedTones))
 
 	return detectedTones, nil
+}
+
+// minTranscriptionToneTonality is the minimum spectral purity a frame must have to count as part of a
+// dispatch tone when pre-filtering audio for transcription (see spectralTonality).
+//
+// Calibrated on real calls from the Trumbull County dispatch talkgroup: tone pages hold ~1.00 (pure
+// sinusoids) for 3s+ runs, while the longest unbroken run of frames >= 0.95 in any voice call was
+// 0.74s. Without this check, steady dispatcher vowels (200-650 Hz) were detected as "tones", the
+// "voice remaining after the last tone" collapsed to <2s and the real dispatch was skipped as
+// tone-only.
+const minTranscriptionToneTonality = 0.95
+
+// spectralTonality returns the fraction of in-band (200-5000 Hz) spectral energy that sits in the
+// three strongest spectral peaks (+-2 bins each) of a windowed frame. A pure dispatch tone (or a
+// tone plus its harmonics) scores ~1.0; speech spreads its energy across many harmonics and noise,
+// and scores well below that over any sustained stretch.
+func spectralTonality(magnitudes map[int]float64, windowSize, sampleRate int) float64 {
+	lo := int(200.0 * float64(windowSize) / float64(sampleRate))
+	hi := int(5000.0 * float64(windowSize) / float64(sampleRate))
+	if lo < 1 {
+		lo = 1
+	}
+
+	type peak struct {
+		bin    int
+		energy float64
+	}
+	var total float64
+	var peaks []peak
+	for k := lo; k <= hi; k++ {
+		m := magnitudes[k]
+		e := m * m
+		total += e
+		if m > magnitudes[k-1] && m >= magnitudes[k+1] {
+			peaks = append(peaks, peak{k, e})
+		}
+	}
+	if total <= 0 || len(peaks) == 0 {
+		return 0
+	}
+
+	sort.Slice(peaks, func(i, j int) bool { return peaks[i].energy > peaks[j].energy })
+
+	used := make(map[int]bool)
+	var peakEnergy float64
+	taken := 0
+	for _, p := range peaks {
+		if taken == 3 {
+			break
+		}
+		if used[p.bin] {
+			continue
+		}
+		for k := p.bin - 2; k <= p.bin+2; k++ {
+			if !used[k] {
+				used[k] = true
+				peakEnergy += magnitudes[k] * magnitudes[k]
+			}
+		}
+		taken++
+	}
+	return peakEnergy / total
 }
 
 // detectAllSustainedTones detects all sustained tones in audio without matching against tone sets
@@ -1509,6 +1517,13 @@ func (detector *ToneDetector) detectAllSustainedTones(samples []float64, sampleR
 		}
 
 		magnitudes := detector.dft(windowed, sampleRate)
+
+		// Speech (steady vowel pitch, 200-650 Hz) also produces a stable spectral peak, so a loud
+		// bin alone is not evidence of a dispatch tone. Only frames whose energy is concentrated in
+		// a few narrow peaks count; otherwise voice gets cut out and the call is skipped as tone-only.
+		if spectralTonality(magnitudes, windowSize, sampleRate) < minTranscriptionToneTonality {
+			continue
+		}
 
 		for bin, mag := range magnitudes {
 			freq := float64(bin) * float64(sampleRate) / float64(windowSize)

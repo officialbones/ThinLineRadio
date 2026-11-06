@@ -19,32 +19,66 @@
  */
 
 import { CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
-import { ChangeDetectorRef, Component, Input } from '@angular/core';
+import { ChangeDetectorRef, Component, Input, ChangeDetectionStrategy } from '@angular/core';
 import { MatDialog } from '@angular/material/dialog';
 import { FormArray, FormGroup } from '@angular/forms';
+import { PageEvent } from '@angular/material/paginator';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { RdioScannerAdminService } from '../../admin.service';
-import { RdioScannerAdminSystemsSelectComponent } from '../systems/select/select.component';
+import { RdioScannerAdminSystemsSelectComponent, SYSTEMS_SELECT_DIALOG_OPTIONS } from '../systems/select/select.component';
 
 @Component({
     selector: 'rdio-scanner-admin-apikeys',
     templateUrl: './apikeys.component.html',
     styleUrls: ['./apikeys.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminApikeysComponent {
     @Input() form: FormArray | undefined;
     @Input() rawSystems: any[] | undefined;
 
-    displayedColumns: string[] = ['drag', 'status', 'ident', 'key', 'access', 'actions'];
+    readonly pageSize = 10;
+    pageIndex = 0;
+    searchQuery = '';
+    keyTab: 'upload' | 'site' = 'upload';
 
-    // Per-row key visibility state
-    keyVisible: boolean[] = [];
+    get displayedColumns(): string[] {
+        if (this.keyTab === 'site') {
+            return ['drag', 'status', 'ident', 'key', 'actions'];
+        }
+        return ['drag', 'status', 'ident', 'key', 'access', 'systems', 'alerts', 'time', 'actions'];
+    }
+
+    /** Per-key visibility keyed by the key string (stable across pagination). */
+    private keyVisibleMap: Record<string, boolean> = {};
+
+    saving = false;
 
     get apikeys(): FormGroup[] {
-        // Spread into a new array so mat-table always receives a new reference
-        // and correctly detects additions/removals even inside an OnPush parent.
         return [...(this.form?.controls || [])]
-            .sort((a, b) => a.value.order - b.value.order) as FormGroup[];
+            .sort((a, b) => (a.value.order || 0) - (b.value.order || 0)) as FormGroup[];
+    }
+
+    get tabApikeys(): FormGroup[] {
+        return this.apikeys.filter((apikey) => (apikey.value.purpose === 'site' ? 'site' : 'upload') === this.keyTab);
+    }
+
+    get filteredApikeys(): FormGroup[] {
+        const q = this.searchQuery.trim().toLowerCase();
+        if (!q) {
+            return this.tabApikeys;
+        }
+        return this.tabApikeys.filter((apikey) => {
+            const ident = String(apikey.value.ident || '').toLowerCase();
+            const key = String(apikey.value.key || '').toLowerCase();
+            return ident.includes(q) || key.includes(q);
+        });
+    }
+
+    get pagedApikeys(): FormGroup[] {
+        const start = this.pageIndex * this.pageSize;
+        return this.filteredApikeys.slice(start, start + this.pageSize);
     }
 
     trackByKey(_index: number, apikey: FormGroup): string {
@@ -58,48 +92,92 @@ export class RdioScannerAdminApikeysComponent {
         private snackBar: MatSnackBar
     ) { }
 
+    setTab(tab: 'upload' | 'site'): void {
+        this.keyTab = tab;
+        this.pageIndex = 0;
+        this.cdr.markForCheck();
+    }
+
+    onSearch(value: string): void {
+        this.searchQuery = value ?? '';
+        this.pageIndex = 0;
+        this.cdr.markForCheck();
+    }
+
+    onPage(event: PageEvent): void {
+        this.pageIndex = event.pageIndex;
+        this.cdr.markForCheck();
+    }
+
+    private clampPage(): void {
+        const maxPage = Math.max(0, Math.ceil(this.filteredApikeys.length / this.pageSize) - 1);
+        if (this.pageIndex > maxPage) {
+            this.pageIndex = maxPage;
+        }
+    }
+
     add(): void {
+        const key = this.uuid();
         const apikey = this.adminService.newApikeyForm({
-            key: this.uuid(),
+            key,
+            purpose: this.keyTab,
             systems: '*',
+            noAudioAlertsEnabled: false,
         });
 
         apikey.markAsDirty({ onlySelf: false });
 
         this.form?.insert(0, apikey);
-        this.keyVisible.unshift(true); // Show new key's value by default
+        this.keyVisibleMap[key] = true;
 
         this.form?.markAsDirty();
-
-        // markForCheck() propagates up through the OnPush parent (config.component)
-        // so the new array reference from the getter is picked up and mat-table
-        // renders the new row immediately without the user having to click elsewhere.
+        this.pageIndex = 0;
         this.cdr.markForCheck();
     }
 
-    remove(index: number): void {
+    remove(apikey: FormGroup): void {
+        const index = this.form?.controls.indexOf(apikey) ?? -1;
+        if (index < 0) {
+            return;
+        }
+        const ident = (apikey.get('ident')?.value || '').toString().trim() || 'this API key';
+        const warning = apikey.get('purpose')?.value === 'site'
+            ? 'SDRTrunk will disconnect from site control, and its Thinline Core streams will stop uploading.'
+            : 'Recorders using this key will stop uploading.';
+        if (!confirm(`Are you sure you want to delete API key "${ident}"?\n\n${warning}`)) {
+            return;
+        }
+        const key = String(apikey.get('key')?.value || '');
         this.form?.removeAt(index);
-        this.keyVisible.splice(index, 1);
+        if (key) {
+            delete this.keyVisibleMap[key];
+        }
 
         this.form?.markAsDirty();
+        this.clampPage();
+        this.saveAll(false);
     }
 
     drop(event: CdkDragDrop<FormGroup[]>): void {
-        if (event.previousIndex !== event.currentIndex) {
-            moveItemInArray(event.container.data, event.previousIndex, event.currentIndex);
-
-            event.container.data.forEach((dat, idx) => dat.get('order')?.setValue(idx + 1, { emitEvent: false }));
-
-            // Sync visibility array
-            const vis = this.keyVisible.splice(event.previousIndex, 1);
-            this.keyVisible.splice(event.currentIndex, 0, ...vis);
-
-            this.form?.markAsDirty();
+        if (this.searchQuery.trim() || event.previousIndex === event.currentIndex) {
+            return;
         }
+        const all = this.filteredApikeys;
+        const from = this.pageIndex * this.pageSize + event.previousIndex;
+        const to = this.pageIndex * this.pageSize + event.currentIndex;
+        if (from === to || from < 0 || from >= all.length) {
+            return;
+        }
+        moveItemInArray(all, from, Math.min(to, all.length - 1));
+        all.forEach((dat, idx) => dat.get('order')?.setValue(idx + 1, { emitEvent: false }));
+
+        this.form?.markAsDirty();
+        this.saveAll(false);
     }
 
     select(access: FormGroup): void {
         const matDialogRef = this.matDialog.open(RdioScannerAdminSystemsSelectComponent, {
+            ...SYSTEMS_SELECT_DIALOG_OPTIONS,
             data: { access, rawSystems: this.rawSystems },
         });
 
@@ -107,6 +185,7 @@ export class RdioScannerAdminApikeysComponent {
             if (data) {
                 access.get('systems')?.setValue(data);
                 access.markAsDirty();
+                this.saveAll(false);
             }
         });
     }
@@ -116,21 +195,70 @@ export class RdioScannerAdminApikeysComponent {
         if (ctrl) {
             ctrl.setValue(!ctrl.value);
             apikey.markAsDirty();
+            this.saveAll(false);
         }
     }
 
-    toggleKeyVisible(index: number): void {
-        this.keyVisible[index] = !this.keyVisible[index];
+    onNoAudioSettingChange(apikey: FormGroup): void {
+        apikey.markAsDirty();
+        this.saveAll(false);
     }
 
-    maskKey(key: string): string {
-        if (!key) return '—';
-        // Show first 8 chars then mask the rest: xxxxxxxx-••••-••••-••••-••••••••••••
-        const parts = key.split('-');
-        if (parts.length === 5) {
-            return `${parts[0]}-••••-••••-••••-••••••••••••`;
+    async saveAll(showToast = true): Promise<void> {
+        if (!this.form) return;
+
+        if (this.form.invalid) {
+            if (showToast) {
+                this.snackBar.open('Fix the highlighted fields before saving.', 'Close', { duration: 4000 });
+            }
+            return;
         }
-        return key.slice(0, 8) + '••••••••••••••••••••••••••••';
+
+        this.saving = true;
+        const list = this.form.getRawValue();
+        const updated = await this.adminService.saveApikeys(list);
+        this.saving = false;
+
+        if (updated) {
+            this.applySavedIds(updated);
+            this.form.markAsPristine();
+            if (showToast) {
+                this.snackBar.open('API keys saved', 'Close', { duration: 1500 });
+            }
+        } else if (showToast) {
+            this.snackBar.open('Failed to save API keys. Please try again.', 'Close', { duration: 4000 });
+        }
+        this.cdr.markForCheck();
+    }
+
+    /** New keys get their id on save; without it the next save would add them again. */
+    private applySavedIds(saved: any[]): void {
+        const ids = new Map<string, number>();
+        for (const apikey of saved) {
+            if (apikey?.key && apikey?.id) {
+                ids.set(String(apikey.key), apikey.id);
+            }
+        }
+        for (const control of this.form?.controls || []) {
+            const id = ids.get(String(control.get('key')?.value || ''));
+            if (id && !control.get('id')?.value) {
+                control.get('id')?.setValue(id, { emitEvent: false });
+            }
+        }
+    }
+
+    isKeyVisible(apikey: FormGroup): boolean {
+        const key = String(apikey.get('key')?.value || '');
+        return !!this.keyVisibleMap[key];
+    }
+
+    toggleKeyVisible(apikey: FormGroup): void {
+        const key = String(apikey.get('key')?.value || '');
+        if (!key) {
+            return;
+        }
+        this.keyVisibleMap[key] = !this.keyVisibleMap[key];
+        this.cdr.markForCheck();
     }
 
     copyKey(key: string): void {

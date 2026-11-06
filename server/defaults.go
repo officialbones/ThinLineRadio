@@ -48,10 +48,12 @@ type DefaultOptions struct {
 	autoPopulate                bool
 	audioConversion             uint
 	branding                    string
+	uiAccentColor               string
 	defaultSystemDelay          uint
 	disableDuplicateDetection   bool
-	duplicateDetectionTimeFrame uint
-	duplicateTimestampWindow    uint
+	duplicateDetectionTimeFrame   uint
+	duplicateTimestampWindow      uint
+	duplicateRadioTimestampWindow uint
 	email                       string
 	keypadBeeps                 string
 	maxClients                  uint
@@ -64,6 +66,7 @@ type DefaultOptions struct {
 	radioReferenceUsername      string
 	radioReferencePassword      string
 	userRegistrationEnabled     bool
+	requireListenerSignIn       bool
 	publicRegistrationEnabled   bool
 	publicRegistrationMode      string
 	emailVerificationRequired   bool
@@ -91,6 +94,7 @@ type DefaultOptions struct {
 	stripePublishableKey        string
 	stripeSecretKey             string
 	stripeWebhookSecret         string
+	stripeBillingPortalConfigurationId string
 	stripeGracePeriodDays        uint
 	stripePriceId               string
 	baseUrl                     string
@@ -114,6 +118,7 @@ type DefaultOptions struct {
 	adminLocalhostOnly          bool
 	configSyncEnabled           bool
 	configSyncPath              string
+	configSyncFileName          string
 	reconnectionEnabled         bool
 	reconnectionGracePeriod     uint
 	reconnectionMaxBufferSize   uint
@@ -164,10 +169,12 @@ var defaults = Defaults{
 		autoPopulate:                true,
 		audioConversion:             AUDIO_CONVERSION_ENABLED, // match rdio-scanner: on by default
 		branding:                    "",
+		uiAccentColor:               defaultUIAccentColor,
 		defaultSystemDelay:          0,
 		disableDuplicateDetection:   false,
-		duplicateDetectionTimeFrame: 30000,
-		duplicateTimestampWindow:    800,
+		duplicateDetectionTimeFrame:   30000,
+		duplicateTimestampWindow:      800,
+		duplicateRadioTimestampWindow: 1200,
 		email:                       "",
 		keypadBeeps:                 "uniden",
 		maxClients:                  100,
@@ -180,6 +187,7 @@ var defaults = Defaults{
 		radioReferenceUsername:      "",
 		radioReferencePassword:      "",
 		userRegistrationEnabled:     true,
+		requireListenerSignIn:       false, // Explicit; creating users does not lock the scanner
 		publicRegistrationEnabled:   false, // Default to invite-only
 		publicRegistrationMode:      "both",
 		emailVerificationRequired:   false, // Default to not requiring email verification
@@ -207,6 +215,7 @@ var defaults = Defaults{
 		stripePublishableKey:        "",
 		stripeSecretKey:             "",
 		stripeWebhookSecret:         "",
+		stripeBillingPortalConfigurationId: "",
 		stripeGracePeriodDays:       0,
 		stripePriceId:               "",
 		baseUrl:                     "",
@@ -243,6 +252,7 @@ var defaults = Defaults{
 		adminLocalhostOnly: false, // Default to false for backwards compatibility
 		configSyncEnabled:  false,
 		configSyncPath:     "",
+		configSyncFileName: "ThinLineRadioV7-config.json",
 		reconnectionEnabled: true,       // Enable by default
 		reconnectionGracePeriod: 60,     // 60 seconds
 		reconnectionMaxBufferSize: 100,  // 100 calls max

@@ -17,16 +17,16 @@
  * ****************************************************************************
  */
 
-import { Component, Input, OnInit, OnDestroy, OnChanges, SimpleChanges, ChangeDetectorRef } from '@angular/core';
+import { Component, Input, OnInit, OnDestroy, OnChanges, SimpleChanges, ChangeDetectorRef, ChangeDetectionStrategy } from '@angular/core';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatDialog } from '@angular/material/dialog';
-import { FormBuilder, FormGroup, FormArray, Validators } from '@angular/forms';
+import { AbstractControl, FormBuilder, FormGroup, FormArray, ValidationErrors, Validators } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 import { PageEvent } from '@angular/material/paginator';
-import { RdioScannerAdminService, System } from '../../admin.service';
+import { RdioScannerAdminService, System, Apikey } from '../../admin.service';
 import { InviteUserDialogComponent, InvitationResultsDialogComponent, CreateUserDialogComponent, ResetPasswordDialogComponent } from './invite-user-dialog.component';
 import { TransferUserDialogComponent } from './transfer-user-dialog.component';
-import { RdioScannerAdminSystemsSelectComponent } from '../systems/select/select.component';
+import { RdioScannerAdminSystemsSelectComponent, SYSTEMS_SELECT_DIALOG_OPTIONS } from '../systems/select/select.component';
 
 export interface FCMToken {
     id: number;
@@ -44,6 +44,8 @@ export interface User {
     verified: boolean;
     createdAt: string;
     lastLogin: string;
+    /** Unix seconds; 0 = never logged in. Used for sorting. */
+    lastLoginAt?: number;
     firstName: string;
     lastName: string;
     zipCode: string;
@@ -57,22 +59,43 @@ export interface User {
     connectionLimit: number;
     effectiveConnectionLimit?: number;
     userGroupId?: number;
+    /** All groups this user belongs to (access is the union); always contains userGroupId. */
+    userGroupIds?: number[];
+    /** Primary group display name from GET /api/admin/users (avoids waiting on /groups). */
+    userGroupName?: string;
     isGroupAdmin?: boolean;
     systemAdmin?: boolean;
+    publicApiEnabled?: boolean;
+    publicApiCapabilities?: {
+        health?: boolean;
+        transcripts?: boolean;
+        alertWebhooks?: boolean;
+    };
+    pushSystemNoAudioAlerts?: boolean;
+    pushApiKeyNoAudioAlerts?: boolean;
+    systemNoAudioAlertSystems?: string;
+    apiKeyNoAudioAlertApiKeys?: string;
     forcePasswordReset?: boolean;
+    suspended?: boolean;
     stripeCustomerId: string;
     stripeSubscriptionId: string;
     subscriptionStatus: string;
+    /** Unix timestamp; 0 / missing = no account expiration. */
+    accountExpiresAt?: number;
     fcmTokens?: FCMToken[];
 }
 
 @Component({
     selector: 'rdio-scanner-admin-users',
     templateUrl: './users.component.html',
-    styleUrls: ['./users.component.scss']
+    styleUrls: ['./users.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChanges {
     @Input() userRegistrationEnabled = false;
+    /** When false, creating accounts does not lock open listening. */
+    @Input() requireListenerSignIn = false;
     @Input() form?: FormArray;
 
     users: User[] = [];
@@ -80,17 +103,33 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
     error: string | null = null;
 
     // Table columns
-    displayedColumns: string[] = ['avatar', 'user', 'group', 'status', 'pin', 'lastLogin', 'actions'];
+    displayedColumns: string[] = ['select', 'avatar', 'user', 'group', 'status', 'lastLogin', 'actions'];
 
     // Expanded row for inline editing
     expandedUser: User | null = null;
 
-    // Search and pagination
+    // Multi-select for bulk actions
+    selectedUserIds = new Set<number>();
+    bulkDeleting = false;
+
+    // Search, filters, sort, and pagination
     searchText = '';
+    /** '' = all, 'none' = no group, otherwise group id as string. */
+    groupFilter = '';
+    /** '' = all; 'active' includes trialing; 'problem' = past_due/unpaid/incomplete. */
+    subscriptionFilter = '';
+    /** '' = all; pin_expired | account_expired | suspended | verified | unverified. */
+    statusFilter = '';
+    /** name | lastLoginDesc | lastLoginAsc */
+    sortMode: 'name' | 'lastLoginDesc' | 'lastLoginAsc' = 'name';
     filteredUsers: User[] = [];
     paginatedUsers: User[] = [];
     pageSize = 25;
     pageIndex = 0;
+
+    /** userId -> live device count from /api/admin/listeners */
+    listeningDeviceCounts = new Map<number, number>();
+    private listenersPollTimer: ReturnType<typeof setInterval> | null = null;
     
     // Editing functionality
     editingUser: User | null = null;
@@ -101,10 +140,73 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
     availableGroups: any[] = [];
     inviting = false;
     systems: System[] = [];
+    apikeys: Apikey[] = [];
     configGroups: any[] = [];
     configTags: any[] = [];
     systemDelayEntries: Array<{systemId: number, delay: number}> = [];
     talkgroupDelayEntries: Array<{systemId: number, talkgroupId: number, delay: number}> = [];
+    publicApiKeysForEdit: Array<{
+        id: number;
+        name: string;
+        keyPrefix: string;
+        lastUsedAt: number;
+        requestCount: number;
+        disabled: boolean;
+    }> = [];
+    publicApiKeysLoading = false;
+
+    /** Only validate ZIP format when the field has a value — blank is allowed. */
+    private static optionalZipValidator(control: AbstractControl): ValidationErrors | null {
+        const v = (control.value ?? '').toString().trim();
+        if (!v) {
+            return null;
+        }
+        return /^\d{5}(-\d{4})?$/.test(v) ? null : { pattern: true };
+    }
+
+    private static parseNoAudioAlertIds(raw?: string): number[] {
+        const value = (raw ?? '').trim();
+        if (!value || value === '[]') {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            return parsed.map((entry) => Number(entry)).filter((id) => Number.isFinite(id) && id > 0);
+        } catch {
+            return [];
+        }
+    }
+
+    private static serializeNoAudioAlertIds(ids: number[] | null | undefined): string {
+        const cleaned = (ids ?? []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
+        return JSON.stringify(cleaned);
+    }
+
+    /**
+     * Normalizes a user's group memberships to unique positive ids and always
+     * includes the primary group, matching the server-side invariant.
+     */
+    private static normalizeGroupIds(ids: number[] | null | undefined, primaryId?: number): number[] {
+        const out: number[] = [];
+        const seen = new Set<number>();
+        const add = (raw: unknown) => {
+            const id = Number(raw);
+            if (Number.isFinite(id) && id > 0 && !seen.has(id)) {
+                seen.add(id);
+                out.push(id);
+            }
+        };
+        add(primaryId);
+        (ids ?? []).forEach(add);
+        return out;
+    }
+
+    private static apiKeyOptionId(apikey: Apikey): number {
+        return Number(apikey.id);
+    }
 
     constructor(
         private adminService: RdioScannerAdminService,
@@ -116,9 +218,13 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
     ) {
         this.editForm = this.fb.group({
             email: ['', [Validators.required, Validators.email]],
-            firstName: ['', [Validators.required]],
-            lastName: ['', [Validators.required]],
-            zipCode: ['', [Validators.required, Validators.pattern(/^\d{5}(-\d{4})?$/)]],
+            // firstName/lastName/zipCode are optional on the User model — many users
+            // (SSO / invited) have them blank. Requiring them here left the form
+            // permanently invalid and greyed out the Save button. Keep the ZIP format
+            // check (it passes when empty) but don't force these fields.
+            firstName: [''],
+            lastName: [''],
+            zipCode: ['', [RdioScannerAdminUsersComponent.optionalZipValidator]],
             verified: [false],
             systems: ['*'], // System and talkgroup access - '*' for all or JSON array
             delay: [0, [Validators.min(0)]],
@@ -128,9 +234,19 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
             systemDelays: [''],
             talkgroupDelays: [''],
             userGroupId: [0],
+            userGroupIds: [[] as number[]],
             isGroupAdmin: [false],
             systemAdmin: [false],
+            publicApiEnabled: [false],
+            publicApiHealth: [false],
+            publicApiTranscripts: [false],
+            publicApiAlertWebhooks: [false],
+            systemNoAudioAlertSystemIds: [[] as number[]],
+            apiKeyNoAudioAlertApiKeyIds: [[] as number[]],
+            pushSystemNoAudioAlerts: [false],
+            pushApiKeyNoAudioAlerts: [false],
             forcePasswordReset: [false],
+            suspended: [false],
             stripeCustomerId: [''],
             stripeSubscriptionId: [''],
             subscriptionStatus: ['']
@@ -144,6 +260,11 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
         this.loadUsers(true);
         this.loadGroups();
         this.loadSystems();
+        this.loadApikeys();
+        void this.refreshListeningCounts();
+        this.listenersPollTimer = setInterval(() => {
+            void this.refreshListeningCounts();
+        }, 10000);
     }
 
     ngOnChanges(changes: SimpleChanges): void {
@@ -155,7 +276,8 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
 
     updateUsersFromForm(): void {
         if (this.form) {
-            this.users = this.form.value.map((user: any) => ({
+            // Use getRawValue() so the disabled shadow array still reports values.
+            this.users = this.form.getRawValue().map((user: any) => ({
                 id: user.id || 0,
                 email: user.email || '',
                 firstName: user.firstName || '',
@@ -164,6 +286,7 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
                 verified: user.verified || false,
                 createdAt: user.createdAt || '',
                 lastLogin: user.lastLogin || '',
+                lastLoginAt: Number(user.lastLoginAt) || 0,
                 systems: user.systems || '',
                 delay: user.delay || 0,
                 systemDelays: user.systemDelays || '',
@@ -173,18 +296,66 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
                 pinExpiresAt: user.pinExpiresAt || 0,
                 connectionLimit: user.connectionLimit || 0,
                 userGroupId: user.userGroupId || 0,
+                userGroupIds: RdioScannerAdminUsersComponent.normalizeGroupIds(user.userGroupIds, user.userGroupId),
                 isGroupAdmin: user.isGroupAdmin || false,
                 systemAdmin: user.systemAdmin || false,
+                publicApiEnabled: user.publicApiEnabled || false,
+                publicApiCapabilities: user.publicApiCapabilities || {},
+                systemNoAudioAlertSystemIds: RdioScannerAdminUsersComponent.parseNoAudioAlertIds(user.systemNoAudioAlertSystems),
+                apiKeyNoAudioAlertApiKeyIds: RdioScannerAdminUsersComponent.parseNoAudioAlertIds(user.apiKeyNoAudioAlertApiKeys),
+                pushSystemNoAudioAlerts: user.pushSystemNoAudioAlerts || false,
+                pushApiKeyNoAudioAlerts: user.pushApiKeyNoAudioAlerts || false,
                 forcePasswordReset: user.forcePasswordReset || false,
+                suspended: user.suspended || false,
                 stripeCustomerId: user.stripeCustomerId || '',
                 stripeSubscriptionId: user.stripeSubscriptionId || '',
                 subscriptionStatus: user.subscriptionStatus || '',
                 accountExpiresAt: user.accountExpiresAt || 0,
-                pinExpired: false // Will be calculated if needed
+                pinExpired: !!user.pinExpired,
+            })).map((user: User) => ({
+                ...user,
+                pinExpired: this.isPinExpired(user),
             }));
+            this.sortUsers();
             this.applyFilter();
             this.cdr.detectChanges();
         }
+    }
+
+    /** Sort key for A–Z list order: last/first name when present, otherwise email. */
+    private getUserSortKey(user: User): string {
+        const name = `${user.lastName || ''} ${user.firstName || ''}`.trim();
+        return (name || user.email || '').toLowerCase();
+    }
+
+    private sortUsers(): void {
+        this.users.sort((a, b) => {
+            if (this.sortMode === 'lastLoginDesc' || this.sortMode === 'lastLoginAsc') {
+                const aAt = Number(a.lastLoginAt) || 0;
+                const bAt = Number(b.lastLoginAt) || 0;
+                // Never-logged (0): last for newest-first, first for oldest-first.
+                if (aAt === 0 && bAt === 0) {
+                    return this.getUserSortKey(a).localeCompare(this.getUserSortKey(b), undefined, { sensitivity: 'base' });
+                }
+                if (aAt === 0) {
+                    return this.sortMode === 'lastLoginDesc' ? 1 : -1;
+                }
+                if (bAt === 0) {
+                    return this.sortMode === 'lastLoginDesc' ? -1 : 1;
+                }
+                const cmp = aAt - bAt;
+                if (cmp !== 0) {
+                    return this.sortMode === 'lastLoginDesc' ? -cmp : cmp;
+                }
+            }
+            return this.getUserSortKey(a).localeCompare(this.getUserSortKey(b), undefined, { sensitivity: 'base' });
+        });
+    }
+
+    onSortModeChange(): void {
+        this.pageIndex = 0;
+        this.sortUsers();
+        this.applyFilter();
     }
 
     async loadSystems(): Promise<void> {
@@ -194,6 +365,18 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
         // Also store groups and tags for the system selection dialog
         this.configGroups = config.groups || [];
         this.configTags = config.tags || [];
+    }
+
+    async loadApikeys(): Promise<void> {
+        try {
+            this.apikeys = await this.adminService.getApikeys();
+        } catch {
+            this.apikeys = [];
+        }
+    }
+
+    apiKeyOptionId(apikey: Apikey): number {
+        return RdioScannerAdminUsersComponent.apiKeyOptionId(apikey);
     }
 
     getTalkgroupsForSystem(systemId: number): any[] {
@@ -325,6 +508,17 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
     }
 
     openCreateUserDialog(): void {
+        if (!this.requireListenerSignIn && this.users.length === 0) {
+            const proceed = confirm(
+                'Listeners can still connect without signing in after you create this account.\n\n' +
+                'Sign-in is controlled by Options → Require listener sign-in — creating users no longer locks the scanner by itself.\n\n' +
+                'Continue creating the user?',
+            );
+            if (!proceed) {
+                return;
+            }
+        }
+
         const dialogRef = this.matDialog.open(CreateUserDialogComponent, {
             width: '500px',
             data: { groups: this.availableGroups }
@@ -399,7 +593,6 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
         }
 
         try {
-            // Build the form arrays for the dialog
             const groupsArray = this.fb.array(
                 this.configGroups.map((group: any) => this.adminService.newGroupForm(group))
             );
@@ -407,34 +600,30 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
                 this.configTags.map((tag: any) => this.adminService.newTagForm(tag))
             );
             const systemsArray = this.fb.array(
-                this.systems.map((system: any) => this.adminService.newSystemForm(system))
+                this.systems.map((system: any) => this.adminService.newSystemForm(system, true, true))
             );
 
-            // Create the root form that contains groups, tags, systems, and the access form
-            // This properly sets up the form hierarchy so accessForm.root points to rootForm
+            const currentAccess = this.parseSystemsAccess(this.editForm.get('systems')?.value);
             const rootForm = this.fb.group({
                 groups: groupsArray,
                 tags: tagsArray,
                 systems: systemsArray,
                 access: this.fb.group({
-                    systems: [this.editForm.get('systems')?.value || '*']
-                })
+                    systems: [currentAccess],
+                }),
             });
-
-            // Get the access form from the root - now it has root property set correctly
             const accessForm = rootForm.get('access') as FormGroup;
 
-            const matDialogRef = this.matDialog.open(RdioScannerAdminSystemsSelectComponent, { 
-                data: accessForm,
-                width: '90vw',
-                maxWidth: '1200px',
-                maxHeight: '90vh'
+            const matDialogRef = this.matDialog.open(RdioScannerAdminSystemsSelectComponent, {
+                ...SYSTEMS_SELECT_DIALOG_OPTIONS,
+                data: { access: accessForm, rawSystems: this.systems },
             });
 
             matDialogRef.afterClosed().subscribe((data) => {
                 if (data !== null && data !== undefined) {
                     this.editForm.get('systems')?.setValue(data);
                     this.editForm.markAsDirty();
+                    this.cdr.markForCheck();
                 }
             });
         } catch (error) {
@@ -446,8 +635,74 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
         }
     }
 
+    /** Normalize stored systems access (JSON string, array, or '*') for the picker. */
+    private parseSystemsAccess(value: any): '*' | Array<{ id: number; talkgroups: number[] | '*' }> {
+        if (value === '*' || value === '' || value == null) {
+            return '*';
+        }
+        let parsed = value;
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed || trimmed === '*') {
+                return '*';
+            }
+            try {
+                parsed = JSON.parse(trimmed);
+            } catch {
+                return '*';
+            }
+        }
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+            return '*';
+        }
+        if (typeof parsed[0] === 'number') {
+            return parsed.map((id: number) => ({ id, talkgroups: '*' as const }));
+        }
+        return parsed;
+    }
+
+    get userSystemsAccessIsAll(): boolean {
+        return this.parseSystemsAccess(this.editForm.get('systems')?.value) === '*';
+    }
+
+    get userSystemsAccessSummary(): string {
+        const access = this.parseSystemsAccess(this.editForm.get('systems')?.value);
+        if (access === '*') {
+            return 'All systems';
+        }
+        const n = access.length;
+        return n === 1 ? '1 system (custom)' : `${n} systems (custom)`;
+    }
+
     ngOnDestroy(): void {
-        // Cleanup if needed
+        if (this.listenersPollTimer) {
+            clearInterval(this.listenersPollTimer);
+            this.listenersPollTimer = null;
+        }
+    }
+
+    private async refreshListeningCounts(): Promise<void> {
+        try {
+            const snapshot = await this.adminService.getListeners();
+            const next = new Map<number, number>();
+            for (const listener of snapshot?.listeners || []) {
+                if (listener.anonymous || !listener.userId) {
+                    continue;
+                }
+                next.set(listener.userId, listener.deviceCount || listener.devices?.length || 0);
+            }
+            this.listeningDeviceCounts = next;
+            this.cdr.detectChanges();
+        } catch {
+            // Non-fatal: Users table still works without live listening chips.
+        }
+    }
+
+    listeningDeviceCount(user: User): number {
+        if (!user?.id) {
+            return 0;
+        }
+        return this.listeningDeviceCounts.get(user.id) || 0;
     }
 
     async loadUsers(forceReload: boolean = false): Promise<void> {
@@ -462,8 +717,12 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
 
         try {
             const users = await this.adminService.getAllUsers();
-            this.users = users;
-            
+            this.users = users.map((user: User) => ({
+                ...user,
+                pinExpired: this.isPinExpired(user),
+            }));
+            this.sortUsers();
+
             // Also update the parent form if it exists
             if (this.form) {
                 this.form.clear();
@@ -498,6 +757,7 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
 
         try {
             await this.adminService.deleteUser(user.id);
+            this.selectedUserIds.delete(user.id);
             this.matSnackBar.open(`User ${user.email} deleted successfully`, 'Close', {
                 duration: 3000,
                 panelClass: ['success-snackbar']
@@ -508,12 +768,121 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
             if (this.form && this.form.parent) {
                 this.form.parent.markAsDirty();
             }
-        } catch (error) {
+        } catch (error: any) {
             console.error('Failed to delete user:', error);
-            this.matSnackBar.open('Failed to delete user', 'Close', {
-                duration: 3000,
+            const msg = error?.error?.error || error?.message || 'Failed to delete user';
+            this.matSnackBar.open(msg, 'Close', {
+                duration: 4000,
                 panelClass: ['error-snackbar']
             });
+        }
+    }
+
+    async setUserSuspended(user: User, suspended: boolean): Promise<void> {
+        const action = suspended ? 'suspend' : 'unsuspend';
+        const confirmMsg = suspended
+            ? `Suspend ${user.email}? They will be unable to log in or connect until unsuspended.`
+            : `Unsuspend ${user.email}? They will regain normal access.`;
+        if (!confirm(confirmMsg)) {
+            return;
+        }
+
+        try {
+            await this.adminService.setUserSuspended(user.id, suspended);
+            this.matSnackBar.open(
+                suspended ? `Suspended ${user.email}` : `Unsuspended ${user.email}`,
+                'Close',
+                { duration: 3000, panelClass: ['success-snackbar'] },
+            );
+            await this.loadUsers(true);
+            if (this.form && this.form.parent) {
+                this.form.parent.markAsDirty();
+            }
+        } catch (error: any) {
+            console.error(`Failed to ${action} user:`, error);
+            const msg = error?.error?.error || error?.message || `Failed to ${action} user`;
+            this.matSnackBar.open(msg, 'Close', {
+                duration: 4000,
+                panelClass: ['error-snackbar']
+            });
+        }
+    }
+
+    get selectedCount(): number {
+        return this.selectedUserIds.size;
+    }
+
+    get allFilteredSelected(): boolean {
+        return this.filteredUsers.length > 0
+            && this.filteredUsers.every(u => this.selectedUserIds.has(u.id));
+    }
+
+    isUserSelected(user: User): boolean {
+        return this.selectedUserIds.has(user.id);
+    }
+
+    toggleUserSelection(user: User, checked: boolean): void {
+        if (checked) {
+            this.selectedUserIds.add(user.id);
+        } else {
+            this.selectedUserIds.delete(user.id);
+        }
+    }
+
+    toggleSelectAllFiltered(checked: boolean): void {
+        if (checked) {
+            this.filteredUsers.forEach(u => this.selectedUserIds.add(u.id));
+        } else {
+            this.filteredUsers.forEach(u => this.selectedUserIds.delete(u.id));
+        }
+    }
+
+    clearSelection(): void {
+        this.selectedUserIds.clear();
+    }
+
+    async bulkDeleteSelected(): Promise<void> {
+        const ids = Array.from(this.selectedUserIds);
+        if (ids.length === 0 || this.bulkDeleting) {
+            return;
+        }
+        if (!confirm(`Delete ${ids.length} selected user${ids.length === 1 ? '' : 's'}? This cannot be undone.`)) {
+            return;
+        }
+
+        this.bulkDeleting = true;
+        try {
+            const result = await this.adminService.bulkDeleteUsers(ids);
+            const deleted = result.deleted?.length || 0;
+            const failed = result.failed?.length || 0;
+            this.selectedUserIds.clear();
+            if (failed === 0) {
+                this.matSnackBar.open(`Deleted ${deleted} user${deleted === 1 ? '' : 's'}.`, 'Close', {
+                    duration: 4000,
+                    panelClass: ['success-snackbar']
+                });
+            } else {
+                const firstErr = result.failed[0]?.error || 'unknown error';
+                this.matSnackBar.open(
+                    `Deleted ${deleted}, failed ${failed}. ${firstErr}`,
+                    'Close',
+                    { duration: 7000, panelClass: ['error-snackbar'] }
+                );
+            }
+            await this.loadUsers(true);
+            if (this.form && this.form.parent) {
+                this.form.parent.markAsDirty();
+            }
+        } catch (error: any) {
+            console.error('Bulk delete failed:', error);
+            const msg = error?.error?.error || error?.message || 'Bulk delete failed';
+            this.matSnackBar.open(msg, 'Close', {
+                duration: 5000,
+                panelClass: ['error-snackbar']
+            });
+        } finally {
+            this.bulkDeleting = false;
+            this.cdr.detectChanges();
         }
     }
 
@@ -584,7 +953,7 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
             lastName: user.lastName,
             zipCode: user.zipCode,
             verified: user.verified,
-            systems: user.systems || '*',
+            systems: this.parseSystemsAccess(user.systems),
             delay: user.delay,
             pin: user.pin,
             pinExpiresAt: pinExpiresAtValue,
@@ -592,13 +961,24 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
             systemDelays: user.systemDelays,
             talkgroupDelays: user.talkgroupDelays,
             userGroupId: user.userGroupId || 0,
+            userGroupIds: RdioScannerAdminUsersComponent.normalizeGroupIds(user.userGroupIds, user.userGroupId),
             isGroupAdmin: user.isGroupAdmin || false,
             systemAdmin: user.systemAdmin || false,
+            publicApiEnabled: user.publicApiEnabled || false,
+            publicApiHealth: !!user.publicApiCapabilities?.health,
+            publicApiTranscripts: !!user.publicApiCapabilities?.transcripts,
+            publicApiAlertWebhooks: !!user.publicApiCapabilities?.alertWebhooks,
+            systemNoAudioAlertSystemIds: RdioScannerAdminUsersComponent.parseNoAudioAlertIds(user.systemNoAudioAlertSystems),
+            apiKeyNoAudioAlertApiKeyIds: RdioScannerAdminUsersComponent.parseNoAudioAlertIds(user.apiKeyNoAudioAlertApiKeys),
+            pushSystemNoAudioAlerts: user.pushSystemNoAudioAlerts || false,
+            pushApiKeyNoAudioAlerts: user.pushApiKeyNoAudioAlerts || false,
             forcePasswordReset: user.forcePasswordReset || false,
+            suspended: user.suspended || false,
             stripeCustomerId: user.stripeCustomerId || '',
             stripeSubscriptionId: user.stripeSubscriptionId || '',
             subscriptionStatus: user.subscriptionStatus || ''
         });
+        void this.loadPublicApiKeysForUser(user.id);
 
         // Parse system delays JSON
         this.systemDelayEntries = [];
@@ -705,9 +1085,24 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
             connectionLimit: parseNonNegativeInt(formValue.connectionLimit),
             pinExpiresAt: pinExpiresAtEpoch,
             userGroupId: parseNonNegativeInt(formValue.userGroupId),
+            userGroupIds: RdioScannerAdminUsersComponent.normalizeGroupIds(
+                formValue.userGroupIds,
+                parseNonNegativeInt(formValue.userGroupId),
+            ),
             isGroupAdmin: !!formValue.isGroupAdmin,
             systemAdmin: !!formValue.systemAdmin,
+            publicApiEnabled: !!formValue.publicApiEnabled,
+            publicApiCapabilities: {
+                health: !!formValue.publicApiHealth,
+                transcripts: !!formValue.publicApiTranscripts,
+                alertWebhooks: !!formValue.publicApiAlertWebhooks,
+            },
+            systemNoAudioAlertSystems: RdioScannerAdminUsersComponent.serializeNoAudioAlertIds(formValue.systemNoAudioAlertSystemIds),
+            apiKeyNoAudioAlertApiKeys: RdioScannerAdminUsersComponent.serializeNoAudioAlertIds(formValue.apiKeyNoAudioAlertApiKeyIds),
+            pushSystemNoAudioAlerts: !!formValue.pushSystemNoAudioAlerts,
+            pushApiKeyNoAudioAlerts: !!formValue.pushApiKeyNoAudioAlerts,
             forcePasswordReset: !!formValue.forcePasswordReset,
+            suspended: !!formValue.suspended,
             stripeCustomerId: (formValue.stripeCustomerId ?? '').toString().trim(),
             stripeSubscriptionId: (formValue.stripeSubscriptionId ?? '').toString().trim(),
             subscriptionStatus: (formValue.subscriptionStatus ?? '').toString().trim(),
@@ -727,7 +1122,28 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
             console.log('updateUser succeeded');
             await this.loadUsers(true);
 
+            // loadUsers() reports its own failure and does not throw. Don't claim
+            // success on top of a "Failed to load users" error — the save may look
+            // applied while the list on screen is stale.
+            if (this.error) {
+                return;
+            }
+
             const updatedUser = this.users.find(u => u.id === userId);
+
+            // Confirm the reloaded memberships match what we submitted before
+            // claiming success — otherwise the change silently did not persist.
+            const wanted = RdioScannerAdminUsersComponent.normalizeGroupIds(payload.userGroupIds, payload.userGroupId).slice().sort();
+            const got = RdioScannerAdminUsersComponent.normalizeGroupIds(updatedUser?.userGroupIds, updatedUser?.userGroupId).slice().sort();
+            if (JSON.stringify(wanted) !== JSON.stringify(got)) {
+                this.matSnackBar.open('User saved, but group memberships did not persist as expected. Please reload and try again.', 'Close', {
+                    duration: 6000,
+                    panelClass: ['error-snackbar']
+                });
+                this.cancelEdit();
+                this.cdr.detectChanges();
+                return;
+            }
             let message = 'User updated successfully';
             if ((this.regeneratePinRequested || (payload.pin !== undefined && payload.pin.trim() === '')) && updatedUser?.pin) {
                 message += ` – new PIN: ${updatedUser.pin}`;
@@ -802,11 +1218,21 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
         return `${limit} concurrent connection${limit === 1 ? '' : 's'}`;
     }
 
-    getGroupName(userGroupId?: number): string | null {
-        if (!userGroupId || userGroupId === 0) {
+    getGroupName(userOrGroupId?: User | number): string | null {
+        if (userOrGroupId == null) {
             return null;
         }
-        const group = this.availableGroups.find(g => g.id === userGroupId);
+        if (typeof userOrGroupId === 'object') {
+            const fromApi = (userOrGroupId.userGroupName || '').trim();
+            if (fromApi) {
+                return fromApi;
+            }
+            return this.getGroupName(userOrGroupId.userGroupId);
+        }
+        if (!userOrGroupId || userOrGroupId === 0) {
+            return null;
+        }
+        const group = this.availableGroups.find(g => g.id === userOrGroupId);
         return group ? group.name : null;
     }
 
@@ -846,7 +1272,21 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
     // Search and pagination methods
     onSearchChange(): void {
         this.pageIndex = 0; // Reset to first page when search changes
+        this.clearSelection();
         this.applyFilter();
+    }
+
+    onFiltersChange(): void {
+        this.pageIndex = 0;
+        this.clearSelection();
+        this.applyFilter();
+    }
+
+    get hasActiveFilters(): boolean {
+        return !!(this.searchText?.trim()
+            || this.groupFilter
+            || this.subscriptionFilter
+            || this.statusFilter);
     }
 
     clearSearch(): void {
@@ -854,24 +1294,122 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
         this.onSearchChange();
     }
 
-    applyFilter(): void {
-        // Filter users by name, email, or group
-        if (this.searchText && this.searchText.trim() !== '') {
-            const searchLower = this.searchText.toLowerCase();
-            this.filteredUsers = this.users.filter(user => {
-                const fullName = `${user.firstName} ${user.lastName}`.toLowerCase();
-                const email = user.email.toLowerCase();
-                const groupName = this.getGroupName(user.userGroupId)?.toLowerCase() || '';
-                
-                return fullName.includes(searchLower) || 
-                       email.includes(searchLower) || 
-                       groupName.includes(searchLower);
-            });
-        } else {
-            this.filteredUsers = [...this.users];
-        }
+    clearFilters(): void {
+        this.searchText = '';
+        this.groupFilter = '';
+        this.subscriptionFilter = '';
+        this.statusFilter = '';
+        this.onFiltersChange();
+    }
 
-        // Apply pagination
+    private matchesSubscriptionFilter(user: User): boolean {
+        const status = (user.subscriptionStatus || '').toLowerCase();
+        switch (this.subscriptionFilter) {
+            case 'active':
+                return status === 'active' || status === 'trialing';
+            case 'trialing':
+                return status === 'trialing';
+            case 'problem':
+                // Keep Problem distinct from Canceled: include incomplete billing
+                // states here; canceled users are filtered via the Canceled option.
+                return status === 'past_due' || status === 'unpaid'
+                    || status === 'incomplete' || status === 'incomplete_expired';
+            case 'canceled':
+                return status === 'canceled' || status === 'cancelled';
+            case 'none':
+                return !status;
+            default:
+                return true;
+        }
+    }
+
+    private matchesStatusFilter(user: User): boolean {
+        switch (this.statusFilter) {
+            case 'pin_expired':
+                return this.isPinExpired(user);
+            case 'account_expired':
+                return this.isAccountExpired(user);
+            case 'suspended':
+                return !!user.suspended;
+            case 'verified':
+                return !!user.verified;
+            case 'unverified':
+                return !user.verified;
+            default:
+                return true;
+        }
+    }
+
+    /** True when the listener PIN expiration timestamp is in the past. */
+    isPinExpired(user: User): boolean {
+        if (user?.pinExpired) {
+            return true;
+        }
+        const expiresAt = Number(user?.pinExpiresAt) || 0;
+        return expiresAt > 0 && Math.floor(Date.now() / 1000) > expiresAt;
+    }
+
+    /** True when the account expiration timestamp is in the past. */
+    isAccountExpired(user: User): boolean {
+        const expiresAt = Number(user?.accountExpiresAt) || 0;
+        return expiresAt > 0 && Math.floor(Date.now() / 1000) > expiresAt;
+    }
+
+    isSubscriptionOk(status: string): boolean {
+        const s = (status || '').toLowerCase();
+        return s === 'active' || s === 'trialing';
+    }
+
+    isSubscriptionProblem(status: string): boolean {
+        const s = (status || '').toLowerCase();
+        return s === 'past_due' || s === 'unpaid'
+            || s === 'canceled' || s === 'cancelled'
+            || s === 'incomplete_expired';
+    }
+
+    isSubscriptionWarn(status: string): boolean {
+        const s = (status || '').toLowerCase();
+        return s === 'incomplete' || s === 'paused';
+    }
+
+    formatSubscriptionStatus(status: string): string {
+        const s = (status || '').trim();
+        if (!s) {
+            return '';
+        }
+        return s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+
+    private matchesGroupFilter(user: User): boolean {
+        if (!this.groupFilter) {
+            return true;
+        }
+        if (this.groupFilter === 'none') {
+            return !user.userGroupId;
+        }
+        return user.userGroupId === Number(this.groupFilter);
+    }
+
+    applyFilter(): void {
+        const searchLower = this.searchText?.trim().toLowerCase() || '';
+
+        this.filteredUsers = this.users.filter(user => {
+            if (searchLower) {
+                const fullName = `${user.firstName} ${user.lastName}`.toLowerCase();
+                const email = (user.email || '').toLowerCase();
+                const groupName = this.getGroupName(user)?.toLowerCase() || '';
+                if (!fullName.includes(searchLower)
+                    && !email.includes(searchLower)
+                    && !groupName.includes(searchLower)) {
+                    return false;
+                }
+            }
+
+            return this.matchesGroupFilter(user)
+                && this.matchesSubscriptionFilter(user)
+                && this.matchesStatusFilter(user);
+        });
+
         this.updatePaginatedUsers();
     }
 
@@ -931,5 +1469,51 @@ export class RdioScannerAdminUsersComponent implements OnInit, OnDestroy, OnChan
                 });
             }
         });
+    }
+
+    async loadPublicApiKeysForUser(userId: number): Promise<void> {
+        this.publicApiKeysLoading = true;
+        this.publicApiKeysForEdit = [];
+        try {
+            const keys = await this.adminService.listPublicApiKeys();
+            this.publicApiKeysForEdit = (keys || [])
+                .filter((k: any) => Number(k.userId) === Number(userId))
+                .map((k: any) => ({
+                    id: Number(k.id),
+                    name: k.name || '',
+                    keyPrefix: k.keyPrefix || '',
+                    lastUsedAt: Number(k.lastUsedAt) || 0,
+                    requestCount: Number(k.requestCount) || 0,
+                    disabled: !!k.disabled,
+                }));
+        } catch (err) {
+            console.error('Failed to load public API keys', err);
+        } finally {
+            this.publicApiKeysLoading = false;
+            this.cdr.detectChanges();
+        }
+    }
+
+    async disablePublicApiKey(keyId: number): Promise<void> {
+        if (!confirm('Disable this public API key? The user will need to mint a new one.')) {
+            return;
+        }
+        try {
+            await this.adminService.disablePublicApiKey(keyId);
+            this.matSnackBar.open('API key disabled', 'Close', { duration: 3000 });
+            if (this.editingUser) {
+                await this.loadPublicApiKeysForUser(this.editingUser.id);
+            }
+        } catch (err: any) {
+            this.matSnackBar.open(err?.error?.error || 'Failed to disable key', 'Close', { duration: 5000 });
+        }
+    }
+
+    formatPublicApiLastUsed(ts: number): string {
+        if (!ts || ts <= 0) {
+            return 'Never';
+        }
+        const ms = ts > 1e12 ? ts : ts * 1000;
+        return new Date(ms).toLocaleString();
     }
 }

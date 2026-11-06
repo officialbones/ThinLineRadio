@@ -17,52 +17,419 @@
  * ****************************************************************************
  */
 
-import { Component, Input, Output, EventEmitter, OnInit, OnDestroy, OnChanges, SimpleChanges, AfterViewInit, ChangeDetectorRef, ChangeDetectionStrategy } from '@angular/core';
-import { FormGroup, FormArray, Validators } from '@angular/forms';
+import { Component, Input, OnInit, OnDestroy, OnChanges, SimpleChanges, AfterViewInit, ChangeDetectorRef, ChangeDetectionStrategy, HostListener } from '@angular/core';
+import { FormGroup, FormArray, Validators, FormBuilder } from '@angular/forms';
 import { Subscription } from 'rxjs';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatDialog } from '@angular/material/dialog';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { RequestAPIKeyDialogComponent } from './request-api-key-dialog.component';
 import { RecoverAPIKeyDialogComponent } from './recover-api-key-dialog.component';
+import { RelayAccountDialogComponent } from './relay-account-dialog.component';
+import { ServerPathBrowseDialogComponent, ServerPathBrowseDialogResult } from './server-path-browse-dialog.component';
 import { LocationDataService } from 'src/app/services/location-data.service';
+import { OPENAI_CHAT_MODEL_OPTIONS, OpenAIChatModelOption, RELAY_SERVER_URL, RdioScannerAdminService } from '../../admin.service';
+import { MappingBoundaryStats, US_STATE_FIPS_OPTIONS } from '../../../mapping/mapping.types';
+import { TranscriptConfig } from '../transcript-parser/transcript-parser.types';
+import { DEFAULT_UI_ACCENT, UI_ACCENT_PRESETS, normalizeUIAccentColor } from '../../../app-accent.util';
+
+export type OptionsPanelId =
+    | 'alerts' | 'security' | 'branding' | 'notifications'
+    | 'thinlineServices' | 'integrations' | 'general' | 'stripe' | 'transcription' | 'userRegistration' | 'mapping';
+
+/** Nav chips include Call Natures / Keyword Lists (not standard options save payloads). */
+export type OptionsNavId = OptionsPanelId | 'callNatures' | 'keywordLists';
+
+interface OptionsNavItem {
+    id: OptionsNavId;
+    label: string;
+    icon: string;
+    description: string;
+}
+
+interface OptionsSubNavItem {
+    id: string;
+    label: string;
+}
+interface OptionsPanelDef {
+    keys: string[];
+    systemsNoAudio?: boolean;
+    systemsRetention?: boolean;
+    systemsDuplicateDetection?: boolean;
+    /** Track/save transcriptionConfig.geminiAPIKey without owning full transcription config. */
+    sharedGeminiApiKey?: boolean;
+}
+
+interface RelayBillingPlanRow {
+    slug: string;
+    name: string;
+    description: string;
+    price_label: string;
+    status: string;
+    subscribed: boolean;
+    billable: boolean;
+    /** Push is covered by an active Geocoding and Push subscription. */
+    includedWithGeocoding?: boolean;
+    /** Admin override — ads stay off, paid checkout is still offered. */
+    complimentary?: boolean;
+    /** AlertPage / Ohio RSN — complimentary forever, no checkout. */
+    houseLocked?: boolean;
+    convertNotice?: string;
+}
+
+interface RelayBillingCatalogResponse {
+    plans?: Array<{
+        slug?: string;
+        name?: string;
+        description?: string;
+        price_label?: string;
+        stripe_price_id?: string;
+        active?: boolean;
+    }>;
+    entitlements?: Array<{
+        plan_slug?: string;
+        status?: string;
+        source?: string;
+    }>;
+    push_plan_enforcement?: {
+        date?: string;
+        active?: boolean;
+        notice?: string;
+    };
+    ad_free_convert?: {
+        house_locked?: boolean;
+        convert_by?: string;
+        notice?: string;
+    };
+    error?: string;
+}
+
+const DEFAULT_RELAY_PUSH_ENFORCEMENT_NOTICE =
+    'Push notification subscriptions will start being enforced on August 20, 2026. Subscribe to Push Notifications or Geocoding and Push before then to keep mobile push working for this server.';
+
+const OPTIONS_PANEL_DEFS: Record<OptionsPanelId, OptionsPanelDef> = {
+    alerts: {
+        keys: [
+            'alertRetentionDays', 'systemHealthAlertsEnabled',
+            'transcriptionFailureAlertsEnabled', 'transcriptionFailureThreshold',
+            'transcriptionFailureTimeWindow', 'transcriptionFailureRepeatMinutes',
+            'toneDetectionAlertsEnabled', 'toneDetectionIssueThreshold',
+            'toneDetectionTimeWindow', 'toneDetectionRepeatMinutes',
+            'autoLearnToneSetConfig',
+            'noAudioAlertsEnabled', 'noAudioThresholdMinutes', 'noAudioRepeatMinutes',
+        ],
+        systemsNoAudio: true,
+    },
+    security: {
+        keys: [
+            'audioConversion', 'disableDuplicateDetection', 'duplicateTimestampWindow',
+            'duplicateRadioTimestampWindow', 'duplicateDetectionTimeFrame', 'audioEncryptionEnabled', 'rateLimitingEnabled',
+            'maxDownloadsPerWindow', 'downloadWindowMinutes',
+        ],
+        systemsDuplicateDetection: true,
+    },
+    branding: {
+        keys: ['branding', 'uiAccentColor', 'baseUrl', 'email', 'emailLogoBorderRadius', 'faviconFilename', 'emailLogoFilename'],
+    },
+    notifications: {
+        keys: [
+            'emailServiceEnabled', 'emailProvider', 'emailSendGridApiKey',
+            'emailMailgunApiKey', 'emailMailgunDomain', 'emailMailgunApiBase',
+            'emailSmtpHost', 'emailSmtpPort', 'emailSmtpUsername', 'emailSmtpPassword',
+            'emailSmtpUseTLS', 'emailSmtpSkipVerify', 'emailSmtpFromEmail', 'emailSmtpFromName',
+        ],
+    },
+    thinlineServices: {
+        keys: ['relayServerAPIKey'],
+    },
+    integrations: {
+        keys: [
+            'openAIIntegration',
+        ],
+        sharedGeminiApiKey: true,
+    },
+    general: {
+        keys: [
+            'time12hFormat', 'autoPopulate', 'defaultSystemDelay', 'playbackGoesLive',
+            'keypadBeeps', 'maxClients', 'pruneDays', 'pruneTime', 'timeZone', 'showListenersCount', 'sortTalkgroups',
+            'reconnectionGracePeriod', 'reconnectionMaxBufferSize', 'configSyncEnabled', 'configSyncPath', 'configSyncFileName',
+        ],
+        systemsRetention: true,
+    },
+    stripe: {
+        keys: [
+            'stripePaywallEnabled', 'stripePublishableKey', 'stripeSecretKey',
+            'stripeWebhookSecret', 'stripeBillingPortalConfigurationId', 'stripeGracePeriodDays',
+        ],
+    },
+    transcription: {
+        keys: ['transcriptionEnabled', 'transcriptionConfig'],
+    },
+    userRegistration: {
+        keys: [
+            'requireListenerSignIn', 'userRegistrationEnabled', 'publicRegistrationEnabled', 'publicRegistrationMode',
+            'emailVerificationRequired', 'turnstileEnabled', 'turnstileSiteKey', 'turnstileSecretKey',
+        ],
+    },
+    mapping: {
+        keys: [],
+    },
+};
+
+const OPTIONS_PANEL_LABELS: Record<OptionsPanelId, string> = {
+    alerts: 'Alert & Health Monitoring',
+    security: 'Audio Settings',
+    branding: 'Branding',
+    notifications: 'Email',
+    thinlineServices: 'Thinline Radio Services',
+    integrations: 'External Integrations',
+    general: 'General Settings',
+    stripe: 'Stripe Payments',
+    transcription: 'Transcription Settings',
+    userRegistration: 'User Registration',
+    mapping: 'Incident Mapping',
+};
+
+const OPTIONS_NAV: OptionsNavItem[] = [
+    { id: 'alerts', label: 'Alerts', icon: 'notifications_active', description: 'System health alerts, transcription failures, tone detection, no audio monitoring' },
+    { id: 'security', label: 'Audio', icon: 'graphic_eq', description: 'Audio conversion, encryption, duplicate detection, download rate limits' },
+    { id: 'branding', label: 'Branding', icon: 'palette', description: 'App name, accent color, logos, favicon, support email, public base URL' },
+    { id: 'notifications', label: 'Email', icon: 'email', description: 'Outbound email provider, SMTP/SendGrid/Mailgun, delivery settings' },
+    { id: 'thinlineServices', label: 'Thinline Services', icon: 'cloud', description: 'Relay API key, account status, push billing, suspension controls' },
+    { id: 'integrations', label: 'Integrations', icon: 'extension', description: 'OpenAI, Gemini, and other external service credentials' },
+    { id: 'general', label: 'General', icon: 'settings', description: 'Listener counts, pruning, time zones, and other server-wide options' },
+    { id: 'stripe', label: 'Stripe', icon: 'payments', description: 'Stripe keys, webhooks, and subscription payment settings' },
+    { id: 'transcription', label: 'Transcription', icon: 'record_voice_over', description: 'Transcription engine, models, processing options, and transcript parser' },
+    { id: 'userRegistration', label: 'Registration', icon: 'person_add', description: 'Public signup, invite codes, and registration controls' },
+    { id: 'mapping', label: 'Mapping', icon: 'map', description: 'Geocoding providers, API keys, boundaries, and incident map options' },
+    { id: 'callNatures', label: 'Call Natures', icon: 'category', description: 'Incident categories, phrase matching, and OpenAI classification' },
+    { id: 'keywordLists', label: 'Keyword Lists', icon: 'format_list_bulleted', description: 'Keyword lists for real-time transcript alerting' },
+];
+
+/** Secondary chips for dense top-level tabs only. */
+const OPTIONS_SUB_NAV: Partial<Record<OptionsNavId, OptionsSubNavItem[]>> = {
+    alerts: [
+        { id: 'health', label: 'Retention & health' },
+        { id: 'transcriptionFailures', label: 'Transcription failures' },
+        { id: 'tone', label: 'Tone detection' },
+        { id: 'noAudio', label: 'No audio' },
+    ],
+    transcription: [
+        { id: 'provider', label: 'Provider' },
+        { id: 'processing', label: 'Processing' },
+        { id: 'quality', label: 'Quality' },
+        { id: 'parser', label: 'Parser' },
+    ],
+    notifications: [
+        { id: 'provider', label: 'Provider' },
+        { id: 'credentials', label: 'Credentials' },
+    ],
+    general: [
+        { id: 'display', label: 'Display' },
+        { id: 'clients', label: 'Clients & pruning' },
+        { id: 'sync', label: 'Config sync' },
+    ],
+};
+
+const OPTIONS_FIELD_LABELS: Record<string, string> = {
+    alertRetentionDays: 'Alert retention days',
+    systemHealthAlertsEnabled: 'System health alerts',
+    transcriptionFailureAlertsEnabled: 'Transcription failure alerts',
+    transcriptionFailureThreshold: 'Transcription failure threshold',
+    transcriptionFailureTimeWindow: 'Transcription failure time window',
+    transcriptionFailureRepeatMinutes: 'Transcription failure repeat interval',
+    toneDetectionAlertsEnabled: 'Tone detection alerts',
+    toneDetectionIssueThreshold: 'Tone detection issue threshold',
+    toneDetectionTimeWindow: 'Tone detection time window',
+    toneDetectionRepeatMinutes: 'Tone detection repeat interval',
+    'autoLearnToneSetConfig.aToneMinDuration': 'A-tone min duration',
+    'autoLearnToneSetConfig.aToneMaxDuration': 'A-tone max duration',
+    'autoLearnToneSetConfig.bToneMinDuration': 'B-tone min duration',
+    'autoLearnToneSetConfig.bToneMaxDuration': 'B-tone max duration',
+    'autoLearnToneSetConfig.longToneMinDuration': 'Long-tone min duration',
+    'autoLearnToneSetConfig.longToneMaxDuration': 'Long-tone max duration',
+    'autoLearnToneSetConfig.callsRequired': 'Calls required',
+    'autoLearnToneSetConfig.frequencyToleranceHz': 'Frequency tolerance (Hz)',
+    noAudioAlertsEnabled: 'No-audio alerts',
+    noAudioThresholdMinutes: 'No-audio threshold (minutes)',
+    noAudioRepeatMinutes: 'No-audio repeat interval',
+    audioConversion: 'Audio conversion',
+    disableDuplicateDetection: 'Disable duplicate detection',
+    duplicateTimestampWindow: 'Duplicate arrival match window',
+    duplicateRadioTimestampWindow: 'Duplicate radio timestamp match window',
+    duplicateDetectionTimeFrame: 'Duplicate cache retention',
+    audioEncryptionEnabled: 'Audio encryption',
+    rateLimitingEnabled: 'Download rate limiting',
+    maxDownloadsPerWindow: 'Max downloads per window',
+    downloadWindowMinutes: 'Download window (minutes)',
+    branding: 'Branding label',
+    uiAccentColor: 'UI accent color',
+    baseUrl: 'Base URL',
+    email: 'Support email',
+    emailLogoBorderRadius: 'Logo border radius',
+    faviconFilename: 'Favicon',
+    emailLogoFilename: 'Server logo',
+    emailServiceEnabled: 'Email service',
+    emailProvider: 'Email provider',
+    emailSendGridApiKey: 'SendGrid API key',
+    emailMailgunApiKey: 'Mailgun API key',
+    emailMailgunDomain: 'Mailgun domain',
+    emailMailgunApiBase: 'Mailgun API base',
+    emailSmtpHost: 'SMTP host',
+    emailSmtpPort: 'SMTP port',
+    emailSmtpUsername: 'SMTP username',
+    emailSmtpPassword: 'SMTP password',
+    emailSmtpUseTLS: 'SMTP TLS',
+    emailSmtpSkipVerify: 'SMTP skip certificate verify',
+    emailSmtpFromEmail: 'From email address',
+    emailSmtpFromName: 'From name',
+    'openAIIntegration.baseUrl': 'OpenAI API base URL',
+    'openAIIntegration.apiKey': 'OpenAI API key',
+    'openAIIntegration.model': 'OpenAI chat model',
+    radioReferenceEnabled: 'Radio Reference integration',
+    radioReferenceUsername: 'Radio Reference username',
+    radioReferencePassword: 'Radio Reference password',
+    relayServerAPIKey: 'Relay server API key',
+    time12hFormat: '12-hour time format',
+    autoPopulate: 'Auto-populate',
+    defaultSystemDelay: 'Default system delay',
+    playbackGoesLive: 'Playback goes live',
+    keypadBeeps: 'Keypad beeps',
+    maxClients: 'Max clients',
+    pruneDays: 'Prune days',
+    pruneTime: 'Prune time',
+    timeZone: 'Time zone',
+    showListenersCount: 'Show listeners count',
+    sortTalkgroups: 'Sort talkgroups',
+    reconnectionGracePeriod: 'Reconnection grace period',
+    reconnectionMaxBufferSize: 'Reconnection max buffer size',
+    configSyncEnabled: 'Config sync',
+    configSyncPath: 'Config sync path',
+    configSyncFileName: 'Config sync file name',
+    stripePaywallEnabled: 'Stripe paywall',
+    stripePublishableKey: 'Stripe publishable key',
+    stripeSecretKey: 'Stripe secret key',
+    stripeWebhookSecret: 'Stripe webhook secret',
+    stripeBillingPortalConfigurationId: 'Stripe billing portal configuration ID',
+    stripeGracePeriodDays: 'Stripe grace period (days)',
+    transcriptionEnabled: 'Transcription enabled',
+    'transcriptionConfig.transcribeAllCalls': 'Transcribe all calls',
+    'transcriptionConfig.provider': 'Transcription provider',
+    'transcriptionConfig.backupProvider': 'Backup transcription provider',
+    'transcriptionConfig.whisperAPIURL': 'Whisper API URL',
+    'transcriptionConfig.whisperAPIKey': 'Whisper API key',
+    'transcriptionConfig.whisperAPIModel': 'Whisper model',
+    'transcriptionConfig.azureKey': 'Azure key',
+    'transcriptionConfig.azureRegion': 'Azure region',
+    'transcriptionConfig.googleAPIKey': 'Google API key',
+    'transcriptionConfig.googleCredentials': 'Google credentials',
+    'transcriptionConfig.geminiAPIKey': 'Gemini API key',
+    'transcriptionConfig.geminiModel': 'Gemini model',
+    'transcriptionConfig.assemblyAIKey': 'AssemblyAI key',
+    'transcriptionConfig.assemblyAISpeechModel': 'AssemblyAI speech model',
+    'transcriptionConfig.assemblyAIWordBoost': 'AssemblyAI word boost',
+    'transcriptionConfig.cloudflareAccountID': 'Cloudflare account ID',
+    'transcriptionConfig.cloudflareAPIToken': 'Cloudflare API token',
+    'transcriptionConfig.cloudflareModel': 'Cloudflare model',
+    'transcriptionConfig.language': 'Transcription language',
+    'transcriptionConfig.prompt': 'Transcription prompt',
+    'transcriptionConfig.timeoutSeconds': 'Transcription timeout',
+    'transcriptionConfig.minCallDuration': 'Minimum call duration',
+    'transcriptionConfig.workerPoolSize': 'Worker pool size',
+    'transcriptionConfig.hallucinationPatterns': 'Hallucination removal patterns',
+    'transcriptionConfig.hallucinationDetectionMode': 'Hallucination detection mode',
+    'transcriptionConfig.hallucinationMinOccurrences': 'Hallucination min occurrences',
+    'transcriptionConfig.hallucinationConfidenceThreshold': 'Hallucination confidence threshold',
+    'transcriptionConfig.profanityFilterEnabled': 'Profanity filter',
+    'transcriptionConfig.profanityFilterExtraWords': 'Extra blocked words',
+    requireListenerSignIn: 'Require listener sign-in',
+    userRegistrationEnabled: 'User registration',
+    publicRegistrationEnabled: 'Public registration',
+    publicRegistrationMode: 'Public registration mode',
+    emailVerificationRequired: 'Email verification required',
+    turnstileEnabled: 'Cloudflare Turnstile',
+    turnstileSiteKey: 'Turnstile site key',
+    turnstileSecretKey: 'Turnstile secret key',
+};
+
+export interface UnsavedPanelChanges {
+    panelId: OptionsPanelId;
+    panelLabel: string;
+    fields: string[];
+}
 
 @Component({
     selector: 'rdio-scanner-admin-options',
     templateUrl: './options.component.html',
+    styleUrls: ['./options.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, OnDestroy, OnChanges {
     @Input() form: FormGroup | undefined;
     @Input() systemsForm: FormArray | undefined;
-    @Output() saveRequested = new EventEmitter<void>();
-    private radioReferenceSubscription?: Subscription;
+    /** Transcript parser word lists / shorthand config (saved separately from options form). */
+    @Input() transcriptParserConfig: TranscriptConfig | null | undefined;
+    /** Keyword lists for transcript alerting (saved via their own API). */
+    @Input() keywordLists: any[] | null | undefined;
+    private formChangeSubscription?: Subscription;
+    private systemsChangeSubscription?: Subscription;
     private initialLoadComplete = false;
-    public isEditingRadioReference = false;
+    private panelBaselines: Partial<Record<OptionsPanelId, string>> = {};
     panelsReady = false;
-    private originalRadioReferenceUsername = '';
-    private originalRadioReferencePassword = '';
+    activePanel: OptionsNavId = 'alerts';
+    activeSubPanel: string | null = OPTIONS_SUB_NAV.alerts?.[0]?.id ?? null;
+    readonly optionsNav = OPTIONS_NAV;
+    readonly optionsSubNav = OPTIONS_SUB_NAV;
     faviconUrl: string = '';
     window = window;
-    
-    // Expansion panel state - all collapsed by default
-    generalExpanded = false;
-    brandingExpanded = false;
-    transcriptionExpanded = false;
-    alertsExpanded = false;
-    emailExpanded = false;
-    notificationsExpanded = false;
-    userRegistrationExpanded = false;
-    stripeExpanded = false;
-    integrationsExpanded = false;
-    securityExpanded = false;
-    
+
     // Central Management Integration
     centralConnectionStatus: 'success' | 'error' | null = null;
     centralConnectionMessage: string = '';
     showExternalAPIKey: boolean = false;
+    readonly openAIChatModels = OPENAI_CHAT_MODEL_OPTIONS;
+    readonly uiAccentPresets = UI_ACCENT_PRESETS;
+    readonly defaultUiAccent = DEFAULT_UI_ACCENT;
+
+    get selectedOpenAIModel(): OpenAIChatModelOption | undefined {
+        const id = this.form?.get('openAIIntegration')?.get('model')?.value || 'gpt-5.4-mini';
+        return this.openAIChatModels.find(m => m.id === id) || this.openAIChatModels[0];
+    }
+
+    get selectedMappingOpenAIModel(): OpenAIChatModelOption | undefined {
+        const override = this.mappingForm?.get('openAIModel')?.value;
+        const id = override || this.form?.get('openAIIntegration')?.get('model')?.value || 'gpt-5.4-mini';
+        return this.openAIChatModels.find(m => m.id === id) || this.openAIChatModels[0];
+    }
+
+    get mappingUsesDefaultOpenAIModel(): boolean {
+        return !this.mappingForm?.get('openAIModel')?.value;
+    }
 
     get isCentrallyManaged(): boolean {
         return this.form?.get('centralManagementEnabled')?.value === true;
+    }
+
+    get uiAccentColorValue(): string {
+        return normalizeUIAccentColor(this.form?.get('uiAccentColor')?.value);
+    }
+
+    setUiAccentColor(value: string): void {
+        this.form?.get('uiAccentColor')?.setValue(normalizeUIAccentColor(value));
+        this.form?.get('uiAccentColor')?.markAsDirty();
+    }
+
+    onUiAccentPickerInput(event: Event): void {
+        const value = (event.target as HTMLInputElement | null)?.value;
+        if (value) {
+            this.setUiAccentColor(value);
+        }
+    }
+
+    onUiAccentHexBlur(event: Event): void {
+        const value = (event.target as HTMLInputElement | null)?.value;
+        this.setUiAccentColor(value || this.defaultUiAccent);
     }
 
     /** Populated from GET /api/admin/relay-suspension when relay has fully suspended this scanner. */
@@ -79,51 +446,978 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
         return !!s && s.fully_suspended === true && s.push_notifications_blocked === true;
     }
 
+    /** Populated from GET /api/admin/relay-account/status — sign-in + legacy nominatim status. */
+    relayAccountStatus: {
+        username: string;
+        signedIn: boolean;
+        lastError: string;
+        nominatimSubscriptionStatus: string;
+    } | null = null;
+    relayAccountBusy = false;
+
+    relayBillingPlanRows: RelayBillingPlanRow[] = [];
+    relayBillingLoading = false;
+    relayBillingError = '';
+    relayPlanSubscribingSlug = '';
+    /** Public portal for subscribe / manage billing after relay sign-in. */
+    readonly relayPortalURL = RELAY_SERVER_URL;
+    relayPushEnforcementNotice = DEFAULT_RELAY_PUSH_ENFORCEMENT_NOTICE;
+
+    private relayBillingPollTimer: ReturnType<typeof setInterval> | null = null;
+    private relayBillingWatchTimer: ReturnType<typeof setInterval> | null = null;
+    private previousSubscribedSlugs = new Set<string>();
+    private relayBillingBaselineReady = false;
+
     constructor(
         private snackBar: MatSnackBar,
         private dialog: MatDialog,
         private locationService: LocationDataService,
         private http: HttpClient,
-        private cdr: ChangeDetectorRef
+        private cdr: ChangeDetectorRef,
+        private adminService: RdioScannerAdminService,
+        private formBuilder: FormBuilder,
     ) {}
+
+    /** Per-panel save state for inline feedback. */
+    savingPanel: OptionsPanelId | null = null;
+
+    mappingForm!: FormGroup;
+    mappingBaseline = '';
+    savingMapping = false;
+
+    readonly usStateOptions = US_STATE_FIPS_OPTIONS;
+    boundaryImportStates: string[] = ['39'];
+    boundaryImportLayers = { county: true, place: true, cousub: true };
+    boundaryReplaceExisting = true;
+    boundaryImporting = false;
+    boundaryImportProgress = '';
+    boundaryImportPercent = 0;
+    boundaryImportError = '';
+    boundaryImportResult = '';
+    boundaryStats: MappingBoundaryStats | null = null;
+
+    /** Payload for mapping config API — omit UI-only helper fields. */
+    private mappingConfigPayload(): Record<string, unknown> {
+        return { ...(this.mappingForm?.getRawValue() || {}) };
+    }
+
+    async refreshBoundaryStats(): Promise<void> {
+        try {
+            this.boundaryStats = await this.adminService.getBoundaryStats();
+        } catch {
+            this.boundaryStats = null;
+        }
+        this.cdr.markForCheck();
+    }
+
+    selectedBoundaryImportLayers(): string[] {
+        const layers: string[] = [];
+        if (this.boundaryImportLayers.county) {
+            layers.push('county');
+        }
+        if (this.boundaryImportLayers.place) {
+            layers.push('place');
+        }
+        if (this.boundaryImportLayers.cousub) {
+            layers.push('cousub');
+        }
+        return layers;
+    }
+
+    async importBoundaries(): Promise<void> {
+        const stateFips = this.boundaryImportStates.filter((s) => !!s);
+        const layers = this.selectedBoundaryImportLayers();
+        if (!stateFips.length) {
+            this.boundaryImportError = 'Select at least one state.';
+            this.boundaryImportResult = '';
+            return;
+        }
+        if (!layers.length) {
+            this.boundaryImportError = 'Select at least one boundary layer.';
+            this.boundaryImportResult = '';
+            return;
+        }
+        this.boundaryImporting = true;
+        this.boundaryImportError = '';
+        this.boundaryImportResult = '';
+        this.boundaryImportProgress = 'Starting…';
+        this.boundaryImportPercent = 0;
+        this.cdr.markForCheck();
+        try {
+            await this.adminService.startBoundaryImport({
+                stateFips,
+                layers,
+                replaceExisting: this.boundaryReplaceExisting,
+            });
+            await this.pollBoundaryImport();
+        } catch (err: any) {
+            this.boundaryImportError =
+                err?.error?.error || err?.message || 'Boundary import failed to start.';
+        } finally {
+            this.boundaryImporting = false;
+            this.cdr.markForCheck();
+        }
+    }
+
+    private async pollBoundaryImport(): Promise<void> {
+        for (;;) {
+            const status = await this.adminService.getBoundaryImportStatus();
+            this.boundaryImportPercent = status.percent || 0;
+            this.boundaryImportProgress = status.message || status.phase || '';
+            if (status.error) {
+                this.boundaryImportError = status.error;
+                break;
+            }
+            if (status.done) {
+                const n = status.counts?.['features'] ?? 0;
+                this.boundaryImportResult = status.message || `Imported ${n} boundaries.`;
+                await this.refreshBoundaryStats();
+                break;
+            }
+            this.cdr.markForCheck();
+            await new Promise((r) => setTimeout(r, 800));
+        }
+    }
+
+    async clearBoundaries(): Promise<void> {
+        if (!confirm('Remove all downloaded map boundaries from this server?')) {
+            return;
+        }
+        try {
+            await this.adminService.deleteAllBoundaries();
+            this.boundaryImportResult = 'All boundaries removed.';
+            this.boundaryImportError = '';
+            await this.refreshBoundaryStats();
+        } catch (err: any) {
+            this.boundaryImportError = err?.error?.error || err?.message || 'Failed to clear boundaries.';
+        }
+        this.cdr.markForCheck();
+    }
+
+    isPanelDirty(panelId: OptionsPanelId): boolean {
+        if (panelId === 'mapping') {
+            return this.isMappingDirty;
+        }
+        const baseline = this.panelBaselines[panelId];
+        if (!baseline || !this.form) {
+            return false;
+        }
+
+        return JSON.stringify(this.snapshotPanel(panelId)) !== baseline;
+    }
+
+    get hasUnsavedChanges(): boolean {
+        return this.unsavedChanges.length > 0 || this.isMappingDirty;
+    }
+
+    get isMappingDirty(): boolean {
+        if (!this.mappingForm) {
+            return false;
+        }
+        return JSON.stringify(this.mappingForm.getRawValue()) !== this.mappingBaseline;
+    }
+
+    get unsavedChanges(): UnsavedPanelChanges[] {
+        if (!this.form || !this.initialLoadComplete) {
+            return [];
+        }
+
+        const groups: UnsavedPanelChanges[] = [];
+        (Object.keys(OPTIONS_PANEL_DEFS) as OptionsPanelId[]).forEach((panelId) => {
+            const fields = this.getPanelFieldChanges(panelId);
+            if (fields.length) {
+                groups.push({
+                    panelId,
+                    panelLabel: OPTIONS_PANEL_LABELS[panelId],
+                    fields,
+                });
+            }
+        });
+
+        if (this.isMappingDirty) {
+            groups.push({
+                panelId: 'mapping',
+                panelLabel: OPTIONS_PANEL_LABELS.mapping,
+                fields: ['Incident mapping settings'],
+            });
+        }
+
+        return groups;
+    }
+
+    async loadMappingConfig(): Promise<void> {
+        if (!this.mappingForm) {
+            return;
+        }
+        try {
+            const cfg = await this.adminService.getMappingConfig();
+            this.mappingForm.patchValue({
+                incidentMappingEnabled: cfg.incidentMappingEnabled ?? false,
+                geocodeCacheMaxAgeDays: cfg.geocodeCacheMaxAgeDays ?? 30,
+                autoLearnKnownPlaces: cfg.autoLearnKnownPlaces ?? false,
+                openAIModel: cfg.openAIModel || '',
+                mapBoundariesEnabled: cfg.mapBoundariesEnabled ?? false,
+                mapBoundaryLayers: cfg.mapBoundaryLayers?.length ? cfg.mapBoundaryLayers : ['county'],
+                callNatureOpenAIClassify: cfg.callNatureOpenAIClassify ?? true,
+                callNaturePhraseLearn: cfg.callNaturePhraseLearn ?? false,
+                callNaturePhraseLearnMinSightings: cfg.callNaturePhraseLearnMinSightings || 3,
+                suppressUnknownNaturePins: cfg.suppressUnknownNaturePins ?? false,
+                sendLocationContext: cfg.sendLocationContext ?? false,
+            }, { emitEvent: false });
+            this.mappingBaseline = JSON.stringify(this.mappingForm.getRawValue());
+            this.refreshPanelBaseline('mapping');
+            this.setupMappingToggleAutoSave();
+            this.cdr.markForCheck();
+        } catch {
+            // mapping config may be unavailable before first save
+        }
+    }
+
+    async saveMappingPanel(): Promise<void> {
+        if (!this.mappingForm || !this.isMappingDirty) {
+            return;
+        }
+        this.savingMapping = true;
+        this.cdr.markForCheck();
+        try {
+            await this.adminService.saveMappingConfig(this.mappingConfigPayload() as any);
+            this.mappingBaseline = JSON.stringify(this.mappingForm.getRawValue());
+            this.refreshPanelBaseline('mapping');
+            this.snackBar.open('Incident Mapping saved', 'Close', { duration: 1500 });
+        } catch {
+            this.snackBar.open('Failed to save incident mapping', 'Close', { duration: 4000 });
+        } finally {
+            this.savingMapping = false;
+            this.cdr.markForCheck();
+        }
+    }
+
+    goToUnsavedPanel(panelId: OptionsPanelId): void {
+        this.setActivePanel(panelId);
+    }
+
+    setActivePanel(id: OptionsNavId): void {
+        this.activePanel = id;
+        const subs = this.subNavFor(id);
+        this.activeSubPanel = subs[0]?.id ?? null;
+        this.cdr.markForCheck();
+        setTimeout(() => {
+            const el = document.getElementById('opt-panel-' + id);
+            if (el) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }, 40);
+    }
+
+    setActiveSubPanel(id: string): void {
+        this.activeSubPanel = id;
+        this.cdr.markForCheck();
+    }
+
+    subNavFor(id: OptionsNavId): OptionsSubNavItem[] {
+        return this.optionsSubNav[id] ?? [];
+    }
+
+    isNavDirty(id: OptionsNavId): boolean {
+        if (id === 'callNatures') {
+            return this.isMappingDirty;
+        }
+        if (id === 'keywordLists') {
+            return false;
+        }
+        return this.isPanelDirty(id as OptionsPanelId);
+    }
+
+    panelTitle(id: OptionsNavId): string {
+        if (id === 'callNatures') {
+            return 'Call Natures';
+        }
+        if (id === 'keywordLists') {
+            return 'Keyword Lists';
+        }
+        if (id in OPTIONS_PANEL_LABELS) {
+            return OPTIONS_PANEL_LABELS[id as OptionsPanelId];
+        }
+        return this.optionsNav.find((n) => n.id === id)?.label || id;
+    }
+
+    panelDescription(id: OptionsNavId): string {
+        return this.optionsNav.find((n) => n.id === id)?.description || '';
+    }
+
+    /**
+     * Save one options section. Only sends keys belonging to that panel; toggles in
+     * other sections are unaffected. Per-system no-audio overrides save separately.
+     */
+    async savePanel(panelId: OptionsPanelId): Promise<void> {
+        if (panelId === 'mapping') {
+            await this.saveMappingPanel();
+            return;
+        }
+        if (!this.form || !this.isPanelDirty(panelId)) {
+            return;
+        }
+
+        if (panelId === 'userRegistration' && this.form.get('turnstileEnabled')?.value) {
+            const site = (this.form.get('turnstileSiteKey')?.value || '').toString().trim();
+            const secret = (this.form.get('turnstileSecretKey')?.value || '').toString().trim();
+            if (!site || !secret) {
+                this.form.get('turnstileSiteKey')?.markAsTouched();
+                this.form.get('turnstileSecretKey')?.markAsTouched();
+                this.snackBar.open('Turnstile requires both a site key and a secret key', 'OK', { duration: 4000 });
+                return;
+            }
+        }
+
+        const def = OPTIONS_PANEL_DEFS[panelId];
+        const payload = this.buildPayloadForKeys(def.keys);
+        this.appendSharedGeminiApiKeyPayload(panelId, payload);
+
+        this.savingPanel = panelId;
+        this.cdr.markForCheck();
+
+        const updated = await this.adminService.updateOptions(payload);
+        let ok = !!updated;
+
+        if (ok && def.systemsNoAudio) {
+            ok = await this.saveDirtySystemsNoAudio();
+        }
+
+        if (ok && def.systemsRetention) {
+            ok = await this.saveDirtySystemsRetention();
+        }
+
+        if (ok && def.systemsDuplicateDetection) {
+            ok = await this.saveDirtySystemsDuplicateDetection();
+        }
+
+        this.savingPanel = null;
+        if (ok) {
+            this.refreshPanelBaseline(panelId);
+            // Gemini key is shared across Integrations + Transcription dirty tracking.
+            if (panelId === 'integrations' || panelId === 'transcription') {
+                this.refreshPanelBaseline(panelId === 'integrations' ? 'transcription' : 'integrations');
+            }
+            this.snackBar.open(`${OPTIONS_PANEL_LABELS[panelId]} saved`, 'Close', { duration: 1500 });
+        } else {
+            this.snackBar.open('Failed to save. Please try again.', 'Close', { duration: 4000 });
+        }
+        this.cdr.markForCheck();
+    }
+
+    private appendSharedGeminiApiKeyPayload(panelId: OptionsPanelId, payload: Record<string, any>): void {
+        const def = OPTIONS_PANEL_DEFS[panelId];
+        if (!def.sharedGeminiApiKey || !this.form) {
+            return;
+        }
+        const baselineJson = this.panelBaselines[panelId];
+        const currentKey = this.form.get('transcriptionConfig')?.get('geminiAPIKey')?.value ?? '';
+        let baselineKey = '';
+        if (baselineJson) {
+            try {
+                baselineKey = (JSON.parse(baselineJson) as Record<string, unknown>)['__geminiAPIKey'] as string ?? '';
+            } catch {
+                baselineKey = '';
+            }
+        }
+        if (baselineKey === currentKey) {
+            return;
+        }
+        const existing = (payload['transcriptionConfig'] && typeof payload['transcriptionConfig'] === 'object')
+            ? payload['transcriptionConfig'] as Record<string, unknown>
+            : {};
+        payload['transcriptionConfig'] = {
+            ...existing,
+            geminiAPIKey: currentKey,
+        };
+    }
+
+    private buildPayloadForKeys(keys: string[]): Record<string, any> {
+        const raw = this.form!.getRawValue();
+        const slice: Record<string, any> = {};
+        for (const key of keys) {
+            if (raw[key] !== undefined) {
+                slice[key] = raw[key];
+            }
+        }
+        return this.normalizeOptionsPayload(slice);
+    }
+
+    private normalizeOptionsPayload(payload: Record<string, any>): Record<string, any> {
+        const result = { ...payload };
+
+        if ('rateLimitingEnabled' in result) {
+            if (!result['rateLimitingEnabled']) {
+                result['maxDownloadsPerWindow'] = 0;
+            }
+            delete result['rateLimitingEnabled'];
+        }
+
+        if (result['transcriptionConfig']) {
+            if (result['transcriptionEnabled'] !== undefined) {
+                result['transcriptionConfig'] = {
+                    ...result['transcriptionConfig'],
+                    enabled: result['transcriptionEnabled'],
+                };
+            }
+
+            const patterns = result['transcriptionConfig'].hallucinationPatterns;
+            if (typeof patterns === 'string') {
+                result['transcriptionConfig'].hallucinationPatterns = patterns
+                    .split('\n').map((l: string) => l.trim()).filter((l: string) => l.length > 0);
+            }
+            const wordBoost = result['transcriptionConfig'].assemblyAIWordBoost;
+            if (typeof wordBoost === 'string') {
+                result['transcriptionConfig'].assemblyAIWordBoost = wordBoost
+                    .split('\n').map((l: string) => l.trim()).filter((l: string) => l.length > 0);
+            }
+            const extraProfanity = result['transcriptionConfig'].profanityFilterExtraWords;
+            if (typeof extraProfanity === 'string') {
+                result['transcriptionConfig'].profanityFilterExtraWords = extraProfanity
+                    .split('\n').map((l: string) => l.trim()).filter((l: string) => l.length > 0);
+            }
+        }
+
+        if ('relayServerAPIKey' in result) {
+            result['relayServerURL'] = RELAY_SERVER_URL;
+        }
+
+        return result;
+    }
+
+    private snapshotPanel(panelId: OptionsPanelId): unknown {
+        if (panelId === 'mapping') {
+            return this.mappingForm?.getRawValue();
+        }
+        const raw = this.form?.getRawValue();
+        const def = OPTIONS_PANEL_DEFS[panelId];
+        const snapshot: Record<string, unknown> = {};
+
+        for (const key of def.keys) {
+            snapshot[key] = raw?.[key];
+        }
+
+        if (def.sharedGeminiApiKey) {
+            snapshot['__geminiAPIKey'] = raw?.transcriptionConfig?.geminiAPIKey ?? '';
+        }
+
+        if (def.systemsNoAudio && this.systemsForm) {
+            snapshot['__systemsNoAudio'] = this.systemsForm.controls.map((ctrl) => ({
+                id: ctrl.value.id,
+                noAudioAlertsEnabled: ctrl.value.noAudioAlertsEnabled,
+                noAudioThresholdMinutes: ctrl.value.noAudioThresholdMinutes,
+            }));
+        }
+
+        if (def.systemsRetention && this.systemsForm) {
+            snapshot['__systemsRetention'] = this.systemsForm.controls.map((ctrl) => ({
+                id: ctrl.value.id,
+                retentionDays: ctrl.value.retentionDays ?? 0,
+            }));
+        }
+
+        if (def.systemsDuplicateDetection && this.systemsForm) {
+            snapshot['__systemsDuplicateDetection'] = this.systemsForm.controls.map((ctrl) => ({
+                id: ctrl.value.id,
+                duplicateDetectionEnabled: ctrl.value.duplicateDetectionEnabled !== false,
+            }));
+        }
+
+        return snapshot;
+    }
+
+    private captureAllPanelBaselines(): void {
+        (Object.keys(OPTIONS_PANEL_DEFS) as OptionsPanelId[]).forEach((panelId) => {
+            this.refreshPanelBaseline(panelId);
+        });
+    }
+
+    private refreshPanelBaseline(panelId: OptionsPanelId): void {
+        this.panelBaselines[panelId] = JSON.stringify(this.snapshotPanel(panelId));
+    }
+
+    private getPanelFieldChanges(panelId: OptionsPanelId): string[] {
+        if (panelId === 'mapping') {
+            return this.isMappingDirty ? ['Incident mapping settings'] : [];
+        }
+        const baselineJson = this.panelBaselines[panelId];
+        if (!baselineJson || !this.form) {
+            return [];
+        }
+
+        const baseline = JSON.parse(baselineJson) as Record<string, unknown>;
+        const current = this.snapshotPanel(panelId) as Record<string, unknown>;
+        const labels: string[] = [];
+
+        for (const key of OPTIONS_PANEL_DEFS[panelId].keys) {
+            this.collectFieldChanges(key, baseline[key], current[key], labels);
+        }
+
+        if (OPTIONS_PANEL_DEFS[panelId].sharedGeminiApiKey) {
+            if ((baseline['__geminiAPIKey'] ?? '') !== (current['__geminiAPIKey'] ?? '')) {
+                labels.push(OPTIONS_FIELD_LABELS['transcriptionConfig.geminiAPIKey'] || 'Gemini API key');
+            }
+        }
+
+        if (OPTIONS_PANEL_DEFS[panelId].systemsNoAudio) {
+            this.collectSystemsNoAudioChanges(
+                baseline['__systemsNoAudio'] as { id: number; noAudioAlertsEnabled: boolean; noAudioThresholdMinutes: number }[] | undefined,
+                current['__systemsNoAudio'] as { id: number; noAudioAlertsEnabled: boolean; noAudioThresholdMinutes: number }[] | undefined,
+                labels,
+            );
+        }
+
+        if (OPTIONS_PANEL_DEFS[panelId].systemsRetention) {
+            this.collectSystemsRetentionChanges(
+                baseline['__systemsRetention'] as { id: number; retentionDays: number }[] | undefined,
+                current['__systemsRetention'] as { id: number; retentionDays: number }[] | undefined,
+                labels,
+            );
+        }
+
+        if (OPTIONS_PANEL_DEFS[panelId].systemsDuplicateDetection) {
+            this.collectSystemsDuplicateDetectionChanges(
+                baseline['__systemsDuplicateDetection'] as { id: number; duplicateDetectionEnabled: boolean }[] | undefined,
+                current['__systemsDuplicateDetection'] as { id: number; duplicateDetectionEnabled: boolean }[] | undefined,
+                labels,
+            );
+        }
+
+        return labels;
+    }
+
+    private collectFieldChanges(path: string, oldVal: unknown, newVal: unknown, labels: string[]): void {
+        const topKey = path.split('.')[0];
+        if (RdioScannerAdminOptionsComponent.TOGGLE_KEYS.includes(topKey)) {
+            return;
+        }
+
+        if (this.valuesEqual(oldVal, newVal)) {
+            return;
+        }
+
+        const isObject = (v: unknown): v is Record<string, unknown> =>
+            v !== null && typeof v === 'object' && !Array.isArray(v);
+
+        if (isObject(oldVal) || isObject(newVal)) {
+            const oldObj = isObject(oldVal) ? oldVal : {};
+            const newObj = isObject(newVal) ? newVal : {};
+            const keys = new Set([...Object.keys(oldObj), ...Object.keys(newObj)]);
+            keys.forEach((key) => {
+                this.collectFieldChanges(`${path}.${key}`, oldObj[key], newObj[key], labels);
+            });
+            return;
+        }
+
+        labels.push(this.labelForField(path));
+    }
+
+    private collectSystemsNoAudioChanges(
+        baseline: { id: number; noAudioAlertsEnabled: boolean; noAudioThresholdMinutes: number }[] | undefined,
+        current: { id: number; noAudioAlertsEnabled: boolean; noAudioThresholdMinutes: number }[] | undefined,
+        labels: string[],
+    ): void {
+        if (!current?.length) {
+            return;
+        }
+
+        for (const entry of current) {
+            const saved = baseline?.find((s) => s.id === entry.id);
+            if (!saved) {
+                continue;
+            }
+
+            const systemLabel = this.systemsForm?.controls
+                .find((ctrl) => ctrl.value.id === entry.id)?.value?.label || `System ${entry.id}`;
+
+            if (saved.noAudioAlertsEnabled !== entry.noAudioAlertsEnabled) {
+                labels.push(`${systemLabel}: no-audio alerts`);
+            }
+            if (saved.noAudioThresholdMinutes !== entry.noAudioThresholdMinutes) {
+                labels.push(`${systemLabel}: no-audio threshold`);
+            }
+        }
+    }
+
+    private collectSystemsRetentionChanges(
+        baseline: { id: number; retentionDays: number }[] | undefined,
+        current: { id: number; retentionDays: number }[] | undefined,
+        labels: string[],
+    ): void {
+        if (!current?.length) {
+            return;
+        }
+
+        for (const entry of current) {
+            const saved = baseline?.find((s) => s.id === entry.id);
+            if (!saved) {
+                continue;
+            }
+
+            const systemLabel = this.systemsForm?.controls
+                .find((ctrl) => ctrl.value.id === entry.id)?.value?.label || `System ${entry.id}`;
+
+            if (saved.retentionDays !== entry.retentionDays) {
+                labels.push(`${systemLabel}: retention days`);
+            }
+        }
+    }
+
+    private collectSystemsDuplicateDetectionChanges(
+        baseline: { id: number; duplicateDetectionEnabled: boolean }[] | undefined,
+        current: { id: number; duplicateDetectionEnabled: boolean }[] | undefined,
+        labels: string[],
+    ): void {
+        if (!current?.length) {
+            return;
+        }
+
+        for (const entry of current) {
+            const saved = baseline?.find((s) => s.id === entry.id);
+            if (!saved) {
+                continue;
+            }
+
+            const systemLabel = this.systemsForm?.controls
+                .find((ctrl) => ctrl.value.id === entry.id)?.value?.label || `System ${entry.id}`;
+
+            if (saved.duplicateDetectionEnabled !== entry.duplicateDetectionEnabled) {
+                labels.push(`${systemLabel}: duplicate detection`);
+            }
+        }
+    }
+
+    private async saveDirtySystemsRetention(): Promise<boolean> {
+        if (!this.systemsForm) {
+            return true;
+        }
+
+        const baseline = JSON.parse(this.panelBaselines.general || '{}').__systemsRetention as {
+            id: number;
+            retentionDays: number;
+        }[] | undefined;
+
+        let allOk = true;
+        for (const ctrl of this.systemsForm.controls) {
+            const id = ctrl.value.id;
+            if (!id) {
+                continue;
+            }
+            const current = {
+                retentionDays: ctrl.value.retentionDays ?? 0,
+            };
+            const saved = baseline?.find((s) => s.id === id);
+            if (saved && saved.retentionDays === current.retentionDays) {
+                continue;
+            }
+
+            try {
+                await this.adminService.saveSystemRetentionSettings(id, current.retentionDays);
+            } catch {
+                allOk = false;
+            }
+        }
+
+        return allOk;
+    }
+
+    private async saveDirtySystemsDuplicateDetection(): Promise<boolean> {
+        if (!this.systemsForm) {
+            return true;
+        }
+
+        const baseline = JSON.parse(this.panelBaselines.security || '{}').__systemsDuplicateDetection as {
+            id: number;
+            duplicateDetectionEnabled: boolean;
+        }[] | undefined;
+
+        let allOk = true;
+        for (const ctrl of this.systemsForm.controls) {
+            const id = ctrl.value.id;
+            if (!id) {
+                continue;
+            }
+            const current = {
+                duplicateDetectionEnabled: ctrl.value.duplicateDetectionEnabled !== false,
+            };
+            const saved = baseline?.find((s) => s.id === id);
+            if (saved && saved.duplicateDetectionEnabled === current.duplicateDetectionEnabled) {
+                continue;
+            }
+
+            try {
+                await this.adminService.saveSystemDuplicateDetectionSettings(id, current.duplicateDetectionEnabled);
+            } catch {
+                allOk = false;
+            }
+        }
+
+        return allOk;
+    }
+
+    private valuesEqual(a: unknown, b: unknown): boolean {
+        return JSON.stringify(a) === JSON.stringify(b);
+    }
+
+    private labelForField(path: string): string {
+        const known = OPTIONS_FIELD_LABELS[path];
+        if (known) {
+            return known;
+        }
+
+        const leaf = path.split('.').pop() || path;
+        if (this.isSensitiveField(leaf)) {
+            return `${this.humanizeKey(leaf)} (modified)`;
+        }
+
+        return this.humanizeKey(leaf);
+    }
+
+    private isSensitiveField(key: string): boolean {
+        const lower = key.toLowerCase();
+        return lower.includes('password')
+            || lower.includes('secret')
+            || lower.includes('apikey')
+            || lower.includes('credentials')
+            || lower.includes('token');
+    }
+
+    private humanizeKey(key: string): string {
+        const spaced = key
+            .replace(/([A-Z])/g, ' $1')
+            .replace(/_/g, ' ')
+            .trim();
+        return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+    }
+
+    private refreshBaselinesForKey(key: string): void {
+        (Object.keys(OPTIONS_PANEL_DEFS) as OptionsPanelId[]).forEach((panelId) => {
+            const def = OPTIONS_PANEL_DEFS[panelId];
+            if (def.keys.includes(key)
+                || (key === 'rateLimitingEnabled' && panelId === 'security')
+                || (key === 'maxDownloadsPerWindow' && panelId === 'security')
+                || (key === 'transcriptionEnabled' && panelId === 'transcription')) {
+                this.refreshPanelBaseline(panelId);
+            }
+        });
+    }
+
+    /** Keep mirrored form fields aligned after a toggle auto-save (before baseline snapshot). */
+    private syncRelatedFieldsAfterToggleSave(key: string, value: unknown): void {
+        if (key === 'transcriptionEnabled') {
+            this.form?.get('transcriptionConfig')?.get('enabled')?.setValue(!!value, { emitEvent: false });
+        }
+    }
+
+    private async saveDirtySystemsNoAudio(): Promise<boolean> {
+        if (!this.systemsForm) {
+            return true;
+        }
+
+        const baseline = JSON.parse(this.panelBaselines.alerts || '{}').__systemsNoAudio as {
+            id: number;
+            noAudioAlertsEnabled: boolean;
+            noAudioThresholdMinutes: number;
+        }[] | undefined;
+
+        let allOk = true;
+        for (const ctrl of this.systemsForm.controls) {
+            const id = ctrl.value.id;
+            const current = {
+                noAudioAlertsEnabled: ctrl.value.noAudioAlertsEnabled ?? false,
+                noAudioThresholdMinutes: ctrl.value.noAudioThresholdMinutes ?? 0,
+            };
+            const saved = baseline?.find((s) => s.id === id);
+            const changed = !saved
+                || saved.noAudioAlertsEnabled !== current.noAudioAlertsEnabled
+                || saved.noAudioThresholdMinutes !== current.noAudioThresholdMinutes;
+
+            if (!changed) {
+                continue;
+            }
+
+            try {
+                await this.adminService.saveSystemNoAudioSettings(
+                    id,
+                    current.noAudioAlertsEnabled,
+                    current.noAudioThresholdMinutes || 30,
+                );
+                ctrl.markAsPristine();
+            } catch {
+                allOk = false;
+            }
+        }
+
+        return allOk;
+    }
+
+    private setupFormChangeTracking(): void {
+        this.formChangeSubscription?.unsubscribe();
+        this.systemsChangeSubscription?.unsubscribe();
+
+        if (this.form) {
+            this.formChangeSubscription = this.form.valueChanges.subscribe(() => {
+                if (this.initialLoadComplete) {
+                    this.cdr.markForCheck();
+                }
+            });
+        }
+
+        if (this.systemsForm) {
+            this.systemsChangeSubscription = this.systemsForm.valueChanges.subscribe(() => {
+                if (this.initialLoadComplete) {
+                    this.cdr.markForCheck();
+                }
+            });
+        }
+    }
+
+    /** Top-level boolean option controls that auto-save the moment they change. */
+    /** IANA zone names for the Time Zone suggestions (empty when the browser cannot list them). */
+    readonly timeZoneNames: string[] = (() => {
+        try {
+            return (Intl as any).supportedValuesOf('timeZone') as string[];
+        } catch {
+            return [];
+        }
+    })();
+
+    private static readonly TOGGLE_KEYS = [
+        'systemHealthAlertsEnabled', 'transcriptionFailureAlertsEnabled', 'toneDetectionAlertsEnabled',
+        'noAudioAlertsEnabled', 'disableDuplicateDetection', 'audioEncryptionEnabled', 'rateLimitingEnabled',
+        'time12hFormat', 'autoPopulate', 'playbackGoesLive', 'showListenersCount', 'sortTalkgroups',
+        'emailServiceEnabled', 'emailSmtpUseTLS', 'emailSmtpSkipVerify',
+        'stripePaywallEnabled', 'transcriptionEnabled', 'requireListenerSignIn', 'userRegistrationEnabled',
+        'publicRegistrationEnabled', 'emailVerificationRequired', 'turnstileEnabled', 'configSyncEnabled',
+        'adminLocalhostOnly', 'adminPasswordLoginDisabled',
+    ];
+
+    private toggleSubscriptions: Subscription[] = [];
+    private mappingToggleSubscriptions: Subscription[] = [];
+
+    /** mappingForm booleans/selects that must persist via PUT /api/admin/mapping/config. */
+    private static readonly MAPPING_AUTO_SAVE_KEYS = [
+        'incidentMappingEnabled',
+        'autoLearnKnownPlaces',
+        'mapBoundariesEnabled',
+        'callNatureOpenAIClassify',
+        'callNaturePhraseLearn',
+        'suppressUnknownNaturePins',
+        'sendLocationContext',
+    ] as const;
+
+    /** Subscribe each toggle so flipping it immediately persists just that key. */
+    private setupToggleAutoSave(): void {
+        this.toggleSubscriptions.forEach(s => s.unsubscribe());
+        this.toggleSubscriptions = [];
+        if (!this.form) return;
+
+        for (const key of RdioScannerAdminOptionsComponent.TOGGLE_KEYS) {
+            const ctrl = this.form.get(key);
+            if (!ctrl) continue;
+            this.toggleSubscriptions.push(ctrl.valueChanges.subscribe((value) => {
+                if (!this.initialLoadComplete) return;
+                this.saveOptionKey(key, value);
+            }));
+        }
+    }
+
+    /** Incident Mapping panel uses a separate API; auto-save its toggles on change. */
+    private setupMappingToggleAutoSave(): void {
+        this.mappingToggleSubscriptions.forEach(s => s.unsubscribe());
+        this.mappingToggleSubscriptions = [];
+        if (!this.mappingForm) {
+            return;
+        }
+        for (const key of RdioScannerAdminOptionsComponent.MAPPING_AUTO_SAVE_KEYS) {
+            const ctrl = this.mappingForm.get(key);
+            if (!ctrl) {
+                continue;
+            }
+            this.mappingToggleSubscriptions.push(ctrl.valueChanges.subscribe(() => {
+                if (!this.initialLoadComplete) {
+                    return;
+                }
+                void this.saveMappingPanel();
+            }));
+        }
+    }
+
+    /** Persist a single option key (used by toggle auto-save). */
+    private async saveOptionKey(key: string, value: any): Promise<void> {
+        let partial: { [key: string]: any };
+
+        if (key === 'rateLimitingEnabled') {
+            // Synthetic control: maps onto maxDownloadsPerWindow (0 = disabled).
+            const max = this.form?.get('maxDownloadsPerWindow')?.value || 100;
+            partial = { maxDownloadsPerWindow: value ? max : 0 };
+        } else if (key === 'transcriptionEnabled') {
+            // Flat toggle drives transcriptionConfig.enabled server-side.
+            partial = { transcriptionEnabled: value };
+        } else {
+            partial = { [key]: value };
+        }
+
+        this.syncRelatedFieldsAfterToggleSave(key, value);
+
+        const updated = await this.adminService.updateOptions(partial);
+        if (updated) {
+            this.syncRelatedFieldsAfterToggleSave(key, value);
+            this.refreshBaselinesForKey(key);
+            this.snackBar.open('Saved', 'Close', { duration: 1500 });
+        } else {
+            this.snackBar.open('Failed to save. Please try again.', 'Close', { duration: 4000 });
+        }
+        this.cdr.markForCheck();
+    }
 
     asFormGroup(ctrl: any): FormGroup {
         return ctrl as FormGroup;
     }
 
-    /** Programmatically open a specific expansion panel (called by global search). */
+    /** Programmatically open a section (global search / unsaved jump). */
     openPanel(panelName: string): void {
-        const key = panelName as keyof this;
-        if (key in this) {
-            (this as any)[key] = true;
-            this.cdr.markForCheck();
-            setTimeout(() => {
-                const el = document.getElementById('opt-panel-' + panelName);
-                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }, 180);
+        // Supports "general", "generalExpanded", or "general:sync".
+        const cleaned = panelName.replace(/Expanded$/, '');
+        const [rawId, subId] = cleaned.split(':');
+        const id = rawId as OptionsNavId;
+        if (this.optionsNav.some((n) => n.id === id)) {
+            this.setActivePanel(id);
+            if (subId && this.subNavFor(id).some((s) => s.id === subId)) {
+                this.setActiveSubPanel(subId);
+            }
         }
     }
 
-    get isRadioReferenceLoggedIn(): boolean {
-        return this.hasStoredRadioReferenceCredentials();
-    }
-
-    get shouldShowLoginForm(): boolean {
-        return this.isEditingRadioReference || !this.isRadioReferenceLoggedIn;
-    }
-
     ngOnInit(): void {
-        this.setupRadioReferenceValidation();
-        this.setInitialRadioReferenceValidation();
-        this.storeOriginalCredentials();
+        this.mappingForm = this.formBuilder.group({
+            incidentMappingEnabled: [false],
+            geocodeCacheMaxAgeDays: [30],
+            autoLearnKnownPlaces: [false],
+            openAIModel: [''],
+            mapBoundariesEnabled: [false],
+            mapBoundaryLayers: [['county'] as string[]],
+            callNatureOpenAIClassify: [false],
+            callNaturePhraseLearn: [false],
+            callNaturePhraseLearnMinSightings: [3],
+            suppressUnknownNaturePins: [false],
+            sendLocationContext: [false],
+        });
+        this.loadMappingConfig();
+        this.setupMappingToggleAutoSave();
+        this.refreshBoundaryStats();
         this.setupRelayServerFormListeners();
         this.setupRateLimitingToggle();
         this.setupAudioEncryptionToggle();
         this.setHardcodedRelayServerURL();
         this.updateFaviconUrl();
         this.updateEmailLogoUrl();
+        this.setupToggleAutoSave();
+        this.setupFormChangeTracking();
         setTimeout(() => {
             this.initialLoadComplete = true;
+            this.captureAllPanelBaselines();
+            this.cdr.markForCheck();
         }, 100);
     }
 
@@ -131,170 +1425,100 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
         setTimeout(() => {
             this.panelsReady = true;
             this.refreshRelaySuspensionStatus();
+            this.refreshRelayAccountStatus();
+            this.refreshRelayBillingCatalog();
+            this.startRelayBillingPoll();
             this.cdr.detectChanges();
         }, 80);
     }
 
     ngOnDestroy(): void {
-        this.radioReferenceSubscription?.unsubscribe();
+        this.formChangeSubscription?.unsubscribe();
+        this.systemsChangeSubscription?.unsubscribe();
+        this.toggleSubscriptions.forEach(s => s.unsubscribe());
+        this.mappingToggleSubscriptions.forEach(s => s.unsubscribe());
+        this.stopRelayBillingPoll();
+        this.stopRelayBillingWatch();
+    }
+
+    @HostListener('document:visibilitychange')
+    onDocumentVisibilityChange(): void {
+        if (document.visibilityState === 'visible' && this.hasRelayAPIKey()) {
+            this.refreshRelayBillingCatalog({ quiet: true });
+            this.refreshRelayAccountStatus();
+        }
     }
 
     ngOnChanges(changes: SimpleChanges): void {
         if (changes['form'] && this.form) {
-            // Collapse all panels explicitly before hiding so they are in the right state when re-shown
-            this.generalExpanded = false;
-            this.brandingExpanded = false;
-            this.transcriptionExpanded = false;
-            this.alertsExpanded = false;
-            this.notificationsExpanded = false;
-            this.userRegistrationExpanded = false;
-            this.stripeExpanded = false;
-            this.integrationsExpanded = false;
-            this.securityExpanded = false;
-
-            this.panelsReady = false;
-            this.cdr.detectChanges(); // Force the hide to apply immediately
-
-            this.setupRadioReferenceValidation();
-            this.setInitialRadioReferenceValidation();
-            this.storeOriginalCredentials();
+            this.setupTurnstileValidation();
+            this.setInitialTurnstileValidation();
             this.setupRelayServerFormListeners();
             this.setupRateLimitingToggle();
             this.setupAudioEncryptionToggle();
             this.setHardcodedRelayServerURL();
-            this.isEditingRadioReference = false;
+            this.setupToggleAutoSave();
+            this.setupFormChangeTracking();
             this.updateEmailLogoUrl();
 
             setTimeout(() => {
                 this.panelsReady = true;
+                this.captureAllPanelBaselines();
                 this.cdr.detectChanges();
             }, 80);
         }
-    }
 
-    private setupRadioReferenceValidation(): void {
-        if (!this.form) return;
-
-        const radioReferenceEnabledControl = this.form.get('radioReferenceEnabled');
-        const usernameControl = this.form.get('radioReferenceUsername');
-        const passwordControl = this.form.get('radioReferencePassword');
-
-        if (radioReferenceEnabledControl && usernameControl && passwordControl) {
-            // Listen to enabled toggle changes
-            this.radioReferenceSubscription = radioReferenceEnabledControl.valueChanges.subscribe(enabled => {
-                if (enabled) {
-                    usernameControl.setValidators([Validators.required]);
-                    passwordControl.setValidators([Validators.required]);
-                } else {
-                    usernameControl.clearValidators();
-                    passwordControl.clearValidators();
-                }
-                
-                usernameControl.updateValueAndValidity();
-                passwordControl.updateValueAndValidity();
-                
-                // Force form to detect changes
-                if (this.form) {
-                    this.form.markAsDirty();
-                    this.form.updateValueAndValidity();
-                }
-            });
-
-            // Listen to username changes (only after initial load to avoid marking form dirty on auto-populate)
-            usernameControl.valueChanges.subscribe(() => {
-                if (this.initialLoadComplete) {
-                    if (this.form) {
-                        this.form.markAsDirty();
-                    }
-                }
-            });
-
-            // Listen to password changes (only after initial load to avoid marking form dirty on auto-populate)
-            passwordControl.valueChanges.subscribe(() => {
-                if (this.initialLoadComplete) {
-                    if (this.form) {
-                        this.form.markAsDirty();
-                    }
-                }
-            });
-        }
-    }
-
-    private setInitialRadioReferenceValidation(): void {
-        if (!this.form) return;
-
-        const radioReferenceEnabledControl = this.form.get('radioReferenceEnabled');
-        const usernameControl = this.form.get('radioReferenceUsername');
-        const passwordControl = this.form.get('radioReferencePassword');
-
-        if (radioReferenceEnabledControl && usernameControl && passwordControl) {
-            const enabled = radioReferenceEnabledControl.value;
-            if (enabled) {
-                usernameControl.setValidators([Validators.required]);
-                passwordControl.setValidators([Validators.required]);
-            } else {
-                usernameControl.clearValidators();
-                passwordControl.clearValidators();
+        if (changes['systemsForm'] && this.systemsForm) {
+            this.setupFormChangeTracking();
+            if (this.initialLoadComplete) {
+                this.refreshPanelBaseline('alerts');
             }
-            
-            usernameControl.updateValueAndValidity();
-            passwordControl.updateValueAndValidity();
         }
     }
 
-    private storeOriginalCredentials(): void {
+    private setupTurnstileValidation(): void {
         if (!this.form) return;
-        
-        // Store the current values as original values
-        this.originalRadioReferenceUsername = this.form.get('radioReferenceUsername')?.value || '';
-        this.originalRadioReferencePassword = this.form.get('radioReferencePassword')?.value || '';
+
+        const enabledControl = this.form.get('turnstileEnabled');
+        const siteKeyControl = this.form.get('turnstileSiteKey');
+        const secretKeyControl = this.form.get('turnstileSecretKey');
+        if (!enabledControl || !siteKeyControl || !secretKeyControl) {
+            return;
+        }
+
+        enabledControl.valueChanges.subscribe(enabled => {
+            if (enabled) {
+                siteKeyControl.setValidators([Validators.required]);
+                secretKeyControl.setValidators([Validators.required]);
+            } else {
+                siteKeyControl.clearValidators();
+                secretKeyControl.clearValidators();
+            }
+            siteKeyControl.updateValueAndValidity({ emitEvent: false });
+            secretKeyControl.updateValueAndValidity({ emitEvent: false });
+            this.form?.updateValueAndValidity({ emitEvent: false });
+        });
     }
 
-    editRadioReferenceLogin(): void {
+    private setInitialTurnstileValidation(): void {
         if (!this.form) return;
-        
-        // Store current values as original before editing
-        this.storeOriginalCredentials();
-        
-        // Enter edit mode
-        this.isEditingRadioReference = true;
-        
-        // Keep the username but clear the password for editing
-        this.form.get('radioReferencePassword')?.setValue('');
-        this.form.markAsDirty();
-    }
 
-    cancelEditRadioReference(): void {
-        if (!this.form) return;
-        
-        // Restore the original username and password values
-        this.form.get('radioReferenceUsername')?.setValue(this.originalRadioReferenceUsername);
-        this.form.get('radioReferencePassword')?.setValue(this.originalRadioReferencePassword);
-        
-        // Exit edit mode
-        this.isEditingRadioReference = false;
-        
-        // Mark form as pristine since we've restored original values
-        this.form.markAsPristine();
-    }
+        const enabled = !!this.form.get('turnstileEnabled')?.value;
+        const siteKeyControl = this.form.get('turnstileSiteKey');
+        const secretKeyControl = this.form.get('turnstileSecretKey');
+        if (!siteKeyControl || !secretKeyControl) {
+            return;
+        }
 
-    removeRadioReferenceAccount(): void {
-        if (!this.form) return;
-        
-        // Exit edit mode if we were editing
-        this.isEditingRadioReference = false;
-        
-        // Clear credentials and disable Radio Reference
-        this.form.get('radioReferenceEnabled')?.setValue(false);
-        this.form.get('radioReferenceUsername')?.setValue('');
-        this.form.get('radioReferencePassword')?.setValue('');
-        this.originalRadioReferenceUsername = '';
-        this.originalRadioReferencePassword = '';
-        this.form.markAsDirty();
-    }
-
-    private hasStoredRadioReferenceCredentials(): boolean {
-        return !!(this.originalRadioReferenceUsername && this.originalRadioReferencePassword);
+        if (enabled) {
+            siteKeyControl.setValidators([Validators.required]);
+            secretKeyControl.setValidators([Validators.required]);
+        } else {
+            siteKeyControl.clearValidators();
+            secretKeyControl.clearValidators();
+        }
+        siteKeyControl.updateValueAndValidity({ emitEvent: false });
+        secretKeyControl.updateValueAndValidity({ emitEvent: false });
     }
 
     private setHardcodedRelayServerURL(): void {
@@ -302,7 +1526,7 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
         
         const relayServerURLControl = this.form.get('relayServerURL');
         if (relayServerURLControl) {
-            relayServerURLControl.setValue('https://tlradioserver.thinlineds.com', { emitEvent: false });
+            relayServerURLControl.setValue(RELAY_SERVER_URL, { emitEvent: false });
         }
     }
 
@@ -354,9 +1578,6 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
 
         toggleControl.valueChanges.subscribe(enabled => {
             applyState(enabled);
-            if (this.form) {
-                this.form.markAsDirty();
-            }
         });
     }
 
@@ -397,7 +1618,7 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
         if (!this.form) return;
 
         // Use hardcoded relay server URL
-        const relayServerURL = 'https://tlradioserver.thinlineds.com';
+        const relayServerURL = RELAY_SERVER_URL;
         const existingAPIKey = this.form.get('relayServerAPIKey')?.value;
         
         // Ensure the form control has the hardcoded value
@@ -415,10 +1636,13 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
             }
         });
 
-        dialogRef.afterClosed().subscribe((apiKey: string | null) => {
+        dialogRef.afterClosed().subscribe(async (apiKey: string | null) => {
             if (apiKey && this.form) {
                 this.form.get('relayServerAPIKey')?.setValue(apiKey);
-                this.saveRequested.emit();
+                // Persist first so the server has the key in memory before catalog load.
+                await this.saveOptionKey('relayServerAPIKey', apiKey);
+                this.refreshRelayAccountStatus();
+                this.refreshRelayBillingCatalog();
             }
         });
     }
@@ -426,17 +1650,19 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
     recoverRelayAPIKey() {
         if (!this.form) return;
 
-        const relayServerURL = 'https://tlradioserver.thinlineds.com';
+        const relayServerURL = RELAY_SERVER_URL;
 
         const dialogRef = this.dialog.open(RecoverAPIKeyDialogComponent, {
             width: '600px',
             data: { relayServerURL: relayServerURL }
         });
 
-        dialogRef.afterClosed().subscribe((apiKey: string | null) => {
+        dialogRef.afterClosed().subscribe(async (apiKey: string | null) => {
             if (apiKey && this.form) {
                 this.form.get('relayServerAPIKey')?.setValue(apiKey);
-                this.saveRequested.emit();
+                await this.saveOptionKey('relayServerAPIKey', apiKey);
+                this.refreshRelayAccountStatus();
+                this.refreshRelayBillingCatalog();
             }
         });
     }
@@ -500,8 +1726,7 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
                         this.faviconUrl = `${window.location.origin}/favicon?t=${Date.now()}`;
                         this.cdr.detectChanges();
                         this.snackBar.open('Favicon uploaded successfully', 'Close', { duration: 3000 });
-                        // Mark form as dirty so user knows to save
-                        this.form?.markAsDirty();
+                        this.refreshPanelBaseline('branding');
                     } else {
                         alert('Failed to upload favicon: ' + (response.error || 'Unknown error'));
                     }
@@ -522,6 +1747,9 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
     }
 
     removeFavicon(): void {
+        if (!confirm('Are you sure you want to delete the favicon?')) {
+            return;
+        }
         // Get auth token from session storage (admin service sends token without "Bearer" prefix)
         const token = sessionStorage.getItem('rdio-scanner-admin-token');
         if (!token) {
@@ -542,8 +1770,7 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
                         this.faviconUrl = '';
                         this.cdr.detectChanges();
                         this.snackBar.open('Favicon removed successfully', 'Close', { duration: 3000 });
-                        // Mark form as dirty so user knows to save
-                        this.form?.markAsDirty();
+                        this.refreshPanelBaseline('branding');
                     } else {
                         alert('Failed to remove favicon: ' + (response.error || 'Unknown error'));
                     }
@@ -692,7 +1919,7 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
                         this.emailLogoUrl = `${window.location.origin}/email-logo?t=${Date.now()}`;
                         this.cdr.detectChanges();
                         this.snackBar.open('Email logo uploaded successfully', 'Close', { duration: 3000 });
-                        this.form?.markAsDirty();
+                        this.refreshPanelBaseline('branding');
                     } else {
                         alert('Failed to upload logo: ' + (response.error || 'Unknown error'));
                     }
@@ -713,6 +1940,9 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
     }
 
     removeEmailLogo(): void {
+        if (!confirm('Are you sure you want to delete the email logo?')) {
+            return;
+        }
         const token = sessionStorage.getItem('rdio-scanner-admin-token');
         if (!token) {
             alert('Not authenticated. Please log in again.');
@@ -730,7 +1960,7 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
                         this.emailLogoErrorRetryCount = 0;
                         this.cdr.detectChanges();
                         this.snackBar.open('Email logo removed successfully', 'Close', { duration: 3000 });
-                        this.form?.markAsDirty();
+                        this.refreshPanelBaseline('branding');
                     } else {
                         alert('Failed to remove logo: ' + (response.error || 'Unknown error'));
                     }
@@ -1001,6 +2231,363 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
             });
     }
 
+    refreshRelayAccountStatus(): void {
+        const token = sessionStorage.getItem('rdio-scanner-admin-token');
+        if (!token) {
+            return;
+        }
+        const headers = new HttpHeaders({ Authorization: token });
+        this.http
+            .get<{
+                username: string;
+                signedIn: boolean;
+                lastError: string;
+                nominatimSubscriptionStatus: string;
+            }>(`${window.location.origin}/api/admin/relay-account/status`, { headers })
+            .subscribe({
+                next: (s) => {
+                    this.relayAccountStatus = s;
+                    this.cdr.markForCheck();
+                },
+                error: () => {
+                    this.relayAccountStatus = null;
+                    this.cdr.markForCheck();
+                },
+            });
+    }
+
+    openRelayAccountDialog(initialMode: 'login' | 'create' = 'create'): void {
+        const token = sessionStorage.getItem('rdio-scanner-admin-token');
+        if (!token) {
+            this.snackBar.open('Not authenticated.', 'Close', { duration: 4000 });
+            return;
+        }
+        const dialogRef = this.dialog.open(RelayAccountDialogComponent, {
+            width: '480px',
+            data: { adminToken: token, initialMode },
+        });
+        dialogRef.afterClosed().subscribe((signedIn: boolean | null) => {
+            if (signedIn) {
+                this.snackBar.open(
+                    initialMode === 'create'
+                        ? 'Relay account created. Open the portal to subscribe if needed.'
+                        : 'Signed in. Open the portal to subscribe or manage billing.',
+                    'Open portal',
+                    { duration: 8000 },
+                ).onAction().subscribe(() => {
+                    window.open(this.relayPortalURL, '_blank', 'noopener,noreferrer');
+                    this.startRelayBillingWatch();
+                });
+                this.refreshRelayAccountStatus();
+                this.refreshRelayBillingCatalog();
+                this.startRelayBillingWatch();
+            }
+        });
+    }
+
+    /** Pick a folder on the ThinLine Radio server for config sync (not the admin browser's disk). */
+    browseConfigSyncPath(): void {
+        const initialPath = (this.form?.get('configSyncPath')?.value || '').trim();
+        const initialFileName = (this.form?.get('configSyncFileName')?.value || '').trim();
+        const dialogRef = this.dialog.open(ServerPathBrowseDialogComponent, {
+            width: '780px',
+            maxWidth: '94vw',
+            maxHeight: '90vh',
+            panelClass: 'admin-dialog-panel',
+            backdropClass: 'admin-dialog-backdrop',
+            autoFocus: 'first-tabbable',
+            data: {
+                initialPath,
+                initialFileName: initialFileName || 'ThinLineRadioV7-config.json',
+                title: 'Config sync location (server)',
+            },
+        });
+        dialogRef.afterClosed().subscribe((result: ServerPathBrowseDialogResult | null) => {
+            if (!result?.path || !this.form) {
+                return;
+            }
+            this.form.get('configSyncPath')?.setValue(result.path);
+            this.form.get('configSyncPath')?.markAsDirty();
+            if (result.fileName) {
+                this.form.get('configSyncFileName')?.setValue(result.fileName);
+                this.form.get('configSyncFileName')?.markAsDirty();
+            }
+            this.form.markAsDirty();
+            this.cdr.markForCheck();
+        });
+    }
+
+    onOpenRelayPortal(): void {
+        this.startRelayBillingWatch();
+    }
+
+    signOutRelayAccount(): void {
+        const token = sessionStorage.getItem('rdio-scanner-admin-token');
+        if (!token) {
+            return;
+        }
+        const headers = new HttpHeaders({ Authorization: token });
+        this.relayAccountBusy = true;
+        this.http
+            .post<{ success: boolean; error?: string }>(
+                `${window.location.origin}/api/admin/relay-account/logout`,
+                {},
+                { headers },
+            )
+            .subscribe({
+                next: () => {
+                    this.relayAccountBusy = false;
+                    this.snackBar.open('Signed out of relay account.', 'Close', { duration: 4000 });
+                    this.refreshRelayAccountStatus();
+                    this.refreshRelayBillingCatalog();
+                },
+                error: (err) => {
+                    this.relayAccountBusy = false;
+                    const msg = err?.error?.error || err?.message || 'Sign-out failed';
+                    this.snackBar.open(msg, 'Close', { duration: 6000 });
+                },
+            });
+    }
+
+    refreshRelayBillingCatalog(opts?: { quiet?: boolean }): void {
+        if (!this.hasRelayAPIKey()) {
+            this.relayBillingPlanRows = [];
+            this.relayBillingError = '';
+            this.previousSubscribedSlugs.clear();
+            this.relayBillingBaselineReady = false;
+            return;
+        }
+        const token = sessionStorage.getItem('rdio-scanner-admin-token');
+        if (!token) {
+            return;
+        }
+        const quiet = !!opts?.quiet && this.relayBillingPlanRows.length > 0;
+        const headers = new HttpHeaders({ Authorization: token });
+        if (!quiet) {
+            this.relayBillingLoading = true;
+        }
+        this.relayBillingError = '';
+        this.http
+            .get<RelayBillingCatalogResponse>(`${window.location.origin}/api/admin/relay-billing/catalog`, { headers })
+            .subscribe({
+                next: (res) => {
+                    this.relayBillingLoading = false;
+                    this.relayBillingPlanRows = this.buildRelayBillingPlanRows(res);
+                    this.applyRelayPushEnforcementNotice(res);
+                    this.noteRelaySubscriptionChanges(this.relayBillingPlanRows);
+                    this.cdr.markForCheck();
+                },
+                error: (err) => {
+                    this.relayBillingLoading = false;
+                    if (!quiet) {
+                        this.relayBillingPlanRows = [];
+                        this.relayBillingError = err?.error?.error || err?.message || 'Failed to load billing plans';
+                    }
+                    this.cdr.markForCheck();
+                },
+            });
+    }
+
+    private applyRelayPushEnforcementNotice(catalog: RelayBillingCatalogResponse): void {
+        const notice = (catalog?.push_plan_enforcement?.notice || '').trim();
+        this.relayPushEnforcementNotice = notice || DEFAULT_RELAY_PUSH_ENFORCEMENT_NOTICE;
+    }
+
+    private startRelayBillingPoll(): void {
+        this.stopRelayBillingPoll();
+        this.relayBillingPollTimer = setInterval(() => {
+            if (this.hasRelayAPIKey()) {
+                this.refreshRelayBillingCatalog({ quiet: true });
+            }
+        }, 30_000);
+    }
+
+    private stopRelayBillingPoll(): void {
+        if (this.relayBillingPollTimer) {
+            clearInterval(this.relayBillingPollTimer);
+            this.relayBillingPollTimer = null;
+        }
+    }
+
+    /** Faster refresh after checkout / portal visit until Stripe webhook lands. */
+    private startRelayBillingWatch(): void {
+        this.stopRelayBillingWatch();
+        const until = Date.now() + 3 * 60_000;
+        this.relayBillingWatchTimer = setInterval(() => {
+            if (Date.now() > until) {
+                this.stopRelayBillingWatch();
+                return;
+            }
+            if (this.hasRelayAPIKey()) {
+                this.refreshRelayBillingCatalog({ quiet: true });
+            }
+        }, 5_000);
+    }
+
+    private stopRelayBillingWatch(): void {
+        if (this.relayBillingWatchTimer) {
+            clearInterval(this.relayBillingWatchTimer);
+            this.relayBillingWatchTimer = null;
+        }
+    }
+
+    private noteRelaySubscriptionChanges(rows: RelayBillingPlanRow[]): void {
+        const next = new Set(rows.filter((r) => r.subscribed && !r.includedWithGeocoding).map((r) => r.slug));
+        if (!this.relayBillingBaselineReady) {
+            this.previousSubscribedSlugs = next;
+            this.relayBillingBaselineReady = true;
+            return;
+        }
+        const newly: string[] = [];
+        for (const slug of next) {
+            if (!this.previousSubscribedSlugs.has(slug)) {
+                newly.push(slug);
+            }
+        }
+        this.previousSubscribedSlugs = next;
+        if (newly.length === 0) {
+            return;
+        }
+        this.stopRelayBillingWatch();
+        const names = rows.filter((r) => newly.includes(r.slug)).map((r) => r.name).join(', ');
+        this.snackBar.open(`Subscribed: ${names}`, 'Close', { duration: 6000 });
+    }
+
+    private buildRelayBillingPlanRows(catalog: RelayBillingCatalogResponse): RelayBillingPlanRow[] {
+        const entBySlug = new Map<string, { status: string; source: string }>();
+        for (const ent of catalog?.entitlements || []) {
+            const slug = (ent.plan_slug || '').trim().toLowerCase();
+            if (slug) {
+                entBySlug.set(slug, {
+                    status: (ent.status || 'none').trim().toLowerCase(),
+                    source: (ent.source || '').trim().toLowerCase(),
+                });
+            }
+        }
+        const nominatimStatus = entBySlug.get('nominatim')?.status || 'none';
+        const geocodingActive = nominatimStatus === 'active' || nominatimStatus === 'trialing';
+        const rows: RelayBillingPlanRow[] = [];
+        for (const plan of catalog?.plans || []) {
+            const slug = (plan.slug || '').trim().toLowerCase();
+            if (!slug || plan.active === false) {
+                continue;
+            }
+            const ent = entBySlug.get(slug);
+            let status = ent?.status || 'none';
+            let subscribed = status === 'active' || status === 'trialing';
+            let billable = !!(plan.stripe_price_id || '').trim();
+            let includedWithGeocoding = false;
+            let complimentary = false;
+            let houseLocked = false;
+            let convertNotice = '';
+            // Geocoding and Push already covers push — don't offer a second checkout.
+            if (slug === 'push_relay' && geocodingActive) {
+                includedWithGeocoding = true;
+                subscribed = true;
+                status = nominatimStatus;
+                billable = false;
+            }
+            // Existing admin-overridden ad-free stays complimentary and can convert
+            // unless the server is house-locked (AlertPage / Ohio RSN).
+            if (slug === 'ad_free' && subscribed && ent?.source !== 'stripe') {
+                complimentary = true;
+                subscribed = false;
+                if (catalog.ad_free_convert?.house_locked) {
+                    houseLocked = true;
+                    billable = false;
+                } else if (catalog.ad_free_convert?.notice) {
+                    convertNotice = catalog.ad_free_convert.notice;
+                }
+            }
+            rows.push({
+                slug,
+                name: plan.name || slug,
+                description: (plan.description || '').trim(),
+                price_label: (plan.price_label || '').trim(),
+                status,
+                subscribed,
+                billable,
+                includedWithGeocoding,
+                complimentary,
+                houseLocked,
+                convertNotice,
+            });
+        }
+        return rows;
+    }
+
+    planStatusLabel(status: string, includedWithGeocoding = false, complimentary = false, houseLocked = false): string {
+        if (includedWithGeocoding) {
+            return 'Included with Geocoding and Push';
+        }
+        if (houseLocked) {
+            return 'Included';
+        }
+        if (complimentary) {
+            return 'Complimentary';
+        }
+        switch ((status || '').toLowerCase()) {
+            case 'active': return 'Active';
+            case 'trialing': return 'Trial';
+            case 'past_due': return 'Past Due';
+            case 'canceled': return 'Canceled';
+            default: return 'Not Subscribed';
+        }
+    }
+
+    planStatusColor(status: string): 'primary' | 'accent' | 'warn' {
+        switch ((status || '').toLowerCase()) {
+            case 'active':
+            case 'trialing':
+                return 'accent';
+            case 'past_due':
+                return 'warn';
+            default:
+                return 'primary';
+        }
+    }
+
+    subscribeRelayPlan(planSlug: string): void {
+        const token = sessionStorage.getItem('rdio-scanner-admin-token');
+        if (!token) {
+            this.snackBar.open('Not authenticated.', 'Close', { duration: 4000 });
+            return;
+        }
+        const headers = new HttpHeaders({ Authorization: token });
+        this.relayPlanSubscribingSlug = planSlug;
+        this.http
+            .post<{ checkout_url?: string; error?: string }>(
+                `${window.location.origin}/api/admin/relay-billing/subscribe`,
+                { plan_slug: planSlug },
+                { headers },
+            )
+            .subscribe({
+                next: (res) => {
+                    this.relayPlanSubscribingSlug = '';
+                    if (res?.checkout_url) {
+                        window.open(res.checkout_url, '_blank');
+                        this.startRelayBillingWatch();
+                        this.snackBar.open('Complete checkout in the new tab — status will update here when done.', 'Close', {
+                            duration: 6000,
+                        });
+                    } else {
+                        this.snackBar.open(res?.error || 'Failed to start checkout', 'Close', { duration: 6000 });
+                    }
+                    this.cdr.markForCheck();
+                },
+                error: (err) => {
+                    this.relayPlanSubscribingSlug = '';
+                    const msg = err?.error?.error || err?.message || 'Failed to start checkout';
+                    this.snackBar.open(msg, 'Close', { duration: 6000 });
+                    this.cdr.markForCheck();
+                },
+            });
+    }
+
+    subscribeNominatim(): void {
+        this.subscribeRelayPlan('nominatim');
+    }
+
     testCentralConnection(): void {
         const url = this.form?.get('centralManagementURL')?.value;
         const apiKey = this.form?.get('centralManagementAPIKey')?.value;
@@ -1034,6 +2621,24 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
     }
 
     // Helper methods for array handling in templates
+    transcriptionUsesProvider(id: string): boolean {
+        const group = this.form?.get('transcriptionConfig');
+        if (!group) {
+            return false;
+        }
+        return group.get('provider')?.value === id || group.get('backupProvider')?.value === id;
+    }
+
+    onPrimaryTranscriptionProviderChange(): void {
+        const group = this.form?.get('transcriptionConfig');
+        if (!group) {
+            return;
+        }
+        if (group.get('backupProvider')?.value === group.get('provider')?.value) {
+            group.get('backupProvider')?.setValue('');
+        }
+    }
+
     getAssemblyAIWordBoostDisplay(): string {
         const wordBoost = this.form?.get('transcriptionConfig')?.get('assemblyAIWordBoost')?.value;
         return Array.isArray(wordBoost) ? wordBoost.join(',') : '';
@@ -1044,13 +2649,4 @@ export class RdioScannerAdminOptionsComponent implements OnInit, AfterViewInit, 
         this.form?.get('transcriptionConfig')?.get('assemblyAIWordBoost')?.setValue(terms);
     }
 
-    getHallucinationPatternsDisplay(): string {
-        const patterns = this.form?.get('transcriptionConfig')?.get('hallucinationPatterns')?.value;
-        return Array.isArray(patterns) ? patterns.join('\n') : '';
-    }
-
-    setHallucinationPatterns(value: string): void {
-        const patterns = value.split('\n').map(s => s.trim()).filter(s => s);
-        this.form?.get('transcriptionConfig')?.get('hallucinationPatterns')?.setValue(patterns);
-    }
 }

@@ -20,7 +20,40 @@
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 import { Observable, BehaviorSubject, of } from 'rxjs';
-import { RdioScannerAlert, RdioScannerAlertPreference, RdioScannerKeywordList } from '../rdio-scanner';
+import { RdioScannerAlert, RdioScannerAlertPreference, RdioScannerIncidentUpdate, RdioScannerKeywordList } from '../rdio-scanner';
+
+export interface RdioScannerSystemAlert {
+    id: number;
+    alertType: string;
+    severity: string;
+    title: string;
+    message: string;
+    data?: string;
+    createdAt: number;
+    createdBy?: number;
+    dismissed?: boolean;
+}
+
+export interface RdioScannerSystemAlertsResponse {
+    alerts: RdioScannerSystemAlert[];
+    isSystemAdmin?: boolean;
+    canViewSystemAlerts?: boolean;
+}
+
+export interface GlobalTrainingProgress {
+    goalHours: number;
+    submissions?: number;
+    serverAccounts?: number;
+    hoursDecimal?: number;
+    percentOfGoal?: number;
+    audioDurationMs?: number;
+    audioDuration?: {
+        hours?: number;
+        minutes?: number;
+        seconds?: number;
+        formatted?: string;
+    };
+}
 
 @Injectable()
 export class AlertsService {
@@ -39,6 +72,8 @@ export class AlertsService {
     private alertsCache: RdioScannerAlert[] = [];
     private lastFetchTime: number = 0;
     private isFetching: boolean = false;
+    /** If a fetch is requested while one is in flight, rerun after it finishes. */
+    private pendingFetch: { pin?: string; forceFullRefresh: boolean } | null = null;
     private alertsSubject: BehaviorSubject<RdioScannerAlert[]>;
     public alerts$: Observable<RdioScannerAlert[]>;
 
@@ -93,8 +128,18 @@ export class AlertsService {
     }
 
     /**
-     * Get all alerts (full fetch - used for initial load)
+     * Every radio-transmission alert this account can hear. Does not touch the
+     * personal Mine cache, and does not include system health alerts.
      */
+    getAllTransmissionAlerts(pin?: string): Observable<RdioScannerAlert[]> {
+        let url = `${this.getFullUrl(this.apiUrl)}?scope=all`;
+        if (pin) {
+            url += `&pin=${encodeURIComponent(pin)}`;
+        }
+        const headers = pin ? new HttpHeaders().set('Authorization', `Bearer ${pin}`) : undefined;
+        return this.http.get<RdioScannerAlert[]>(url, { headers });
+    }
+
     getAlerts(limit: number = 50, offset: number = 0, pin?: string): Observable<any[]> {
         let url = `${this.getFullUrl(this.apiUrl)}?limit=${limit}&offset=${offset}`;
         if (pin) {
@@ -104,18 +149,30 @@ export class AlertsService {
         return this.http.get<any[]>(url, { headers });
     }
 
+    getSystemAlerts(limit: number = 50, pin?: string, includeDismissed: boolean = false): Observable<RdioScannerSystemAlertsResponse> {
+        let url = `${this.getFullUrl('/api/system-alerts')}?limit=${limit}&includeDismissed=${includeDismissed}`;
+        if (pin) {
+            url += `&pin=${encodeURIComponent(pin)}`;
+        }
+        const headers = pin ? new HttpHeaders().set('Authorization', `Bearer ${pin}`) : undefined;
+        return this.http.get<RdioScannerSystemAlertsResponse>(url, { headers });
+    }
+
     /**
      * Fetch new alerts since last fetch time and append to cache
      * Returns the new alerts that were added
      */
     fetchNewAlerts(pin?: string, forceFullRefresh: boolean = false): Observable<RdioScannerAlert[]> {
-        // Prevent concurrent fetches - return cached alerts if already fetching
+        // If a fetch is already in flight, queue a follow-up instead of dropping the
+        // request (issue #229: ALT/push arrives mid-fetch → Alerts tab stays empty).
         if (this.isFetching) {
-            return new Observable<RdioScannerAlert[]>(observer => {
-                // Return empty array if already fetching (will get updates via alerts$ subscription)
-                observer.next([]);
-                observer.complete();
-            });
+            const pending = this.pendingFetch;
+            this.pendingFetch = {
+                pin: pin ?? pending?.pin,
+                forceFullRefresh: forceFullRefresh || !!pending?.forceFullRefresh,
+            };
+            // Current cache for now; queued fetch updates alerts$ when the in-flight one ends.
+            return of([...this.alertsCache]);
         }
 
         this.isFetching = true;
@@ -137,7 +194,7 @@ export class AlertsService {
         }
 
         const headers = pin ? new HttpHeaders().set('Authorization', `Bearer ${pin}`) : undefined;
-        
+
         return new Observable<RdioScannerAlert[]>(observer => {
             this.http.get<any[]>(url, { headers }).subscribe({
                 next: (newAlerts) => {
@@ -151,22 +208,26 @@ export class AlertsService {
                                 typedAlert.transcriptSnippet = typedAlert.transcriptSnippet || typedAlert.transcript || '';
                                 return typedAlert;
                             });
-                            
-                            // Set lastFetchTime to most recent alert's createdAt, or current time if no alerts
+
+                            // Set lastFetchTime to most recent alert's createdAt.
+                            // If the list is empty, leave lastFetchTime at 0 so the next
+                            // fetch is full — advancing to Date.now() would permanently
+                            // skip alerts created just before/around this empty response
+                            // (issue #229: push fires, Alerts tab stays empty).
                             if (this.alertsCache.length > 0) {
                                 // Alerts are returned in descending order (most recent first)
-                                this.lastFetchTime = this.alertsCache[0].createdAt || Date.now();
+                                this.lastFetchTime = this.alertsCache[0].createdAt || 0;
                             } else {
-                                this.lastFetchTime = Date.now();
+                                this.lastFetchTime = 0;
                             }
                         } else {
                             // Convert and deduplicate
                             const existingIds = new Set(this.alertsCache.map(a => a.alertId));
-                            
+
                             for (const alert of newAlerts || []) {
                                 const typedAlert = alert as RdioScannerAlert;
                                 typedAlert.transcriptSnippet = typedAlert.transcriptSnippet || typedAlert.transcript || '';
-                                
+
                                 // Only add if not already in cache
                                 if (!existingIds.has(typedAlert.alertId)) {
                                     alertsToAdd.push(typedAlert);
@@ -175,17 +236,16 @@ export class AlertsService {
 
                             // Append new alerts to the beginning (most recent first)
                             this.alertsCache = [...alertsToAdd, ...this.alertsCache];
-                            
+
                             // Update lastFetchTime to most recent alert's createdAt
-                            // If we got new alerts, use the first one (most recent), otherwise keep current time
                             if (alertsToAdd.length > 0) {
                                 this.lastFetchTime = alertsToAdd[0].createdAt || this.lastFetchTime;
                             } else if (this.alertsCache.length > 0) {
                                 // No new alerts, but we have cached ones - use the most recent cached alert
                                 this.lastFetchTime = this.alertsCache[0].createdAt || this.lastFetchTime;
                             } else {
-                                // No alerts at all - use current time
-                                this.lastFetchTime = Date.now();
+                                // Still empty — next fetch must be full, not since=now
+                                this.lastFetchTime = 0;
                             }
                         }
 
@@ -194,6 +254,15 @@ export class AlertsService {
                         this.writeSessionCache();
 
                         this.isFetching = false;
+                        const queued = this.pendingFetch;
+                        this.pendingFetch = null;
+                        if (queued) {
+                            // Run the deferred fetch; subscribers of alerts$ get the update.
+                            this.fetchNewAlerts(queued.pin, queued.forceFullRefresh).subscribe({
+                                error: (err) => console.error('Error on queued alerts fetch:', err),
+                            });
+                        }
+
                         observer.next(forceFullRefresh ? this.alertsCache : alertsToAdd);
                         observer.complete();
                     } catch (error) {
@@ -205,6 +274,13 @@ export class AlertsService {
                 error: (error) => {
                     console.error('Error fetching new alerts:', error);
                     this.isFetching = false;
+                    const queued = this.pendingFetch;
+                    this.pendingFetch = null;
+                    if (queued) {
+                        this.fetchNewAlerts(queued.pin, queued.forceFullRefresh).subscribe({
+                            error: (err) => console.error('Error on queued alerts fetch:', err),
+                        });
+                    }
                     observer.error(error);
                 }
             });
@@ -250,6 +326,64 @@ export class AlertsService {
         }
         const headers = pin ? new HttpHeaders().set('Authorization', `Bearer ${pin}`) : undefined;
         return this.http.get<any[]>(url, { headers });
+    }
+
+    getTrainingProgress(pin?: string): Observable<GlobalTrainingProgress> {
+        let url = `${this.getFullUrl('/api/transcripts/training-progress')}`;
+        if (pin) {
+            url += `?pin=${encodeURIComponent(pin)}`;
+        }
+        const headers = pin ? new HttpHeaders().set('Authorization', `Bearer ${pin}`) : undefined;
+        return this.http.get<GlobalTrainingProgress>(url, { headers });
+    }
+
+    /**
+     * Apply a pushed incident-mapping update to cached alerts for one call.
+     */
+    patchIncidentUpdate(update: RdioScannerIncidentUpdate): boolean {
+        const next = this.withIncidentUpdate(this.alertsCache, update);
+        if (!next) {
+            return false;
+        }
+        this.alertsCache = next;
+        this.alertsSubject.next([...this.alertsCache]);
+        this.writeSessionCache();
+        return true;
+    }
+
+    /**
+     * Returns a new list with the mapping result applied, or null when no card matched.
+     */
+    withIncidentUpdate(alerts: RdioScannerAlert[], update: RdioScannerIncidentUpdate): RdioScannerAlert[] | null {
+        const callId = Number(update?.callId);
+        if (!Number.isFinite(callId)) {
+            return null;
+        }
+        let changed = false;
+        const next = (alerts || []).map((alert) => {
+            if (Number(alert.callId) !== callId) {
+                return alert;
+            }
+            changed = true;
+            const patched = { ...alert };
+            if (update.incidentAddress !== undefined) {
+                patched.incidentAddress = update.incidentAddress;
+            }
+            if (update.incidentNature !== undefined) {
+                patched.incidentNature = update.incidentNature;
+            }
+            if (update.incidentLat !== undefined) {
+                patched.incidentLat = update.incidentLat;
+            }
+            if (update.incidentLon !== undefined) {
+                patched.incidentLon = update.incidentLon;
+            }
+            if (update.incidentGeocodeStatus !== undefined) {
+                patched.incidentGeocodeStatus = update.incidentGeocodeStatus;
+            }
+            return patched;
+        });
+        return changed ? next : null;
     }
 
     getPreferences(pin?: string): Observable<RdioScannerAlertPreference[]> {

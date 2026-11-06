@@ -17,11 +17,13 @@
  * ****************************************************************************
  */
 
-import { Component, OnInit, ChangeDetectorRef, Input, OnChanges, SimpleChanges } from '@angular/core';
+import { Component, OnInit, ChangeDetectorRef, Input, OnChanges, SimpleChanges, ChangeDetectionStrategy } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBar } from '@angular/material/snack-bar';
+import { MatDialog } from '@angular/material/dialog';
 import { FormBuilder, FormGroup, FormArray, Validators } from '@angular/forms';
 import { RdioScannerAdminService, System } from '../../admin.service';
+import { RdioScannerAdminSystemsSelectComponent, SYSTEMS_SELECT_DIALOG_OPTIONS } from '../systems/select/select.component';
 
 interface PricingOption {
   priceId: string;
@@ -49,6 +51,7 @@ interface UserGroup {
   stripeTaxRateId?: string;
   isPublicRegistration: boolean;
   allowAddExistingUsers: boolean;
+  autoEnableNewTalkgroups: boolean;
   createdAt: number;
 }
 
@@ -65,12 +68,16 @@ interface RegistrationCode {
 }
 
 @Component({
-  selector: 'rdio-scanner-admin-user-groups',
-  templateUrl: './user-groups.component.html',
-  styleUrls: ['./user-groups.component.scss']
+    selector: 'rdio-scanner-admin-user-groups',
+    templateUrl: './user-groups.component.html',
+    styleUrls: ['./user-groups.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
   @Input() form?: FormArray;
+  /** Systems from the loaded admin config (preferred over a separate getConfig call). */
+  @Input() rawSystems?: System[];
   
   groups: UserGroup[] = [];
   loading = false;
@@ -78,11 +85,26 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
   groupForm: FormGroup;
   showCreateForm = false;
   systems: System[] = [];
-  selectedSystemAccess: Array<{id: number, talkgroups: number[] | '*'}> = []; // Format with talkgroups
+  configGroups: any[] = [];
+  configTags: any[] = [];
+  /** Current system/talkgroup access for the create/edit form. Empty = all systems. */
+  selectedSystemAccess: Array<{id: number, talkgroups: number[] | '*'}> = [];
   systemDelayEntries: Array<{systemId: number, delay: number}> = [];
   talkgroupDelayEntries: Array<{systemId: number, talkgroupId: number, delay: number}> = [];
   availableUsers: any[] = [];
   groupAdminMode: 'none' | 'existing' | 'new' = 'none';
+
+  get systemAccessIsAll(): boolean {
+    return this.selectedSystemAccess.length === 0;
+  }
+
+  get systemAccessSummary(): string {
+    if (this.systemAccessIsAll) {
+      return 'All systems';
+    }
+    const n = this.selectedSystemAccess.length;
+    return n === 1 ? '1 system (custom)' : `${n} systems (custom)`;
+  }
 
   // Searchable user selector — create-group form
   userSearchQuery = '';
@@ -136,7 +158,8 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
     private snackBar: MatSnackBar,
     private fb: FormBuilder,
     private adminService: RdioScannerAdminService,
-    private cdr: ChangeDetectorRef
+    private cdr: ChangeDetectorRef,
+    private matDialog: MatDialog,
   ) {
     this.groupForm = this.fb.group({
       id: [0],
@@ -157,16 +180,18 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
       stripeTaxRateId: [''],
       isPublicRegistration: [false],
       allowAddExistingUsers: [false],
+      autoEnableNewTalkgroups: [false],
       groupAdminUserId: [0],
-      newGroupAdminEmail: ['', [Validators.email]],
-      newGroupAdminPassword: ['', [Validators.minLength(6)]],
+      newGroupAdminEmail: [''],
+      newGroupAdminPassword: [''],
       newGroupAdminFirstName: [''],
       newGroupAdminLastName: [''],
-      newGroupAdminZipCode: ['', [Validators.pattern(/^\d{5}(-\d{4})?$/)]]
+      newGroupAdminZipCode: ['']
     });
 
     // Add at least one pricing option by default
     this.addPricingOption();
+    this.updateGroupAdminValidators();
 
     // Set initial validators based on billingEnabled default value
     const initialBillingEnabled = this.groupForm.get('billingEnabled')?.value ?? false;
@@ -189,6 +214,10 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
   }
 
   ngOnChanges(changes: SimpleChanges): void {
+    if (changes['rawSystems']) {
+      this.applySystemsList(this.rawSystems);
+    }
+
     if (changes['form'] && this.form) {
       // When form data is provided (e.g., from import for review), use it
       this.updateGroupsFromForm();
@@ -197,7 +226,8 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
 
   updateGroupsFromForm(): void {
     if (this.form) {
-      this.groups = this.form.value.map((group: any) => ({
+      // Use getRawValue() so disabled shadow arrays still report their values.
+      this.groups = this.form.getRawValue().map((group: any) => ({
         id: group.id || 0,
         name: group.name || '',
         description: group.description || '',
@@ -216,6 +246,7 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
         stripeTaxRateId: group.stripeTaxRateId || '',
         isPublicRegistration: group.isPublicRegistration || false,
         allowAddExistingUsers: group.allowAddExistingUsers || false,
+        autoEnableNewTalkgroups: group.autoEnableNewTalkgroups || false,
         createdAt: group.createdAt || 0
       }));
       this.cdr.detectChanges();
@@ -253,9 +284,15 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
   }
 
   removePricingOption(index: number): void {
-    if (this.pricingOptionsArray.length > 1) {
-      this.pricingOptionsArray.removeAt(index);
+    if (this.pricingOptionsArray.length <= 1) {
+      return;
     }
+    const label = (this.pricingOptionsArray.at(index)?.get('label')?.value || '').toString().trim()
+      || 'this pricing option';
+    if (!confirm(`Are you sure you want to delete ${label}?`)) {
+      return;
+    }
+    this.pricingOptionsArray.removeAt(index);
   }
 
   updatePricingOptionValidators(billingEnabled: boolean): void {
@@ -269,6 +306,41 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
       formGroup.get('amount')?.setValidators(validators);
       formGroup.get('amount')?.updateValueAndValidity();
     });
+  }
+
+  /**
+   * "Create new group admin" fields are hidden when editing an existing group, but
+   * they still lived on the FormGroup with minLength/pattern validators. That kept
+   * the Update button greyed out even when only changing talkgroup access.
+   */
+  updateGroupAdminValidators(): void {
+    const requireNewAdmin = !this.editingGroup && this.groupAdminMode === 'new';
+    const zipPattern = /^\d{5}(-\d{4})?$/;
+
+    const set = (name: string, validators: any[]) => {
+      const ctrl = this.groupForm.get(name);
+      ctrl?.setValidators(validators);
+      ctrl?.updateValueAndValidity({ emitEvent: false });
+    };
+
+    if (requireNewAdmin) {
+      set('newGroupAdminEmail', [Validators.required, Validators.email]);
+      set('newGroupAdminPassword', [Validators.required, Validators.minLength(6)]);
+      set('newGroupAdminFirstName', [Validators.required]);
+      set('newGroupAdminLastName', [Validators.required]);
+      set('newGroupAdminZipCode', [Validators.required, Validators.pattern(zipPattern)]);
+    } else {
+      set('newGroupAdminEmail', []);
+      set('newGroupAdminPassword', []);
+      set('newGroupAdminFirstName', []);
+      set('newGroupAdminLastName', []);
+      set('newGroupAdminZipCode', []);
+    }
+    this.groupForm.updateValueAndValidity();
+  }
+
+  onGroupAdminModeChange(): void {
+    this.updateGroupAdminValidators();
   }
 
   loadUsers(): void {
@@ -324,9 +396,71 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
   }
 
   loadSystems(): void {
+    if (this.rawSystems?.length) {
+      this.applySystemsList(this.rawSystems);
+    }
+
     this.adminService.getConfig().then(config => {
-      this.systems = config.systems || [];
+      if (!this.rawSystems?.length) {
+        this.applySystemsList(config.systems);
+      }
+      this.configGroups = config.groups || [];
+      this.configTags = config.tags || [];
+      this.cdr.markForCheck();
     });
+  }
+
+  private applySystemsList(systems: System[] | undefined): void {
+    this.systems = systems || [];
+    this.cdr.markForCheck();
+  }
+
+  /** Open the same systems/talkgroups picker used by API keys and downstreams. */
+  selectGroupSystems(): void {
+    try {
+      const groupsArray = this.fb.array(
+        this.configGroups.map((group: any) => this.adminService.newGroupForm(group))
+      );
+      const tagsArray = this.fb.array(
+        this.configTags.map((tag: any) => this.adminService.newTagForm(tag))
+      );
+      const systemsArray = this.fb.array(
+        this.systems.map((system: any) => this.adminService.newSystemForm(system, true, true))
+      );
+
+      const currentAccess = this.systemAccessIsAll ? '*' : this.selectedSystemAccess;
+      const rootForm = this.fb.group({
+        groups: groupsArray,
+        tags: tagsArray,
+        systems: systemsArray,
+        access: this.fb.group({
+          systems: [currentAccess],
+        }),
+      });
+      const accessForm = rootForm.get('access') as FormGroup;
+
+      const matDialogRef = this.matDialog.open(RdioScannerAdminSystemsSelectComponent, {
+        ...SYSTEMS_SELECT_DIALOG_OPTIONS,
+        data: { access: accessForm, rawSystems: this.systems },
+      });
+
+      matDialogRef.afterClosed().subscribe((data) => {
+        if (data === null || data === undefined) {
+          return;
+        }
+        if (data === '*') {
+          this.selectedSystemAccess = [];
+        } else if (Array.isArray(data)) {
+          this.selectedSystemAccess = data;
+        } else {
+          this.selectedSystemAccess = [];
+        }
+        this.cdr.markForCheck();
+      });
+    } catch (error) {
+      console.error('Error opening system selection:', error);
+      this.snackBar.open('Error opening system selection: ' + error, 'Close', { duration: 5000 });
+    }
   }
 
   async loadGroups(forceReload: boolean = false): Promise<void> {
@@ -388,6 +522,8 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
       maxUsers: 0,
       billingEnabled: false,
       isPublicRegistration: false,
+      allowAddExistingUsers: false,
+      autoEnableNewTalkgroups: false,
       groupAdminUserId: 0,
       newGroupAdminEmail: '',
       newGroupAdminPassword: '',
@@ -396,6 +532,8 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
       newGroupAdminZipCode: ''
     });
     this.groupAdminMode = 'none';
+    this.updateGroupAdminValidators();
+    this.updatePricingOptionValidators(false);
     this.showCreateForm = true;
   }
   
@@ -422,96 +560,6 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
     }
     // Trigger change detection to update the talkgroups list
     this.cdr.detectChanges();
-  }
-
-  addSystemAccess(): void {
-    if (this.selectedSystemAccess.length < this.systems.length) {
-      this.selectedSystemAccess.push({
-        id: 0,
-        talkgroups: '*'
-      });
-    }
-  }
-
-  removeSystemAccess(index: number): void {
-    this.selectedSystemAccess.splice(index, 1);
-  }
-
-  onSystemSelected(index: number, systemRef: number): void {
-    // Reset talkgroup selection to '*' (all talkgroups) when system changes
-    if (this.selectedSystemAccess[index]) {
-      this.selectedSystemAccess[index].talkgroups = '*';
-    }
-    // Trigger change detection to update the talkgroups list
-    this.cdr.detectChanges();
-  }
-
-  getTalkgroupsForSystemAccess(systemRef: number): any[] {
-    const system = this.systems.find(s => s.systemRef === systemRef);
-    return system?.talkgroups || [];
-  }
-
-  toggleTalkgroupInSystem(systemIndex: number, talkgroupId: number, event?: any): void {
-    const access = this.selectedSystemAccess[systemIndex];
-    if (!access) return;
-
-    // If event is provided (from checkbox), use the checked state
-    const shouldSelect = event ? event.checked : !this.isTalkgroupSelected(systemIndex, talkgroupId);
-
-    if (access.talkgroups === '*') {
-      if (!shouldSelect) {
-        // Switch from all to specific list, excluding this talkgroup
-        const system = this.systems.find(s => s.systemRef === access.id);
-        if (system && system.talkgroups) {
-          access.talkgroups = system.talkgroups
-            .map(tg => tg.talkgroupRef)
-            .filter((id): id is number => id !== null && id !== undefined && id !== talkgroupId);
-        } else {
-          access.talkgroups = [];
-        }
-      }
-      // If shouldSelect is true and it's already '*', do nothing
-    } else if (Array.isArray(access.talkgroups)) {
-      const index = access.talkgroups.indexOf(talkgroupId);
-      if (shouldSelect && index < 0) {
-        access.talkgroups.push(talkgroupId);
-      } else if (!shouldSelect && index >= 0) {
-        access.talkgroups.splice(index, 1);
-      }
-    }
-  }
-
-  isTalkgroupSelected(systemIndex: number, talkgroupId: number): boolean {
-    const access = this.selectedSystemAccess[systemIndex];
-    if (!access) return false;
-    if (access.talkgroups === '*') return true;
-    if (Array.isArray(access.talkgroups)) {
-      return access.talkgroups.includes(talkgroupId);
-    }
-    return false;
-  }
-
-  selectAllTalkgroups(systemIndex: number): void {
-    const access = this.selectedSystemAccess[systemIndex];
-    if (!access) return;
-    access.talkgroups = '*';
-  }
-
-  unselectAllTalkgroups(systemIndex: number): void {
-    const access = this.selectedSystemAccess[systemIndex];
-    if (!access) return;
-    access.talkgroups = [];
-  }
-
-  hasTalkgroupsSelected(access: {id: number, talkgroups: number[] | '*'}): boolean {
-    return access.talkgroups === '*' || (Array.isArray(access.talkgroups) && access.talkgroups.length > 0);
-  }
-
-  getTalkgroupCount(access: {id: number, talkgroups: number[] | '*'}): number {
-    if (access.talkgroups === '*') {
-      return 0; // Will show "All talkgroups" instead
-    }
-    return Array.isArray(access.talkgroups) ? access.talkgroups.length : 0;
   }
 
   getTalkgroupsForSystem(systemRef: number): any[] {
@@ -608,6 +656,7 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
     // Update validators based on the group's billingEnabled value
     const billingEnabled = group.billingEnabled ?? false;
     this.updatePricingOptionValidators(billingEnabled);
+    this.updateGroupAdminValidators();
     
     this.showCreateForm = true;
   }
@@ -758,6 +807,7 @@ export class RdioScannerAdminUserGroupsComponent implements OnInit, OnChanges {
     this.selectedSystemAccess = [];
     this.groupForm.reset();
     this.groupAdminMode = 'none';
+    this.updateGroupAdminValidators();
     this.userSearchQuery = '';
     this.systemDelayEntries = [];
     this.talkgroupDelayEntries = [];

@@ -24,6 +24,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // migrateAccesses - REMOVED: Access codes functionality has been removed
@@ -773,8 +775,9 @@ func migrateLogs(db *Database) error {
 			continue
 		}
 
-		query = `INSERT INTO "logs" ("logId", "level", "message", "timestamp") VALUES ($1, $2, $3, $4)`
-		if _, err = tx.Exec(query, l.Id, l.Level, l.Message, timestamp); err != nil {
+		category := CategorizeLogMessage(message.String)
+		query = `INSERT INTO "logs" ("logId", "level", "category", "message", "timestamp") VALUES ($1, $2, $3, $4, $5)`
+		if _, err = tx.Exec(query, l.Id, l.Level, category, l.Message, timestamp); err != nil {
 			log.Println(formatError(err, query))
 		}
 	}
@@ -1711,6 +1714,22 @@ func migrateUserGroupsMaxUsers(db *Database) error {
 	return nil
 }
 
+// migrateUserAlertPushPreferences adds per-user push subscription flags for no-audio health alerts.
+func migrateUserAlertPushPreferences(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "pushSystemNoAudioAlerts" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "pushApiKeyNoAudioAlerts" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "systemNoAudioAlertSystems" text NOT NULL DEFAULT ''`,
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "apiKeyNoAudioAlertApiKeys" text NOT NULL DEFAULT ''`,
+	}
+	for _, query := range queries {
+		if _, err := db.Sql.Exec(query); err != nil {
+			log.Printf("migration note (user alert push preferences): %v", err)
+		}
+	}
+	return nil
+}
+
 // migrateSystemAdmins adds systemAdmin column to users table and creates systemAlerts table
 func migrateSystemAdmins(db *Database) error {
 	// Add systemAdmin column to users table
@@ -1864,6 +1883,32 @@ func migrateUserForcePasswordReset(db *Database) error {
 	query := `ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "forcePasswordReset" boolean NOT NULL DEFAULT false`
 	if _, err := db.Sql.Exec(query); err != nil {
 		log.Printf("migration note: %v", err)
+	}
+	return nil
+}
+
+// migrateUserSuspended adds suspended column to users table
+func migrateUserSuspended(db *Database) error {
+	query := `ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "suspended" boolean NOT NULL DEFAULT false`
+	if _, err := db.Sql.Exec(query); err != nil {
+		log.Printf("migration note: %v", err)
+	}
+	return nil
+}
+
+// migrateUserGroupIds adds the userGroupIds column (JSON array of all groups a
+// user belongs to) and backfills existing single-group users to [userGroupId].
+func migrateUserGroupIds(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "userGroupIds" text NOT NULL DEFAULT ''`,
+		// Backfill: users with a primary group but no membership array get [primary].
+		`UPDATE "users" SET "userGroupIds" = '[' || "userGroupId" || ']'
+			WHERE ("userGroupIds" IS NULL OR "userGroupIds" = '') AND "userGroupId" > 0`,
+	}
+	for _, query := range queries {
+		if _, err := db.Sql.Exec(query); err != nil {
+			log.Printf("migration note: %v", err)
+		}
 	}
 	return nil
 }
@@ -2426,26 +2471,35 @@ func migrateSystemHealthAlertOptions(db *Database) error {
 // migrateCallUnitsLabel adds a "label" column to the callUnits table to persist
 // P25 talker aliases and other dynamic unit labels submitted with calls.
 func migrateCallUnitsLabel(db *Database) error {
-	// Check if column already exists
 	var exists bool
 	if err := db.Sql.QueryRow(`
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'callUnits' AND column_name = 'label'
+			WHERE table_schema = 'public'
+			  AND table_name = 'callUnits'
+			  AND column_name = 'label'
 		)`).Scan(&exists); err != nil {
-		return fmt.Errorf("migrateCallUnitsLabel: %w", err)
+		return fmt.Errorf("check label column: %w", err)
 	}
 	if exists {
 		return nil
 	}
 
 	log.Println("migrating callUnits: adding label column for P25 talker aliases...")
-	queries := []string{
-		`ALTER TABLE "callUnits" ADD COLUMN IF NOT EXISTS "label" text NOT NULL DEFAULT ''`,
+	// Avoid ADD COLUMN ... NOT NULL DEFAULT in one step — on some Postgres builds that
+	// rewrites large callUnits tables and can drop the client connection (unexpected EOF).
+	if _, err := db.Sql.Exec(`ALTER TABLE "callUnits" ADD COLUMN IF NOT EXISTS "label" text`); err != nil {
+		return fmt.Errorf("add label column: %w", err)
 	}
-	if err := db.migrateWithSchema("20260303000000-callunits-label", queries, true); err != nil {
-		return fmt.Errorf("migrateCallUnitsLabel: %w", err)
+	if _, err := db.Sql.Exec(`ALTER TABLE "callUnits" ALTER COLUMN "label" SET DEFAULT ''`); err != nil {
+		log.Printf("migration note (callUnits label default): %v", err)
 	}
+	if _, err := db.Sql.Exec(`UPDATE "callUnits" SET "label" = '' WHERE "label" IS NULL`); err != nil {
+		log.Printf("migration note (callUnits label null fill): %v", err)
+	} else if _, err := db.Sql.Exec(`ALTER TABLE "callUnits" ALTER COLUMN "label" SET NOT NULL`); err != nil {
+		log.Printf("migration note (callUnits label not null): %v", err)
+	}
+	_, _ = db.Sql.Exec(`INSERT INTO "rdioScannerMeta" ("name") VALUES ('20260303000000-callunits-label') ON CONFLICT ("name") DO NOTHING`)
 	log.Println("callUnits label column migration completed")
 	return nil
 }
@@ -2531,18 +2585,38 @@ func migrateLogsIndex(db *Database) error {
 		return nil
 	}
 
-	// CONCURRENTLY builds the index without holding a write lock on the logs table,
-	// so the server stays responsive during startup even on very large log tables.
-	// It cannot run inside a transaction, which is fine here.
-	log.Println("building logs_timestamp_idx concurrently (this may take a few minutes on large tables)...")
-	query := `CREATE INDEX CONCURRENTLY "logs_timestamp_idx" ON "logs" ("timestamp" DESC)`
-	if _, err := db.Sql.Exec(query); err != nil {
-		return fmt.Errorf("migrateLogsIndex: %w", err)
+	log.Println("logs timestamp index will be built in background after startup")
+	return nil
+}
+
+func ensureLogsTimestampIndexBackground(db *Database) {
+	var exists bool
+	checkQuery := `SELECT EXISTS (
+		SELECT 1 FROM pg_indexes
+		WHERE tablename = 'logs' AND indexname = 'logs_timestamp_idx'
+	)`
+	if err := db.Sql.QueryRow(checkQuery).Scan(&exists); err != nil {
+		writeLogStdout(fmt.Sprintf("migration note (logs timestamp index check): %v", err))
+		return
+	}
+	if exists {
+		return
 	}
 
-	log.Println("logs timestamp index migration completed successfully")
+	writeLogStdout("building logs_timestamp_idx concurrently in background...")
+	if _, err := db.Sql.Exec(`CREATE INDEX CONCURRENTLY "logs_timestamp_idx" ON "logs" ("timestamp" DESC)`); err != nil {
+		writeLogStdout(fmt.Sprintf("migration note (logs timestamp index): %v", err))
+		return
+	}
+	writeLogStdout("logs timestamp index build completed")
+}
 
-	return nil
+// deferPostStartupMaintenance runs heavy, non-critical DB work after the server
+// is listening and call workers are running.
+func deferPostStartupMaintenance(db *Database) {
+	go ensureBootstrapIndexesBackground(db)
+	go ensureLogsTimestampIndexBackground(db)
+	startLogsCategoryMaintenance(db)
 }
 
 // migrateAudioFingerprinting adds the audioFingerprint column to the calls table.
@@ -2749,14 +2823,660 @@ func migratePostgresSiteRefToText(db *Database) error {
 // audio to raw PCM and hashing the samples, making it codec/container-agnostic.
 // Empty string for rows ingested before this migration was added.
 func migrateCallsAudioHash(db *Database) error {
-	qs := []string{
-		`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "audioHash" text NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS "idx_calls_audioHash" ON "calls" ("systemId", "talkgroupId", "audioHash") WHERE "audioHash" != ''`,
+	if _, err := db.Sql.Exec(`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "audioHash" text NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("migrateCallsAudioHash: %w", err)
 	}
-	for _, q := range qs {
+	if _, err := db.Sql.Exec(`CREATE INDEX IF NOT EXISTS "idx_calls_audioHash" ON "calls" ("systemId", "talkgroupId", "audioHash") WHERE "audioHash" != ''`); err != nil {
+		log.Printf("migration note (calls audioHash index): %v", err)
+	}
+	return nil
+}
+
+func migrateCallsTrainingReview(db *Database) error {
+	for _, q := range []string{
+		`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "reviewedTranscript" text NOT NULL DEFAULT ''`,
+		`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "trainingReviewStatus" text NOT NULL DEFAULT ''`,
+	} {
 		if _, err := db.Sql.Exec(q); err != nil {
-			return fmt.Errorf("migrateCallsAudioHash: %w", err)
+			return fmt.Errorf("migrateCallsTrainingReview: %w", err)
 		}
+	}
+	if _, err := db.Sql.Exec(`CREATE INDEX IF NOT EXISTS "calls_training_review_idx" ON "calls" ("trainingReviewStatus", "transcriptionStatus", "timestamp" DESC)`); err != nil {
+		log.Printf("migration note (calls training review index): %v", err)
+	}
+	// Partial index for the pending-review queue (callId DESC matches list query).
+	partial := `CREATE INDEX IF NOT EXISTS "calls_transcript_review_pending_idx" ON "calls" ("callId" DESC) WHERE "transcript" <> '' AND "transcriptionStatus" = 'completed' AND COALESCE("trainingReviewStatus", '') <> 'submitted'`
+	if _, err := db.Sql.Exec(partial); err != nil {
+		// SQLite < 3.8 or older PG without partial indexes — non-fatal.
+		log.Printf("migrateCallsTrainingReview: partial index skipped: %v", err)
+	}
+	return nil
+}
+
+// migrateToneSetAutoLearn adds auto-learn tone set support.
+func migrateToneSetAutoLearn(db *Database) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS "toneSetLearnCandidates" (
+			"candidateId" bigserial NOT NULL PRIMARY KEY,
+			"systemId" bigint NOT NULL,
+			"talkgroupId" bigint NOT NULL,
+			"signatureHash" text NOT NULL,
+			"patternType" text NOT NULL,
+			"toneSetDraft" text NOT NULL DEFAULT '{}',
+			"callRecords" text NOT NULL DEFAULT '[]',
+			"firstSeenAt" bigint NOT NULL DEFAULT 0,
+			"lastSeenAt" bigint NOT NULL DEFAULT 0,
+			"reviewEmailedAt" bigint NOT NULL DEFAULT 0
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS "toneSetLearnCandidates_sig_idx" ON "toneSetLearnCandidates" ("systemId", "talkgroupId", "signatureHash")`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnToneSets" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "talkgroups" ADD COLUMN IF NOT EXISTS "autoLearnToneSets" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "talkgroups" ADD COLUMN IF NOT EXISTS "alertingTalkgroup" boolean NOT NULL DEFAULT false`,
+	}
+	for _, q := range queries {
+		if _, err := db.Sql.Exec(q); err != nil {
+			log.Printf("migrateToneSetAutoLearn note: %v", err)
+		}
+	}
+	return nil
+}
+
+func migrateBulkToneDetection(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "bulkToneDetectionEnabled" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "bulkToneDetectionTagIds" text NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "bulkToneDetectionAutoOffDays" integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "bulkToneDetectionExpiresAt" bigint NOT NULL DEFAULT 0`,
+	}
+	for _, q := range queries {
+		if _, err := db.Sql.Exec(q); err != nil {
+			log.Printf("migrateBulkToneDetection note: %v", err)
+		}
+	}
+	return nil
+}
+
+// migrateUnitAliasAutoLearn adds auto-learn unit alias support.
+func migrateUnitAliasAutoLearn(db *Database) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS "unitAliasLearnCandidates" (
+			"candidateId" bigserial NOT NULL PRIMARY KEY,
+			"systemId" bigint NOT NULL,
+			"talkgroupId" bigint NOT NULL,
+			"unitRef" bigint NOT NULL,
+			"callRecords" text NOT NULL DEFAULT '[]',
+			"firstSeenAt" bigint NOT NULL DEFAULT 0,
+			"lastSeenAt" bigint NOT NULL DEFAULT 0,
+			"finalizedAt" bigint NOT NULL DEFAULT 0
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS "unitAliasLearnCandidates_ref_idx" ON "unitAliasLearnCandidates" ("systemId", "talkgroupId", "unitRef")`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnUnitAliases" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnUnitAliasesAutoOffDays" integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnUnitAliasesExpiresAt" bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE "talkgroups" ADD COLUMN IF NOT EXISTS "autoLearnUnitAliases" boolean NOT NULL DEFAULT false`,
+	}
+	for _, q := range queries {
+		if _, err := db.Sql.Exec(q); err != nil {
+			log.Printf("migrateUnitAliasAutoLearn note: %v", err)
+		}
+	}
+	return nil
+}
+
+// migrateUnitAliasSuggestionsReview adds Accept/Dismiss review columns for unit alias learning.
+func migrateUnitAliasSuggestionsReview(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "unitAliasLearnCandidates" ADD COLUMN IF NOT EXISTS "suggestedLabel" text NOT NULL DEFAULT ''`,
+		`ALTER TABLE "unitAliasLearnCandidates" ADD COLUMN IF NOT EXISTS "reason" text NOT NULL DEFAULT ''`,
+		`ALTER TABLE "unitAliasLearnCandidates" ADD COLUMN IF NOT EXISTS "usedOpenAI" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "unitAliasLearnCandidates" ADD COLUMN IF NOT EXISTS "acceptedAt" bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE "unitAliasLearnCandidates" ADD COLUMN IF NOT EXISTS "dismissedAt" bigint NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS "unitAliasLearnCandidates_review_idx" ON "unitAliasLearnCandidates" ("systemId", "dismissedAt", "acceptedAt", "finalizedAt", "lastSeenAt" DESC)`,
+	}
+	for _, q := range queries {
+		if _, err := db.Sql.Exec(q); err != nil {
+			log.Printf("migrateUnitAliasSuggestionsReview note: %v", err)
+		}
+	}
+	return nil
+}
+
+// migrateAutoLearnTagRollout adds tag-based rollout for tone and unit alias auto-learn.
+func migrateAutoLearnTagRollout(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnToneSetsTagIds" text NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnToneSetsAutoOffDays" integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnToneSetsExpiresAt" bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "autoLearnUnitAliasesTagIds" text NOT NULL DEFAULT '[]'`,
+	}
+	for _, q := range queries {
+		if _, err := db.Sql.Exec(q); err != nil {
+			log.Printf("migrateAutoLearnTagRollout note: %v", err)
+		}
+	}
+	return nil
+}
+
+const (
+	logsCategoryMigrationID      = "20260608000000-logs-category"
+	logsAPIRecategorizeMigration = "20260608000001-logs-api-recategorize"
+)
+
+func logsMigrationDone(db *Database, name string) bool {
+	var count int
+	if err := db.Sql.QueryRow(`SELECT COUNT(*) FROM "rdioScannerMeta" WHERE "name" = $1`, name).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
+}
+
+func markLogsMigrationDone(db *Database, name string) {
+	if _, err := db.Sql.Exec(`INSERT INTO "rdioScannerMeta" ("name") VALUES ($1) ON CONFLICT ("name") DO NOTHING`, name); err != nil {
+		log.Printf("migration note (%s): %v", name, err)
+	}
+}
+
+func batchUpdateLogCategories(db *Database, logIDs []int64, categories []string) error {
+	if len(logIDs) == 0 {
+		return nil
+	}
+	_, err := db.Sql.Exec(`
+		UPDATE "logs" AS l
+		SET "category" = v.category
+		FROM (
+			SELECT unnest($1::bigint[]) AS "logId",
+			       unnest($2::text[]) AS category
+		) AS v
+		WHERE l."logId" = v."logId"
+	`, pq.Array(logIDs), pq.Array(categories))
+	return err
+}
+
+// migrateLogsCategory adds the category column during schema migration only.
+// Index build and row backfill are deferred to startLogsCategoryMaintenance so
+// startup, call ingest, and client serving are not blocked on large log tables.
+//
+// Important: do NOT use ADD COLUMN ... NOT NULL DEFAULT in one step. On PostgreSQL
+// versions that rewrite the table for that form, existing btree indexes are
+// rebuilt. Some installs have oversized log "message" values (and occasionally
+// an index that includes message), which then fails with SQLSTATE 54000
+// ("index row requires N bytes, maximum size is 8191") and blocks startup.
+func migrateLogsCategory(db *Database) error {
+	log.Println("migrating logs category column...")
+
+	var exists bool
+	check := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'logs'
+			  AND column_name = 'category'
+		)`
+	if err := db.Sql.QueryRow(check).Scan(&exists); err != nil {
+		// Non-fatal: admin log filtering works without categories.
+		log.Printf("migration note (logs category column check): %v", err)
+		return nil
+	}
+	if exists {
+		log.Println("logs category column already exists, skipping")
+		return nil
+	}
+
+	// Nullable, no DEFAULT — metadata-only on all supported PG versions (no rewrite).
+	if _, err := db.Sql.Exec(`ALTER TABLE "logs" ADD COLUMN "category" text`); err != nil {
+		log.Printf("migration note (logs category add column): %v", err)
+		return nil
+	}
+	if _, err := db.Sql.Exec(`ALTER TABLE "logs" ALTER COLUMN "category" SET DEFAULT 'system'`); err != nil {
+		log.Printf("migration note (logs category default): %v", err)
+	}
+
+	log.Println("logs category column added (backfill/index deferred to background)")
+	return nil
+}
+
+// startLogsCategoryMaintenance runs after the server is ready. It builds the
+// category index and backfills rows in small throttled batches so the shared
+// DB pool stays available for calls and live clients.
+func startLogsCategoryMaintenance(db *Database) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				writeLogStdout(fmt.Sprintf("logs category maintenance panic: %v", r))
+			}
+		}()
+
+		if !logsMigrationDone(db, logsCategoryMigrationID) {
+			writeLogStdout("logs category backfill started in background")
+			createLogsCategoryIndexBackground(db)
+			backfillLogsCategory(db)
+		}
+
+		if !logsMigrationDone(db, logsAPIRecategorizeMigration) {
+			writeLogStdout("logs api recategorize started in background")
+			backfillLogsAPIRecategorize(db)
+		}
+	}()
+}
+
+func createLogsCategoryIndexBackground(db *Database) {
+	dropInvalidLogsIndexes(db)
+
+	var exists bool
+	checkQuery := `SELECT EXISTS (
+		SELECT 1 FROM pg_indexes
+		WHERE tablename = 'logs' AND indexname = 'logs_category_timestamp_idx'
+	)`
+	if err := db.Sql.QueryRow(checkQuery).Scan(&exists); err != nil {
+		log.Printf("migration note (logs category index check): %v", err)
+		if _, err2 := db.Sql.Exec(`CREATE INDEX IF NOT EXISTS "logs_category_timestamp_idx" ON "logs" ("category", "timestamp" DESC)`); err2 != nil {
+			log.Printf("migration note (logs category index): %v", err2)
+		}
+		return
+	}
+
+	if exists {
+		return
+	}
+
+	writeLogStdout("building logs_category_timestamp_idx concurrently in background...")
+	if _, err := db.Sql.Exec(`CREATE INDEX CONCURRENTLY "logs_category_timestamp_idx" ON "logs" ("category", "timestamp" DESC)`); err != nil {
+		writeLogStdout(fmt.Sprintf("migration note (logs category index): %v", err))
+	}
+}
+
+// dropInvalidLogsIndexes removes leftover INVALID indexes from failed
+// CREATE INDEX CONCURRENTLY attempts so later maintenance can retry cleanly.
+func dropInvalidLogsIndexes(db *Database) {
+	rows, err := db.Sql.Query(`
+		SELECT c.relname
+		FROM pg_class c
+		JOIN pg_index i ON i.indexrelid = c.oid
+		JOIN pg_class t ON t.oid = i.indrelid
+		WHERE t.relname = 'logs'
+		  AND NOT i.indisvalid
+	`)
+	if err != nil {
+		writeLogStdout(fmt.Sprintf("migration note (logs invalid index scan): %v", err))
+		return
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil || name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	for _, name := range names {
+		writeLogStdout(fmt.Sprintf("dropping invalid logs index %s...", name))
+		q := fmt.Sprintf(`DROP INDEX CONCURRENTLY IF EXISTS %s`, pq.QuoteIdentifier(name))
+		if _, err := db.Sql.Exec(q); err != nil {
+			writeLogStdout(fmt.Sprintf("migration note (drop invalid logs index %s): %v", name, err))
+		}
+	}
+}
+
+func backfillLogsAPIRecategorize(db *Database) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("logs api recategorize panic: %v", r)
+		}
+	}()
+
+	const batchSize = 200
+	const batchPause = 500 * time.Millisecond
+	var lastID int64
+	updated := 0
+
+	for {
+		rows, err := db.Sql.Query(`
+			SELECT "logId", "message"
+			FROM "logs"
+			WHERE "logId" > $1
+			  AND "message" ILIKE 'api:%'
+			  AND "category" = 'calls'
+			ORDER BY "logId"
+			LIMIT $2
+		`, lastID, batchSize)
+		if err != nil {
+			writeLogStdout(fmt.Sprintf("logs api recategorize query failed: %v", err))
+			return
+		}
+
+		logIDs := make([]int64, 0, batchSize)
+		categories := make([]string, 0, batchSize)
+		batchCount := 0
+		for rows.Next() {
+			var logID int64
+			var msg string
+			if err := rows.Scan(&logID, &msg); err != nil {
+				continue
+			}
+			lastID = logID
+			batchCount++
+			category := CategorizeLogMessage(msg)
+			if category == LogCategoryCalls {
+				continue
+			}
+			logIDs = append(logIDs, logID)
+			categories = append(categories, category)
+		}
+		rows.Close()
+
+		if len(logIDs) > 0 {
+			if err := batchUpdateLogCategories(db, logIDs, categories); err != nil {
+				writeLogStdout(fmt.Sprintf("logs api recategorize batch update failed: %v", err))
+				return
+			}
+			updated += len(logIDs)
+		}
+
+		if batchCount < batchSize {
+			break
+		}
+		time.Sleep(batchPause)
+	}
+
+	markLogsMigrationDone(db, logsAPIRecategorizeMigration)
+
+	if updated > 0 {
+		writeLogStdout(fmt.Sprintf("logs api recategorize completed (%d rows updated)", updated))
+	} else {
+		writeLogStdout("logs api recategorize completed (no rows needed updating)")
+	}
+}
+
+func backfillLogsCategory(db *Database) {
+	const batchSize = 200
+	const batchPause = 500 * time.Millisecond
+	var lastID int64
+	updated := 0
+
+	for {
+		rows, err := db.Sql.Query(`
+			SELECT "logId", "message"
+			FROM "logs"
+			WHERE "logId" > $1
+			  AND ("category" IS NULL OR "category" = 'system')
+			ORDER BY "logId"
+			LIMIT $2
+		`, lastID, batchSize)
+		if err != nil {
+			writeLogStdout(fmt.Sprintf("logs category backfill query failed: %v", err))
+			return
+		}
+
+		logIDs := make([]int64, 0, batchSize)
+		categories := make([]string, 0, batchSize)
+		batchCount := 0
+		for rows.Next() {
+			var logID int64
+			var msg string
+			if err := rows.Scan(&logID, &msg); err != nil {
+				continue
+			}
+			lastID = logID
+			batchCount++
+			logIDs = append(logIDs, logID)
+			categories = append(categories, CategorizeLogMessage(msg))
+		}
+		rows.Close()
+
+		if len(logIDs) > 0 {
+			if err := batchUpdateLogCategories(db, logIDs, categories); err != nil {
+				writeLogStdout(fmt.Sprintf("logs category backfill batch update failed: %v", err))
+				return
+			}
+			updated += len(logIDs)
+		}
+
+		if batchCount < batchSize {
+			break
+		}
+		if updated%10000 == 0 {
+			writeLogStdout(fmt.Sprintf("logs category backfill: %d rows updated...", updated))
+		}
+		time.Sleep(batchPause)
+	}
+
+	// Fill any remaining NULLs, then tighten the column once data is safe.
+	if _, err := db.Sql.Exec(`UPDATE "logs" SET "category" = 'system' WHERE "category" IS NULL`); err != nil {
+		writeLogStdout(fmt.Sprintf("logs category null fill failed: %v", err))
+	} else if _, err := db.Sql.Exec(`ALTER TABLE "logs" ALTER COLUMN "category" SET NOT NULL`); err != nil {
+		writeLogStdout(fmt.Sprintf("migration note (logs category set not null): %v", err))
+	}
+
+	markLogsMigrationDone(db, logsCategoryMigrationID)
+	writeLogStdout(fmt.Sprintf("logs category backfill completed (%d rows categorized)", updated))
+}
+
+// migrateSdrtrunkHealth stores the latest one-way health report from each SDRTrunk API key.
+func migrateSdrtrunkHealth(db *Database) error {
+	query := `CREATE TABLE IF NOT EXISTS "sdrtrunkHealth" (
+		"apikeyId" bigint PRIMARY KEY,
+		"systemRef" integer NOT NULL DEFAULT 0,
+		"receivedAt" bigint NOT NULL DEFAULT 0,
+		"reporting" boolean NOT NULL DEFAULT true,
+		"version" text NOT NULL DEFAULT '',
+		"uploaderState" text NOT NULL DEFAULT '',
+		"controlLost" boolean NOT NULL DEFAULT false,
+		"tunerError" boolean NOT NULL DEFAULT false,
+		"uploaderError" boolean NOT NULL DEFAULT false,
+		"report" text NOT NULL DEFAULT ''
+	)`
+	if _, err := db.Sql.Exec(query); err != nil {
+		log.Printf("migration note (sdrtrunk health): %v", err)
+	}
+	return nil
+}
+
+// migrateApikeyPurpose separates call-upload keys from SDRTrunk site control keys.
+func migrateApikeyPurpose(db *Database) error {
+	query := `ALTER TABLE "apikeys" ADD COLUMN IF NOT EXISTS "purpose" text NOT NULL DEFAULT 'upload'`
+	if _, err := db.Sql.Exec(query); err != nil {
+		log.Printf("migration note (apikey purpose): %v", err)
+	}
+	return nil
+}
+
+// migrateApikeyNoAudioMonitoring adds per-API-key ingest liveness tracking and alert settings.
+func migrateApikeyNoAudioMonitoring(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "apikeys" ADD COLUMN IF NOT EXISTS "lastCallAt" bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE "apikeys" ADD COLUMN IF NOT EXISTS "noAudioAlertsEnabled" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "apikeys" ADD COLUMN IF NOT EXISTS "noAudioThresholdMinutes" integer NOT NULL DEFAULT 10`,
+	}
+	for _, query := range queries {
+		if _, err := db.Sql.Exec(query); err != nil {
+			log.Printf("migration note (apikey no-audio): %v", err)
+		}
+	}
+	return nil
+}
+
+// migrateRetentionDays adds per-system and per-talkgroup call retention overrides.
+func migrateRetentionDays(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "retentionDays" integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE "talkgroups" ADD COLUMN IF NOT EXISTS "retentionDays" integer NOT NULL DEFAULT 0`,
+	}
+	for _, query := range queries {
+		if _, err := db.Sql.Exec(query); err != nil {
+			log.Printf("migration note (retention days): %v", err)
+		}
+	}
+	return nil
+}
+
+// migrateSystemDuplicateDetection adds per-system duplicate detection toggle.
+func migrateSystemDuplicateDetection(db *Database) error {
+	query := `ALTER TABLE "systems" ADD COLUMN IF NOT EXISTS "duplicateDetectionEnabled" boolean NOT NULL DEFAULT true`
+	if _, err := db.Sql.Exec(query); err != nil {
+		log.Printf("migration note (system duplicate detection): %v", err)
+	}
+	return nil
+}
+
+// migrateKeywordAlertUnique removes duplicate keyword alert rows (same call) and
+// adds a partial unique index so only one keyword alert can exist per call.
+func migrateKeywordAlertUnique(db *Database) error {
+	if db.Config.DbType != DbTypePostgresql {
+		return nil
+	}
+
+	deleteDupes := `
+		DELETE FROM "alerts" a
+		USING "alerts" b
+		WHERE a."alertType" = 'keyword'
+		  AND b."alertType" = 'keyword'
+		  AND a."callId" = b."callId"
+		  AND a."systemId" = b."systemId"
+		  AND a."talkgroupId" = b."talkgroupId"
+		  AND a."alertId" > b."alertId"`
+	if res, err := db.Sql.Exec(deleteDupes); err != nil {
+		return fmt.Errorf("migrateKeywordAlertUnique dedupe: %w", err)
+	} else if n, err := res.RowsAffected(); err == nil && n > 0 {
+		log.Printf("migrateKeywordAlertUnique: removed %d duplicate keyword alert rows", n)
+	}
+
+	idx := `CREATE UNIQUE INDEX IF NOT EXISTS "alerts_keyword_call_uidx" ON "alerts" ("callId", "systemId", "talkgroupId") WHERE "alertType" = 'keyword'`
+	if _, err := db.Sql.Exec(idx); err != nil {
+		return fmt.Errorf("migrateKeywordAlertUnique index: %w", err)
+	}
+	return nil
+}
+
+// migrateAutoEnableNewTalkgroups adds a per-usergroup toggle controlling whether
+// newly created systems/talkgroups are auto-granted (when access uses wildcards)
+// and whether clients default those channels on in the livefeed map. Default false.
+func migrateAutoEnableNewTalkgroups(db *Database) error {
+	q := `ALTER TABLE "userGroups" ADD COLUMN IF NOT EXISTS "autoEnableNewTalkgroups" boolean NOT NULL DEFAULT false`
+	if _, err := db.Sql.Exec(q); err != nil {
+		return fmt.Errorf("migrateAutoEnableNewTalkgroups: %w", err)
+	}
+	return nil
+}
+
+// migrateTalkgroupHidden adds the "hidden" flag to talkgroups. A hidden talkgroup is
+// removed from the channel list shown to users and no longer ingests new calls, but
+// the talkgroup row (and therefore all calls, transcripts and alerts that reference it)
+// is kept.
+func migrateTalkgroupHidden(db *Database) error {
+	if _, err := db.Sql.Exec(`ALTER TABLE "talkgroups" ADD COLUMN IF NOT EXISTS "hidden" boolean NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("migrateTalkgroupHidden: %w", err)
+	}
+	return nil
+}
+
+// migrateTalkgroupTranscriptionExclude opts a talkgroup out of STT when
+// TranscribeAllCalls (or alert-driven transcription) would otherwise queue it.
+func migrateTalkgroupTranscriptionExclude(db *Database) error {
+	if _, err := db.Sql.Exec(`ALTER TABLE "talkgroups" ADD COLUMN IF NOT EXISTS "transcriptionExclude" boolean NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("migrateTalkgroupTranscriptionExclude: %w", err)
+	}
+	return nil
+}
+
+// migrateRequireListenerSignIn seeds the explicit requireListenerSignIn option from
+// the previous implicit rules (userRegistrationEnabled OR any user PIN), so existing
+// locked scanners stay locked and new installs stay open until the admin toggles it.
+func migrateRequireListenerSignIn(db *Database) error {
+	var existing sql.NullString
+	err := db.Sql.QueryRow(`SELECT "value" FROM "options" WHERE "key" = $1`, "requireListenerSignIn").Scan(&existing)
+	if err == nil && existing.Valid {
+		return nil // already configured
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("migrateRequireListenerSignIn: lookup: %w", err)
+	}
+
+	require := false
+
+	var regVal sql.NullString
+	if qerr := db.Sql.QueryRow(`SELECT "value" FROM "options" WHERE "key" = $1`, "userRegistrationEnabled").Scan(&regVal); qerr == nil && regVal.Valid {
+		var enabled bool
+		if uerr := json.Unmarshal([]byte(regVal.String), &enabled); uerr == nil && enabled {
+			require = true
+		}
+	}
+
+	if !require {
+		var pinCount int
+		// Any non-empty PIN means the old HasPins() gate would have locked the server.
+		qerr := db.Sql.QueryRow(`SELECT COUNT(*) FROM "users" WHERE COALESCE("pin", '') <> ''`).Scan(&pinCount)
+		if qerr != nil {
+			return fmt.Errorf("migrateRequireListenerSignIn: pin count: %w", qerr)
+		}
+		if pinCount > 0 {
+			require = true
+		}
+	}
+
+	raw, _ := json.Marshal(require)
+	if _, err := db.Sql.Exec(`INSERT INTO "options" ("key", "value") VALUES ($1, $2)`, "requireListenerSignIn", string(raw)); err != nil {
+		return fmt.Errorf("migrateRequireListenerSignIn: insert: %w", err)
+	}
+	return nil
+}
+
+// migratePublicApi adds user-scoped public REST API keys, capabilities, usage audit,
+// and outbound alert webhook destinations (separate from uploader apikeys).
+func migratePublicApi(db *Database) error {
+	queries := []string{
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "publicApiEnabled" boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "publicApiCapabilities" text NOT NULL DEFAULT '{}'`,
+		`CREATE TABLE IF NOT EXISTS "publicApiKeys" (
+			"keyId" bigserial NOT NULL PRIMARY KEY,
+			"userId" bigint NOT NULL,
+			"name" text NOT NULL DEFAULT '',
+			"keyPrefix" text NOT NULL DEFAULT '',
+			"keyHash" text NOT NULL DEFAULT '',
+			"createdAt" bigint NOT NULL DEFAULT 0,
+			"lastUsedAt" bigint NOT NULL DEFAULT 0,
+			"disabled" boolean NOT NULL DEFAULT false,
+			"requestCount" bigint NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS "publicApiKeys_userId_idx" ON "publicApiKeys" ("userId")`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS "publicApiKeys_keyHash_idx" ON "publicApiKeys" ("keyHash")`,
+		`CREATE TABLE IF NOT EXISTS "publicApiKeyUsage" (
+			"usageId" bigserial NOT NULL PRIMARY KEY,
+			"keyId" bigint NOT NULL,
+			"path" text NOT NULL DEFAULT '',
+			"status" integer NOT NULL DEFAULT 0,
+			"at" bigint NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS "publicApiKeyUsage_keyId_at_idx" ON "publicApiKeyUsage" ("keyId", "at" DESC)`,
+		`CREATE INDEX IF NOT EXISTS "publicApiKeyUsage_at_idx" ON "publicApiKeyUsage" ("at")`,
+		`CREATE TABLE IF NOT EXISTS "publicApiWebhooks" (
+			"webhookId" bigserial NOT NULL PRIMARY KEY,
+			"userId" bigint NOT NULL,
+			"destinationType" text NOT NULL DEFAULT 'custom',
+			"url" text NOT NULL DEFAULT '',
+			"email" text NOT NULL DEFAULT '',
+			"secret" text NOT NULL DEFAULT '',
+			"enabled" boolean NOT NULL DEFAULT true,
+			"alertTypes" text NOT NULL DEFAULT '["*"]',
+			"createdAt" bigint NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS "publicApiWebhooks_userId_idx" ON "publicApiWebhooks" ("userId")`,
+	}
+	for _, q := range queries {
+		if _, err := db.Sql.Exec(q); err != nil {
+			return fmt.Errorf("migratePublicApi: %w", err)
+		}
+	}
+	return nil
+}
+
+// migratePublicApiUsageAtIndex adds a standalone "at" index for hourly usage pruning.
+// Idempotent for hosts that already got the index from a later migratePublicApi revision.
+func migratePublicApiUsageAtIndex(db *Database) error {
+	if _, err := db.Sql.Exec(`CREATE INDEX IF NOT EXISTS "publicApiKeyUsage_at_idx" ON "publicApiKeyUsage" ("at")`); err != nil {
+		return fmt.Errorf("migratePublicApiUsageAtIndex: %w", err)
 	}
 	return nil
 }

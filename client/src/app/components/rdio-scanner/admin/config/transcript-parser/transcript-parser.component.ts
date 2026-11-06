@@ -17,7 +17,7 @@
  * ****************************************************************************
  */
 
-import { Component, Input, OnInit } from '@angular/core';
+import { Component, Input, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { firstValueFrom } from 'rxjs';
@@ -44,6 +44,8 @@ const emptyConfig = (): TranscriptConfig => ({
     selector: 'rdio-scanner-admin-transcript-parser',
     templateUrl: './transcript-parser.component.html',
     styleUrls: ['./transcript-parser.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminTranscriptParserComponent implements OnInit {
     /**
@@ -205,6 +207,11 @@ export class RdioScannerAdminTranscriptParserComponent implements OnInit {
     }
 
     deleteFuzzy(listKey: FuzzyListKey, index: number): void {
+        const word = (this.config[listKey] as FuzzyWord[])[index];
+        const label = (word?.word || word?.aliases?.[0] || 'this entry').toString();
+        if (!confirm(`Are you sure you want to delete "${label}"?`)) {
+            return;
+        }
         if (this.editingFuzzy?.listKey === listKey) {
             if (this.editingFuzzy.index === index) {
                 this.editingFuzzy = null;
@@ -290,6 +297,11 @@ export class RdioScannerAdminTranscriptParserComponent implements OnInit {
     }
 
     deleteShorthand(index: number): void {
+        const sh = this.config.channelShorthands[index];
+        const label = (sh?.label || sh?.dispatch || 'this shorthand').toString();
+        if (!confirm(`Are you sure you want to delete "${label}"?`)) {
+            return;
+        }
         if (this.editingShorthand === index) {
             this.editingShorthand = null;
             this.editingShorthandData = null;

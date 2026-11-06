@@ -17,7 +17,7 @@
  * ****************************************************************************
  */
 
-import { ChangeDetectorRef, Component, OnDestroy, OnInit } from '@angular/core';
+import { ChangeDetectorRef, Component, OnDestroy, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { MatDialog } from '@angular/material/dialog';
 import { RdioScannerAlertPreference, RdioScannerConfig, RdioScannerKeywordList, RdioScannerService, RdioScannerSystem, RdioScannerTalkgroup, RdioScannerToneSet } from '../../rdio-scanner';
 import { AlertsService } from '../alerts.service';
@@ -38,6 +38,8 @@ type StoredPreference = RdioScannerAlertPreference & {
         './preferences.component.scss',
     ],
     templateUrl: './preferences.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAlertPreferencesComponent implements OnDestroy, OnInit {
     preferences: Map<string, StoredPreference> = new Map();
@@ -48,6 +50,7 @@ export class RdioScannerAlertPreferencesComponent implements OnDestroy, OnInit {
     searchQuery = '';
     isSearchFocused = false;
     detailSystemId: number | null = null;
+    systemsRailCollapsed = false;
     expandedTags: Map<string, boolean> = new Map();
     
     private pin?: string;
@@ -228,6 +231,11 @@ export class RdioScannerAlertPreferencesComponent implements OnDestroy, OnInit {
         this.cdRef.markForCheck();
     }
 
+    toggleSystemsRail(): void {
+        this.systemsRailCollapsed = !this.systemsRailCollapsed;
+        this.cdRef.markForCheck();
+    }
+
     getDetailSystem(): RdioScannerSystem | undefined {
         if (this.detailSystemId == null) return undefined;
         return this.systems.find(s => s.id === this.detailSystemId);
@@ -351,6 +359,10 @@ export class RdioScannerAlertPreferencesComponent implements OnDestroy, OnInit {
             keywords: pref.keywords,
             keywordListIds: pref.keywordListIds,
             toneSetIds: pref.toneSetIds,
+            notificationSound: pref.notificationSound ?? '',
+            toneSetSounds: pref.toneSetSounds ?? {},
+            pagerAlert: pref.pagerAlert ?? false,
+            toneSetPagerAlerts: pref.toneSetPagerAlerts ?? {},
         }));
         
         // DEBUG: Log what we're sending to the API

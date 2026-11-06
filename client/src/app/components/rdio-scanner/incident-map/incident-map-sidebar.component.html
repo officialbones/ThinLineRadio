@@ -1,0 +1,80 @@
+@if (map$ | async; as m) {
+  <aside class="incident-map-sidebar"
+    >
+    <span class="sidebar-sync" aria-hidden="true">{{ m.sidebarTick }}</span>
+    <div class="sidebar-header">
+      <div class="sidebar-header-text">
+        <h3>Incidents</h3>
+        <span class="sidebar-range">{{ m.timeRangeLabel }}</span>
+      </div>
+      @if (!m.loading) {
+        <span class="sidebar-count">
+          @if (m.hasActiveFilters) {
+            {{ m.filteredIncidents.length }}@if (m.filteredIncidentRawCount > m.filteredIncidents.length) {
+            ({{ m.filteredIncidentRawCount }} calls)
+            } / {{ m.incidents.length }}
+          } @else {
+            {{ m.filteredIncidents.length }}@if (m.filteredIncidentRawCount > m.filteredIncidents.length) {
+            ({{ m.filteredIncidentRawCount }} calls)
+          }
+        }
+      </span>
+    }
+    @if (m.loading) {
+      <mat-spinner diameter="20"></mat-spinner>
+    }
+  </div>
+  <div class="sidebar-list" #incidentList (scroll)="onIncidentListScroll($event)">
+    @if (showJumpTop) {
+      <div class="sidebar-jump-top-wrap">
+        <button type="button" class="sidebar-jump-top" (click)="scrollIncidentListToTop()">
+          <mat-icon>arrow_upward</mat-icon>
+          Top
+        </button>
+      </div>
+    }
+    @if (!m.loading && m.incidents.length === 0) {
+      <div class="sidebar-empty">
+        <mat-icon>map</mat-icon>
+        <span>No geocoded incidents yet.</span>
+      </div>
+    }
+    @if (!m.loading && m.incidents.length > 0 && m.filteredIncidents.length === 0) {
+      <div class="sidebar-empty">
+        <mat-icon>filter_alt_off</mat-icon>
+        <span>No incidents match your filters.</span>
+      </div>
+    }
+    @for (incident of m.filteredIncidents; track incident.callId) {
+      <button type="button"
+        class="incident-list-item"
+        [attr.data-incident-call-id]="incident.callId"
+        [class.selected]="m.selectedIncident?.callId === incident.callId"
+        [class.focusing]="m.focusingCallId === incident.callId"
+        [style.background]="incident.uiBgColor || m.incidentListBackground(incident)"
+        [style.box-shadow]="m.selectedIncident?.callId === incident.callId ? (incident.uiSelectedShadow || m.incidentListSelectedShadow(incident)) : 'none'"
+        (click)="m.selectIncident(incident)">
+        <div class="incident-list-nature"
+          [style.background]="incident.uiTagColor || m.getIncidentTagColor(incident)"
+          [style.color]="incident.uiTextColor || m.incidentNatureTextColor(incident)">
+          {{ incident.uiNatureLabel || m.incidentNatureLabel(incident) }}
+        </div>
+        <div class="incident-list-title">{{ incident.uiAddress || m.incidentAddress(incident) }}</div>
+        <div class="incident-list-channel">{{ incident.uiChannel || m.incidentChannel(incident) }}</div>
+        <div class="incident-list-meta">
+          @if (incident.tagLabel) {
+            <span class="incident-list-tag">{{ incident.tagLabel }}</span>
+          }
+          @if (incident.tagLabel) {
+            <span> · </span>
+          }
+          <span>{{ incident.uiTime || m.formatTimestamp(incident.timestamp) }}</span>
+        </div>
+        <button type="button"
+          class="btn-play-audio"
+        (click)="m.playIncident(incident); $event.stopPropagation()">Play Audio</button>
+      </button>
+    }
+  </div>
+</aside>
+}

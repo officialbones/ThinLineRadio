@@ -17,16 +17,18 @@
  * ****************************************************************************
  */
 
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy } from '@angular/core';
 import { FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 import { ActivatedRoute, Router } from '@angular/router';
 import { RdioScannerService } from '../rdio-scanner.service';
 
 @Component({
-  selector: 'rdio-scanner-user-login',
-  templateUrl: './user-login.component.html',
-  styleUrls: ['./user-login.component.scss']
+    selector: 'rdio-scanner-user-login',
+    templateUrl: './user-login.component.html',
+    styleUrls: ['./user-login.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerUserLoginComponent implements OnInit, OnDestroy {
   loginForm: FormGroup;
@@ -194,6 +196,7 @@ export class RdioScannerUserLoginComponent implements OnInit, OnDestroy {
           }
           // Persist system admin flag so the main UI can show the Admin Panel button
           this.rdioScannerService.saveIsSystemAdmin(response?.user?.systemAdmin === true);
+          this.rdioScannerService.savePublicApiEnabled(response?.user?.publicApiEnabled === true);
           console.log('Login successful:', response);
         },
         error: (error) => {
@@ -250,6 +253,7 @@ export class RdioScannerUserLoginComponent implements OnInit, OnDestroy {
                 this.rdioScannerService.savePin(pin);
               }
               this.rdioScannerService.saveIsSystemAdmin(response?.user?.systemAdmin === true);
+              this.rdioScannerService.savePublicApiEnabled(response?.user?.publicApiEnabled === true);
               this.showForcedPasswordReset = false;
               this.forcedPasswordResetForm.reset();
               this.forcedResetEmail = '';

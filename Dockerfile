@@ -5,7 +5,9 @@
 # =============================================================================
 # Stage 1: Build Angular Client
 # =============================================================================
-FROM node:18-alpine AS client-builder
+# Angular CLI 22 requires Node >=22.22.3 (or >=24.15 / >=26); pin so Docker builds stay compatible.
+ARG NODE_VERSION=22.23
+FROM node:${NODE_VERSION}-alpine AS client-builder
 
 WORKDIR /build
 
@@ -14,7 +16,7 @@ COPY client/package*.json ./client/
 
 # Install dependencies
 WORKDIR /build/client
-RUN npm install --legacy-peer-deps
+RUN node -v && npm install --legacy-peer-deps
 
 # Copy client source code
 COPY client/ ./
@@ -28,7 +30,7 @@ RUN ls -la /build/server/webapp/ && echo "Webapp build successful"
 # =============================================================================
 # Stage 2: Build Go Server
 # =============================================================================
-FROM golang:1.24-alpine AS server-builder
+FROM golang:1.25-alpine AS server-builder
 
 # BuildKit sets these per --platform (e.g. linux/arm64); defaults suit plain `docker build`.
 ARG TARGETOS=linux

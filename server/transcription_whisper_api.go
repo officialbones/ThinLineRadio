@@ -165,6 +165,11 @@ func isRetryableError(err error) bool {
 		"no such host",
 		"temporary failure",
 		"TLS handshake timeout",
+		"status 429",
+		"status 502",
+		"status 503",
+		"status 504",
+		"(retryable)",
 	}
 
 	for _, retryable := range retryableErrors {
@@ -417,4 +422,3 @@ func (api *WhisperAPITranscription) GetSupportedLanguages() []string {
 		"hu", "id", "ms", "no", "ro", "sk", "sv", "uk", "vi",
 	}
 }
-

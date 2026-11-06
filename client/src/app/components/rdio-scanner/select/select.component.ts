@@ -17,7 +17,7 @@
  * ****************************************************************************
  */
 
-import { ChangeDetectorRef, Component, OnDestroy, OnInit } from '@angular/core';
+import { ChangeDetectorRef, Component, OnDestroy, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { CdkDragDrop } from '@angular/cdk/drag-drop';
 import { MatDialog } from '@angular/material/dialog';
 import { Subscription } from 'rxjs';
@@ -38,6 +38,12 @@ import { ScanListsService, ScanList, ScanListChannel } from '../scan-lists.servi
 import { SystemsVisibilityDialogComponent } from './systems-visibility-dialog.component';
 import { ScanListEditDialogComponent, ScanListEditDialogData } from './scan-list-edit-dialog.component';
 
+export interface ChannelSearchResult {
+    system: RdioScannerSystem;
+    talkgroup: RdioScannerTalkgroup;
+    tag: string;
+}
+
 @Component({
     selector: 'rdio-scanner-select',
     styleUrls: [
@@ -45,6 +51,8 @@ import { ScanListEditDialogComponent, ScanListEditDialogData } from './scan-list
         './select.component.scss',
     ],
     templateUrl: './select.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     categories: RdioScannerCategory[] | undefined;
@@ -56,16 +64,25 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     // Layout: master–detail (sidebar systems + detail panel)
     searchQuery = '';
     isSearchFocused = false;
-    /** Sidebar list: all visible systems, favorites, or scan lists */
-    navMode: 'all' | 'favorites' | 'scanLists' = 'all';
+    /** Narrow icon rail when true; full systems list when false. */
+    systemsRailCollapsed = false;
+    /** Sidebar list: Channels browse, or Scan Lists (includes Favorites). */
+    navMode: 'all' | 'scanLists' = 'all';
 
-    // Scan Lists
+    toggleSystemsRail(): void {
+        this.systemsRailCollapsed = !this.systemsRailCollapsed;
+    }
+
+    // Scan Lists — master/detail (same layout language as Channels)
+    static readonly FAVORITES_SCAN_LIST_ID = 'favorites';
     scanLists: ScanList[] = [];
-    private expandedScanLists = new Set<string>();
+    detailScanListId: string | null = null;
     private expandedScanListSystems = new Set<string>();
     private expandedScanListTags = new Set<string>();
     private scanListsSubscription?: Subscription;
     detailSystemId: number | null = null;
+    /** Cached tag groups for the detail pane — avoids @for identity thrash. */
+    detailTagGroups: Array<{ tag: string; talkgroups: RdioScannerTalkgroup[] }> = [];
     expandedTags: Map<string, boolean> = new Map();
     hiddenSystems: Set<number> = new Set();
     private eventSubscription?: Subscription;
@@ -87,12 +104,14 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         this.favoritesSubscription = this.favoritesService.getFavorites().subscribe(() => {
             this.favoriteItems = this.favoritesService.getFavoriteItems();
             this.syncDetailSystemSelection();
+            this.syncDetailScanListSelection();
             this.cdRef.markForCheck();
         });
         this.favoriteItems = this.favoritesService.getFavoriteItems();
 
         this.scanListsSubscription = this.scanListsService.getLists().subscribe(lists => {
             this.scanLists = lists;
+            this.syncDetailScanListSelection();
             this.cdRef.markForCheck();
         });
         this.scanLists = this.scanListsService.getListsSnapshot();
@@ -105,7 +124,7 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         // Load hidden systems from localStorage
         this.loadHiddenSystems();
 
-        // Config/categories/map may have been applied before this instance subscribed (e.g. toggling New ↔ Classic view destroys and recreates this component).
+        // Config/categories/map may have been applied before this instance subscribed.
         this.seedFromRdioService();
     }
 
@@ -167,26 +186,80 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         this.cdRef.markForCheck();
     }
 
-    setNavMode(mode: 'all' | 'favorites' | 'scanLists'): void {
+    setNavMode(mode: 'all' | 'scanLists'): void {
         if (this.navMode === mode) return;
         this.navMode = mode;
         this.syncDetailSystemSelection();
+        this.syncDetailScanListSelection();
         this.cdRef.markForCheck();
     }
 
     // ── Scan List helpers ──────────────────────────────────────────────────────
 
-    isScanListExpanded(listId: string): boolean {
-        return this.expandedScanLists.has(listId);
+    selectDetailScanList(listId: string): void {
+        this.detailScanListId = listId;
+        this.cdRef.markForCheck();
     }
 
-    toggleScanListExpanded(listId: string): void {
-        if (this.expandedScanLists.has(listId)) {
-            this.expandedScanLists.delete(listId);
-        } else {
-            this.expandedScanLists.add(listId);
+    /** User-created lists only (Favorites is derived and pinned above the drop list). */
+    getUserScanLists(): ScanList[] {
+        return this.scanLists.filter(l => !l.isFavoritesSource);
+    }
+
+    /** Favorites virtual list + user scan lists for the rail / detail lookup. */
+    getScanListsForRail(): ScanList[] {
+        return [this.getFavoritesScanList(), ...this.getUserScanLists()];
+    }
+
+    getDetailScanList(): ScanList | undefined {
+        if (!this.detailScanListId) return undefined;
+        return this.getScanListsForRail().find(l => l.id === this.detailScanListId);
+    }
+
+    getFavoritesScanList(): ScanList {
+        const channels: ScanListChannel[] = [];
+        const seen = new Set<string>();
+
+        for (const system of this.getFavoriteSystemsWithFavorites()) {
+            for (const group of this.getFavoriteTagGroupsForSystem(system)) {
+                for (const tg of group.talkgroups) {
+                    const key = `${system.id}:${tg.id}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    channels.push({
+                        systemId: String(system.id),
+                        talkgroupId: String(tg.id),
+                        talkgroupDbId: tg.talkgroupId != null ? String(tg.talkgroupId) : undefined,
+                        talkgroupLabel: tg.label || '',
+                        talkgroupName: tg.name || '',
+                        systemLabel: system.label || '',
+                        tag: this.tagColorService.resolveTagLabel(tg.tag),
+                        isEnabled: true,
+                    });
+                }
+            }
         }
-        this.cdRef.markForCheck();
+
+        return {
+            id: RdioScannerSelectComponent.FAVORITES_SCAN_LIST_ID,
+            name: 'Favorites',
+            isFavoritesSource: true,
+            channels,
+        };
+    }
+
+    private syncDetailScanListSelection(): void {
+        const lists = this.getScanListsForRail();
+        if (lists.length === 0) {
+            this.detailScanListId = null;
+            return;
+        }
+        if (
+            this.detailScanListId == null ||
+            !lists.some(l => l.id === this.detailScanListId)
+        ) {
+            this.detailScanListId = lists[0].id;
+        }
     }
 
     isScanListSystemExpanded(listId: string, systemId: string): boolean {
@@ -224,10 +297,26 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     getScanListSystems(list: ScanList): { systemId: string; systemLabel: string; channels: ScanListChannel[] }[] {
         const map = new Map<string, { systemId: string; systemLabel: string; channels: ScanListChannel[] }>();
         for (const ch of list.channels) {
-            if (!map.has(ch.systemId)) {
-                map.set(ch.systemId, { systemId: ch.systemId, systemLabel: ch.systemLabel, channels: [] });
+            // Normalize id so "12" and 12 never split into two groups.
+            const systemId = String(ch.systemId ?? '').trim();
+            if (!systemId) continue;
+
+            let systemLabel = (ch.systemLabel || '').trim();
+            if (!systemLabel) {
+                const sys = this.systems?.find(s => String(s.id) === systemId);
+                systemLabel = (sys?.label || '').trim() || `System ${systemId}`;
             }
-            map.get(ch.systemId)!.channels.push(ch);
+
+            const existing = map.get(systemId);
+            if (!existing) {
+                map.set(systemId, { systemId, systemLabel, channels: [ch] });
+            } else {
+                existing.channels.push(ch);
+                // Prefer a real label if an earlier channel had an empty one.
+                if ((!existing.systemLabel || existing.systemLabel.startsWith('System ')) && systemLabel) {
+                    existing.systemLabel = systemLabel;
+                }
+            }
         }
         return Array.from(map.values()).sort((a, b) => a.systemLabel.localeCompare(b.systemLabel));
     }
@@ -235,7 +324,7 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     getScanListTags(channels: ScanListChannel[]): { tag: string; channels: ScanListChannel[] }[] {
         const map = new Map<string, ScanListChannel[]>();
         for (const ch of channels) {
-            const tag = ch.tag || 'Untagged';
+            const tag = this.tagColorService.resolveTagLabel(ch.tag);
             if (!map.has(tag)) map.set(tag, []);
             map.get(tag)!.push(ch);
         }
@@ -245,24 +334,37 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
                 if (b[0] === 'Untagged') return -1;
                 return a[0].localeCompare(b[0]);
             })
-            .map(([tag, chs]) => ({ tag, channels: chs.sort((a, b) => a.talkgroupLabel.localeCompare(b.talkgroupLabel)) }));
+            .map(([tag, chs]) => ({
+                tag,
+                channels: chs.sort((a, b) => (a.talkgroupLabel || '').localeCompare(b.talkgroupLabel || '')),
+            }));
+    }
+
+    trackScanListChannel(_index: number, ch: ScanListChannel): string {
+        return `${ch.systemId}:${ch.talkgroupId}`;
     }
 
     createScanList(): void {
         const name = prompt('New list name:');
         if (name?.trim()) {
-            this.scanListsService.createList(name.trim());
+            const created = this.scanListsService.createList(name.trim());
+            this.detailScanListId = created.id;
+            this.cdRef.markForCheck();
         }
     }
 
-    renameScanList(list: ScanList): void {
+    renameScanList(list: ScanList, event?: Event): void {
+        event?.stopPropagation();
+        event?.preventDefault();
         const name = prompt('Rename list:', list.name);
         if (name?.trim() && name.trim() !== list.name) {
             this.scanListsService.renameList(list.id, name.trim());
         }
     }
 
-    deleteScanList(list: ScanList): void {
+    deleteScanList(list: ScanList, event?: Event): void {
+        event?.stopPropagation();
+        event?.preventDefault();
         if (confirm(`Delete "${list.name}"?`)) {
             this.scanListsService.deleteList(list.id);
         }
@@ -276,6 +378,21 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
 
     removeScanListChannel(list: ScanList, ch: ScanListChannel, event: Event): void {
         event.stopPropagation();
+        const label = (ch.talkgroupLabel || ch.talkgroupName || `talkgroup ${ch.talkgroupId}`).toString();
+        if (list.isFavoritesSource) {
+            if (!confirm(`Remove ${label} from Favorites?`)) {
+                return;
+            }
+            const sysId = parseInt(ch.systemId, 10);
+            const tgId = parseInt(ch.talkgroupId, 10);
+            if (!Number.isNaN(sysId) && !Number.isNaN(tgId)) {
+                this.favoritesService.removeFavorite({ type: 'talkgroup', systemId: sysId, talkgroupId: tgId });
+            }
+            return;
+        }
+        if (!confirm(`Remove ${label} from "${list.name}"?`)) {
+            return;
+        }
         this.scanListsService.removeChannel(list.id, ch.systemId, ch.talkgroupId);
     }
 
@@ -286,6 +403,10 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
      */
     editScanListChannels(list: ScanList, event?: Event): void {
         event?.stopPropagation();
+        event?.preventDefault();
+        if (list.isFavoritesSource) {
+            return;
+        }
         const data: ScanListEditDialogData = {
             list,
             systems: this.getVisibleSystems(),
@@ -336,7 +457,14 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         if (list.channels.length === 0) return;
         const allOn = this.getScanListLiveState(list) === 'all';
         this.rdioScannerService.beep(allOn ? RdioScannerBeepStyle.Deactivate : RdioScannerBeepStyle.Activate);
-        this.scanListsService.bulkToggleList(list.id, !allOn);
+        if (list.isFavoritesSource) {
+            this.rdioScannerService.setLivefeedActiveForChannels(
+                list.channels.map(c => ({ systemId: c.systemId, talkgroupId: c.talkgroupId })),
+                !allOn,
+            );
+        } else {
+            this.scanListsService.bulkToggleList(list.id, !allOn);
+        }
         this.cdRef.markForCheck();
     }
 
@@ -359,27 +487,81 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
 
     selectDetailSystem(systemId: number): void {
         this.detailSystemId = systemId;
+        this.refreshDetailTagGroups();
         this.cdRef.markForCheck();
     }
 
+    isSearchActive(): boolean {
+        return this.searchQuery.trim().length > 0;
+    }
+
+    /** Systems listed in the left navigator rail (not filtered by search). */
+    getSystemsForBrowseRail(): RdioScannerSystem[] {
+        return this.getVisibleSystems();
+    }
+
+    /** @deprecated Use getSystemsForBrowseRail — kept for any external callers. */
     getSystemsForSidebar(): RdioScannerSystem[] {
-        let list: RdioScannerSystem[];
-        if (this.navMode === 'favorites') {
-            list = this.getFavoriteSystemsWithFavorites().filter(s => !this.hiddenSystems.has(s.id));
-        } else {
-            list = this.getVisibleSystems();
-        }
+        return this.getSystemsForBrowseRail();
+    }
+
+    getSearchResults(): ChannelSearchResult[] {
         const q = this.searchQuery.trim().toLowerCase();
-        if (!q) return list;
-        return list.filter(system => {
-            if ((system.label || '').toLowerCase().includes(q)) return true;
-            return (system.talkgroups || []).some(tg => {
-                const label = (tg.label || '').toLowerCase();
-                const name = (tg.name || '').toLowerCase();
-                const id = tg.id.toString();
-                return label.includes(q) || name.includes(q) || id.includes(q);
-            });
+        if (!q) return [];
+
+        const results: ChannelSearchResult[] = [];
+        for (const system of this.getSystemsForBrowseRail()) {
+            const talkgroups = system.talkgroups || [];
+
+            for (const talkgroup of talkgroups) {
+                const label = (talkgroup.label || '').toLowerCase();
+                const name = (talkgroup.name || '').toLowerCase();
+                const id = talkgroup.id.toString();
+                const systemLabel = (system.label || '').toLowerCase();
+                if (label.includes(q) || name.includes(q) || id.includes(q) || systemLabel.includes(q)) {
+                    results.push({
+                        system,
+                        talkgroup,
+                        tag: this.tagColorService.resolveTagLabel(talkgroup.tag),
+                    });
+                }
+            }
+        }
+
+        results.sort((a, b) => {
+            const scoreDiff = this.searchRelevanceScore(b, q) - this.searchRelevanceScore(a, q);
+            if (scoreDiff !== 0) return scoreDiff;
+            const systemCmp = (a.system.label || '').localeCompare(b.system.label || '');
+            if (systemCmp !== 0) return systemCmp;
+            return (a.talkgroup.label || '').localeCompare(b.talkgroup.label || '');
         });
+
+        return results;
+    }
+
+    trackBySearchResult(_index: number, hit: ChannelSearchResult): string {
+        return `${hit.system.id}-${hit.talkgroup.id}`;
+    }
+
+    openSystemFromSearch(systemId: number, event?: Event): void {
+        event?.stopPropagation();
+        event?.preventDefault();
+        this.searchQuery = '';
+        this.detailSystemId = systemId;
+        this.refreshDetailTagGroups();
+        this.cdRef.markForCheck();
+    }
+
+    private searchRelevanceScore(hit: ChannelSearchResult, q: string): number {
+        const label = (hit.talkgroup.label || '').toLowerCase();
+        const name = (hit.talkgroup.name || '').toLowerCase();
+        if (label === q) return 100;
+        if (label.startsWith(q)) return 80;
+        if (label.includes(q)) return 60;
+        if (name.includes(q)) return 40;
+        if (hit.talkgroup.id.toString() === q) return 30;
+        if ((hit.system.label || '').toLowerCase().includes(q)) return 20;
+        return 10;
     }
 
     getDetailSystem(): RdioScannerSystem | undefined {
@@ -388,14 +570,16 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     }
 
     private syncDetailSystemSelection(): void {
-        const list = this.getSystemsForSidebar();
+        const list = this.getSystemsForBrowseRail();
         if (list.length === 0) {
             this.detailSystemId = null;
+            this.detailTagGroups = [];
             return;
         }
         if (this.detailSystemId == null || !list.some(s => s.id === this.detailSystemId)) {
             this.detailSystemId = list[0].id;
         }
+        this.refreshDetailTagGroups();
     }
 
     getVisibleSystems(): RdioScannerSystem[] {
@@ -415,6 +599,15 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         });
     }
 
+    /** Talkgroups shown in the Channels detail pane for a system. */
+    getTalkgroupsInSystemView(system: RdioScannerSystem): RdioScannerTalkgroup[] {
+        return this.getFilteredTalkgroups(system);
+    }
+
+    getSystemViewTotalCount(system: RdioScannerSystem): number {
+        return this.getFilteredTalkgroups(system).length;
+    }
+
     getFavoriteTalkgroupsCount(system: RdioScannerSystem): number {
         // Return count of favorited talkgroups in this system
         return this.favoriteItems
@@ -427,11 +620,15 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         const groups: Map<string, RdioScannerTalkgroup[]> = new Map();
         
         filtered.forEach(tg => {
-            const tag = tg.tag || 'Untagged';
+            const tag = this.tagColorService.resolveTagLabel(tg.tag);
             if (!groups.has(tag)) {
                 groups.set(tag, []);
             }
-            groups.get(tag)!.push(tg);
+            const list = groups.get(tag)!;
+            // Deduplicate talkgroups that appear under both LED and label forms.
+            if (!list.some(existing => existing.id === tg.id)) {
+                list.push(tg);
+            }
         });
 
         // Sort tags alphabetically, keeping 'Untagged' last
@@ -442,6 +639,15 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         });
 
         return sorted.map(([tag, talkgroups]) => ({ tag, talkgroups }));
+    }
+
+    private refreshDetailTagGroups(): void {
+        const system = this.getDetailSystem();
+        if (!system) {
+            this.detailTagGroups = [];
+            return;
+        }
+        this.detailTagGroups = this.groupTalkgroupsByTag(system);
     }
 
     isTagExpanded(systemId: number, tag: string): boolean {
@@ -494,7 +700,8 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
 
     toggleSystemTalkgroups(system: RdioScannerSystem, event: Event): void {
         event.stopPropagation();
-        const allEnabled = (system.talkgroups || []).every(tg => this.isTalkgroupEnabled(system.id, tg.id));
+        const inView = this.getTalkgroupsInSystemView(system);
+        const allEnabled = inView.length > 0 && inView.every(tg => this.isTalkgroupEnabled(system.id, tg.id));
         this.avoid({ system, status: !allEnabled });
     }
 
@@ -548,7 +755,7 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
                 });
             } else if (fav.type === 'tag' && fav.tag) {
                 (system.talkgroups || [])
-                    .filter(tg => (tg.tag || 'Untagged') === fav.tag)
+                    .filter(tg => this.talkgroupMatchesTag(tg, fav.tag!))
                     .forEach(tg => {
                         pairs.set(`${system.id}-${tg.id}`, { systemId: system.id, tgId: tg.id });
                     });
@@ -653,39 +860,45 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     }
 
     getEnabledCountInSystem(system: RdioScannerSystem): number {
-        const filtered = this.getFilteredTalkgroups(system);
+        const filtered = this.getTalkgroupsInSystemView(system);
         return filtered.filter(tg => this.isTalkgroupEnabled(system.id, tg.id)).length;
     }
 
     isAllEnabledInSystem(system: RdioScannerSystem): boolean {
-        const filtered = this.getFilteredTalkgroups(system);
+        const filtered = this.getTalkgroupsInSystemView(system);
         if (filtered.length === 0) return false;
         return filtered.every(tg => this.isTalkgroupEnabled(system.id, tg.id));
     }
 
     isSomeEnabledInSystem(system: RdioScannerSystem): boolean {
-        const filtered = this.getFilteredTalkgroups(system);
+        const filtered = this.getTalkgroupsInSystemView(system);
         const enabled = filtered.filter(tg => this.isTalkgroupEnabled(system.id, tg.id)).length;
         return enabled > 0 && enabled < filtered.length;
     }
 
-    isAllEnabledInTag(systemId: number, tag: string): boolean {
-        const system = this.systems?.find(s => s.id === systemId);
-        if (!system) return false;
-        const tagGroups = this.groupTalkgroupsByTag(system);
-        const tagGroup = tagGroups.find(tg => tg.tag === tag);
-        if (!tagGroup || tagGroup.talkgroups.length === 0) return false;
-        return tagGroup.talkgroups.every(tg => this.isTalkgroupEnabled(systemId, tg.id));
+    isAllEnabledInTag(systemId: number, tag: string, talkgroups?: RdioScannerTalkgroup[]): boolean {
+        const list = talkgroups ?? this.getTalkgroupsForTag(systemId, tag);
+        if (list.length === 0) return false;
+        return list.every(tg => this.isTalkgroupEnabled(systemId, tg.id));
     }
 
-    isSomeEnabledInTag(systemId: number, tag: string): boolean {
+    isSomeEnabledInTag(systemId: number, tag: string, talkgroups?: RdioScannerTalkgroup[]): boolean {
+        const list = talkgroups ?? this.getTalkgroupsForTag(systemId, tag);
+        if (list.length === 0) return false;
+        const enabled = list.filter(tg => this.isTalkgroupEnabled(systemId, tg.id)).length;
+        return enabled > 0 && enabled < list.length;
+    }
+
+    private getTalkgroupsForTag(systemId: number, tag: string): RdioScannerTalkgroup[] {
         const system = this.systems?.find(s => s.id === systemId);
-        if (!system) return false;
-        const tagGroups = this.groupTalkgroupsByTag(system);
-        const tagGroup = tagGroups.find(tg => tg.tag === tag);
-        if (!tagGroup) return false;
-        const enabled = tagGroup.talkgroups.filter(tg => this.isTalkgroupEnabled(systemId, tg.id)).length;
-        return enabled > 0 && enabled < tagGroup.talkgroups.length;
+        if (!system) return [];
+        const resolved = this.tagColorService.resolveTagLabel(tag);
+        return this.groupTalkgroupsByTag(system).find(tg => tg.tag === resolved)?.talkgroups ?? [];
+    }
+
+    /** Match talkgroups whose raw tag resolves to the same canonical label. */
+    private talkgroupMatchesTag(tg: RdioScannerTalkgroup, tag: string): boolean {
+        return this.tagColorService.resolveTagLabel(tg.tag) === this.tagColorService.resolveTagLabel(tag);
     }
 
     getSystemStatusIcon(system: RdioScannerSystem): string {
@@ -700,15 +913,15 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         return 'status-disabled';
     }
 
-    getTagStatusIcon(systemId: number, tag: string): string {
-        if (this.isAllEnabledInTag(systemId, tag)) return 'check_circle';
-        if (this.isSomeEnabledInTag(systemId, tag)) return 'remove_circle';
+    getTagStatusIcon(systemId: number, tag: string, talkgroups?: RdioScannerTalkgroup[]): string {
+        if (this.isAllEnabledInTag(systemId, tag, talkgroups)) return 'check_circle';
+        if (this.isSomeEnabledInTag(systemId, tag, talkgroups)) return 'remove_circle';
         return 'circle_outlined';
     }
 
-    getTagStatusClass(systemId: number, tag: string): string {
-        if (this.isAllEnabledInTag(systemId, tag)) return 'status-enabled';
-        if (this.isSomeEnabledInTag(systemId, tag)) return 'status-partial';
+    getTagStatusClass(systemId: number, tag: string, talkgroups?: RdioScannerTalkgroup[]): string {
+        if (this.isAllEnabledInTag(systemId, tag, talkgroups)) return 'status-enabled';
+        if (this.isSomeEnabledInTag(systemId, tag, talkgroups)) return 'status-partial';
         return 'status-disabled';
     }
 
@@ -768,9 +981,11 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
             // Collect all tags in this system
             const tagSet = new Set<string>();
             (system.talkgroups || []).forEach(tg => {
-                const tag = tg.tag || 'Untagged';
-                tagSet.add(tag);
-                itemsToRemove.push({ type: 'tag', systemId, tag });
+                const tag = this.tagColorService.resolveTagLabel(tg.tag);
+                if (!tagSet.has(tag)) {
+                    tagSet.add(tag);
+                    itemsToRemove.push({ type: 'tag', systemId, tag });
+                }
             });
             
             // Collect all talkgroups in this system
@@ -786,7 +1001,7 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
             // Collect all tags in this system
             const tagSet = new Set<string>();
             (system.talkgroups || []).forEach(tg => {
-                const tag = tg.tag || 'Untagged';
+                const tag = this.tagColorService.resolveTagLabel(tg.tag);
                 if (!tagSet.has(tag)) {
                     tagSet.add(tag);
                     itemsToAdd.push({ type: 'tag', systemId, tag });
@@ -804,7 +1019,7 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         const system = this.systems?.find(s => s.id === systemId);
         if (!system) return;
 
-        const tagTalkgroups = (system.talkgroups || []).filter(tg => (tg.tag || 'Untagged') === tag);
+        const tagTalkgroups = (system.talkgroups || []).filter(tg => this.talkgroupMatchesTag(tg, tag));
 
         if (this.favoritesService.isTagFavorite(systemId, tag)) {
             // Remove tag and ALL its talkgroups
@@ -847,14 +1062,14 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         const talkgroup = system?.talkgroups?.find(tg => tg.id === talkgroupId);
         if (!system || !talkgroup) return;
 
-        const tag = talkgroup.tag || 'Untagged';
+        const tag = this.tagColorService.resolveTagLabel(talkgroup.tag);
 
         if (this.favoritesService.isTalkgroupFavorite(systemId, talkgroupId)) {
             // Remove only this talkgroup
             this.favoritesService.removeFavorite({ type: 'talkgroup', systemId, talkgroupId });
             
             // Check if tag should be removed (no other talkgroups favorited in this tag)
-            const tagTalkgroups = (system.talkgroups || []).filter(tg => (tg.tag || 'Untagged') === tag);
+            const tagTalkgroups = (system.talkgroups || []).filter(tg => this.talkgroupMatchesTag(tg, tag));
             const hasOtherTagFavorites = tagTalkgroups.some(tg => 
                 tg.id !== talkgroupId && this.favoritesService.isTalkgroupFavorite(systemId, tg.id)
             );
@@ -869,18 +1084,9 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
                 this.favoritesService.removeFavorite({ type: 'system', systemId });
             }
         } else {
-            // Add talkgroup, tag, and system
+            // Only persist the talkgroup — tag/system favorites mean "all in tag/system"
+            // and would expand to every talkgroup on sync and bulk enable/disable.
             this.favoritesService.addFavorite({ type: 'talkgroup', systemId, talkgroupId });
-            
-            // Ensure parent tag is also favorited
-            if (!this.favoritesService.isTagFavorite(systemId, tag)) {
-                this.favoritesService.addFavorite({ type: 'tag', systemId, tag });
-            }
-            
-            // Ensure parent system is also favorited
-            if (!this.favoritesService.isSystemFavorite(systemId)) {
-                this.favoritesService.addFavorite({ type: 'system', systemId });
-            }
         }
     }
 
@@ -974,81 +1180,69 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
     getFavoriteTagGroupsForSystem(system: RdioScannerSystem): Array<{tag: string, talkgroups: RdioScannerTalkgroup[]}> {
         const groups: Map<string, RdioScannerTalkgroup[]> = new Map();
         const isSystemFavorite = this.favoritesService.isSystemFavorite(system.id);
-        
-        // Get all individually favorited tags
+
         const favoriteTags = new Set<string>();
         this.favoriteItems
             .filter(f => f.type === 'tag' && f.systemId === system.id && f.tag)
             .forEach(f => favoriteTags.add(f.tag!));
-        
-        // Get all individually favorited talkgroups
+
         const favoriteTalkgroups = new Set<number>();
         this.favoriteItems
             .filter(f => f.type === 'talkgroup' && f.systemId === system.id && f.talkgroupId !== undefined)
             .forEach(f => favoriteTalkgroups.add(f.talkgroupId!));
 
-        // Only show all tags/talkgroups if system is explicitly favorited AND all are individually favorited
+        const addFavoriteTalkgroup = (tg: RdioScannerTalkgroup): void => {
+            const tag = this.tagColorService.resolveTagLabel(tg.tag);
+            if (!groups.has(tag)) {
+                groups.set(tag, []);
+            }
+            if (!groups.get(tag)!.some(t => t.id === tg.id)) {
+                groups.get(tag)!.push(tg);
+            }
+        };
+
         if (isSystemFavorite) {
             const allTags = new Set<string>();
-            (system.talkgroups || []).forEach(tg => {
-                const tag = tg.tag || 'Untagged';
-                allTags.add(tag);
-            });
-            
-            // Check if ALL tags are favorited
-            const allTagsAreFavorited = Array.from(allTags).every(tag => favoriteTags.has(tag));
-            
-            // Check if ALL talkgroups are favorited
+            (system.talkgroups || []).forEach(tg => allTags.add(this.tagColorService.resolveTagLabel(tg.tag)));
+
+            const favoriteTagsResolved = new Set(
+                Array.from(favoriteTags).map(t => this.tagColorService.resolveTagLabel(t))
+            );
+            const allTagsAreFavorited = Array.from(allTags).every(tag => favoriteTagsResolved.has(tag));
             const allTalkgroupsAreFavorited = (system.talkgroups || []).every(tg => favoriteTalkgroups.has(tg.id));
-            
-            // Only show all if everything is individually favorited
+
             if (allTagsAreFavorited && allTalkgroupsAreFavorited) {
                 this.groupTalkgroupsByTag(system).forEach(({ tag, talkgroups }) => {
                     groups.set(tag, [...talkgroups]);
                 });
             } else {
-                // System is favorited but not all children are — show favorited tags (all their talkgroups)
-                // and individually favorited talkgroups
-                favoriteTags.forEach(tag => {
-                    const tagTalkgroups = (system.talkgroups || []).filter(tg => (tg.tag || 'Untagged') === tag);
-                    if (tagTalkgroups.length > 0) {
-                        groups.set(tag, tagTalkgroups);
+                favoriteTagsResolved.forEach(tag => {
+                    const tagTalkgroups = (system.talkgroups || []).filter(tg => this.talkgroupMatchesTag(tg, tag));
+                    const favorited = tagTalkgroups.filter(tg => favoriteTalkgroups.has(tg.id));
+                    if (favorited.length > 0) {
+                        groups.set(tag, favorited);
                     }
                 });
-
-                // Add individually favorited talkgroups whose tag is not itself favorited
                 (system.talkgroups || []).forEach(tg => {
                     if (favoriteTalkgroups.has(tg.id)) {
-                        const tag = tg.tag || 'Untagged';
-                        if (!groups.has(tag)) {
-                            groups.set(tag, []);
-                        }
-                        if (!groups.get(tag)!.some(t => t.id === tg.id)) {
-                            groups.get(tag)!.push(tg);
-                        }
+                        addFavoriteTalkgroup(tg);
                     }
                 });
             }
         } else {
-            // System is not favorited — show all talkgroups under favorited tags,
-            // plus any individually favorited talkgroups
-            favoriteTags.forEach(tag => {
-                const tagTalkgroups = (system.talkgroups || []).filter(tg => (tg.tag || 'Untagged') === tag);
-                if (tagTalkgroups.length > 0) {
-                    groups.set(tag, tagTalkgroups);
+            const favoriteTagsResolved = new Set(
+                Array.from(favoriteTags).map(t => this.tagColorService.resolveTagLabel(t))
+            );
+            favoriteTagsResolved.forEach(tag => {
+                const tagTalkgroups = (system.talkgroups || []).filter(tg => this.talkgroupMatchesTag(tg, tag));
+                const favorited = tagTalkgroups.filter(tg => favoriteTalkgroups.has(tg.id));
+                if (favorited.length > 0) {
+                    groups.set(tag, favorited);
                 }
             });
-
-            // Add individually favorited talkgroups whose tag is not itself favorited
             (system.talkgroups || []).forEach(tg => {
                 if (favoriteTalkgroups.has(tg.id)) {
-                    const tag = tg.tag || 'Untagged';
-                    if (!groups.has(tag)) {
-                        groups.set(tag, []);
-                    }
-                    if (!groups.get(tag)!.some(t => t.id === tg.id)) {
-                        groups.get(tag)!.push(tg);
-                    }
+                    addFavoriteTalkgroup(tg);
                 }
             });
         }
@@ -1163,7 +1357,7 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
                 if (processedTags.has(tagKey)) {
                     return;
                 }
-                const tagTalkgroups = (system.talkgroups || []).filter(tg => (tg.tag || 'Untagged') === fav.tag);
+                const tagTalkgroups = (system.talkgroups || []).filter(tg => this.talkgroupMatchesTag(tg, fav.tag!));
                 if (tagTalkgroups.length > 0) {
                     processedTags.add(tagKey);
                     this.applyTagStatus(system.id, fav.tag, tagTalkgroups, status);
@@ -1177,14 +1371,10 @@ export class RdioScannerSelectComponent implements OnDestroy, OnInit {
         });
     }
 
-    private getTalkgroupsForTag(system: RdioScannerSystem, tag: string): RdioScannerTalkgroup[] {
-        return (system.talkgroups || []).filter(tg => (tg.tag || 'Untagged') === tag);
-    }
-
     private getTalkgroupTag(systemId: number, talkgroupId: number): string | undefined {
         const system = this.systems?.find(s => s.id === systemId);
         const talkgroup = system?.talkgroups?.find(tg => tg.id === talkgroupId);
-        return talkgroup?.tag || 'Untagged';
+        return talkgroup ? this.tagColorService.resolveTagLabel(talkgroup.tag) : undefined;
     }
 
     private eventHandler(event: RdioScannerEvent): void {

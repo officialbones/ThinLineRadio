@@ -17,9 +17,8 @@
  * ****************************************************************************
  */
 
-import { Component, ElementRef, HostListener, OnDestroy, OnInit, ViewChild } from '@angular/core';
+import { Component, ElementRef, HostListener, OnDestroy, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
-import { MatSidenav } from '@angular/material/sidenav';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { timer } from 'rxjs';
 import { RdioScannerEvent, RdioScannerLivefeedMode } from './rdio-scanner';
@@ -27,12 +26,15 @@ import { RdioScannerService } from './rdio-scanner.service';
 import { SettingsService } from './settings/settings.service';
 import { RdioScannerNativeComponent } from './native/native.component';
 import { isMobileRestrictedBrowser } from './mobile-browser.util';
-import { RdioScannerSearchComponent } from './search/search.component';
+import { AppFontService } from './app-font.service';
+import { AppAccentService } from './app-accent.service';
 
 @Component({
     selector: 'rdio-scanner',
     styleUrls: ['./rdio-scanner.component.scss'],
     templateUrl: './rdio-scanner.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerComponent implements OnDestroy, OnInit {
     private eventSubscription;
@@ -44,30 +46,8 @@ export class RdioScannerComponent implements OnDestroy, OnInit {
     private pinAuthRequired = false;
     private connectionLimitAlertShown = false;
 
-    useClassicView = window?.localStorage?.getItem('rdio-scanner-classic-view') === 'true';
-
     /** Mobile browsers cannot use the scanner UI; see mobile-web-hub. */
     readonly isMobileRestrictedBrowser = isMobileRestrictedBrowser();
-
-    // Classic view sidenav refs
-    @ViewChild('classicSearchPanel')  private classicSearchPanel:  MatSidenav | undefined;
-    @ViewChild('classicSelectPanel')  private classicSelectPanel:  MatSidenav | undefined;
-    @ViewChild('classicSettingsPanel') private classicSettingsPanel: MatSidenav | undefined;
-    @ViewChild('classicAlertsPanel')  private classicAlertsPanel:  MatSidenav | undefined;
-    @ViewChild('classicSearchComponent') private classicSearchComponent: RdioScannerSearchComponent | undefined;
-
-    toggleClassicView(): void {
-        this.useClassicView = !this.useClassicView;
-        window?.localStorage?.setItem('rdio-scanner-classic-view', String(this.useClassicView));
-    }
-
-    classicScrollTop(e: HTMLElement): void {
-        setTimeout(() => e.scrollTo(0, 0));
-    }
-
-    onSearchPanelClosed(): void {
-        this.rdioScannerService.stopPlaybackMode();
-    }
 
     constructor(
         private matSnackBar: MatSnackBar,
@@ -75,6 +55,8 @@ export class RdioScannerComponent implements OnDestroy, OnInit {
         private rdioScannerService: RdioScannerService,
         private settingsService: SettingsService,
         private route: ActivatedRoute,
+        private appFontService: AppFontService,
+        private appAccentService: AppAccentService,
     ) {
         this.eventSubscription = this.rdioScannerService.event.subscribe((event: RdioScannerEvent) => this.eventHandler(event));
 
@@ -130,6 +112,10 @@ export class RdioScannerComponent implements OnDestroy, OnInit {
     }
 
     ngOnInit(): void {
+        // Re-apply after .scanner-shell exists (APP_INITIALIZER may run before it mounts).
+        this.appFontService.apply(this.appFontService.getCurrentFont());
+        this.appAccentService.setSiteColor(this.appAccentService.getSiteColor());
+
         /*
          * BEGIN OF RED TAPE:
          * 
@@ -153,39 +139,6 @@ export class RdioScannerComponent implements OnDestroy, OnInit {
         /**
          * END OF RED TAPE.
          */
-        
-        // Load and apply saved font on app init
-        this.loadAndApplyFont();
-    }
-    
-    private loadAndApplyFont(): void {
-        const availableFonts = [
-            { name: 'Roboto', value: 'Roboto, sans-serif' },
-            { name: 'Rajdhani', value: 'Rajdhani, sans-serif' },
-            { name: 'ShareTechMono', value: '"Share Tech Mono", monospace' },
-            { name: 'Audiowide', value: 'Audiowide, cursive' },
-        ];
-        
-        this.settingsService.getSettings().subscribe({
-            next: (settings) => {
-                const fontName = settings?.appFont || 'Roboto';
-                const font = availableFonts.find(f => f.name === fontName);
-                if (font) {
-                    document.body.style.fontFamily = font.value;
-                    
-                    // Adjust font size for Audiowide (15% smaller)
-                    if (fontName === 'Audiowide') {
-                        document.documentElement.style.fontSize = '14.45px'; // 85% of 17px
-                    } else {
-                        document.documentElement.style.fontSize = '';
-                    }
-                }
-            },
-            error: () => {
-                // On error, use default font (Roboto)
-                document.body.style.fontFamily = 'Roboto, sans-serif';
-            },
-        });
     }
 
     start(): void {
@@ -194,8 +147,6 @@ export class RdioScannerComponent implements OnDestroy, OnInit {
 
     stop(): void {
         this.rdioScannerService.stopLivefeed();
-        this.classicSearchPanel?.close();
-        this.classicSelectPanel?.close();
     }
 
     toggleFullscreen(): void {
@@ -298,7 +249,19 @@ export class RdioScannerComponent implements OnDestroy, OnInit {
         }
         
         if ('config' in event) {
-            this.userRegistrationEnabled = event.config?.options?.userRegistrationEnabled ?? false;
+            const siteAccent = event.config?.options?.uiAccentColor;
+            if (typeof siteAccent === 'string' && siteAccent) {
+                this.appAccentService.setSiteColor(siteAccent);
+            }
+            const userSettings = event.config?.userSettings;
+            if (userSettings && 'uiAccentColor' in userSettings) {
+                const userAccent = userSettings['uiAccentColor'];
+                this.appAccentService.setUserColor(typeof userAccent === 'string' ? userAccent : '');
+            }
+            // VER-only updates omit options — don't clobber registration state with false.
+            if (event.config?.options && 'userRegistrationEnabled' in event.config.options) {
+                this.userRegistrationEnabled = !!event.config.options.userRegistrationEnabled;
+            }
 
             if (this.userRegistrationEnabled) {
                 // Check if we're coming from a route that requires explicit authentication

@@ -16,258 +16,164 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-.systems-overview {
+
+.systems-landing {
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    min-height: 240px;
 }
 
-// ─── Header ──────────────────────────────────────────────────────────────────
-.overview-header {
+.admin-section-bar {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
-    gap: 16px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid #2a2a2a;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
 
-    .overview-intro {
-        display: flex;
-        align-items: flex-start;
-        gap: 12px;
+.admin-section-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
 
-        mat-icon {
-            color: #cc0000;
-            font-size: 28px;
-            width: 28px;
-            height: 28px;
-            margin-top: 2px;
-        }
+.search-field {
+    flex: 1 1 220px;
+    max-width: 320px;
+    margin: 0 !important;
+    font-size: 13px;
 
-        h3 {
-            margin: 0 0 4px;
-            font-size: 17px;
-            font-weight: 600;
-            color: #eee;
-        }
+    ::ng-deep .mat-mdc-form-field-subscript-wrapper { display: none; }
 
-        p { margin: 0; color: #888; }
+    ::ng-deep .mat-mdc-text-field-wrapper {
+        background: transparent !important;
+        padding-left: 4px;
     }
 
-    .overview-actions {
-        display: flex;
-        gap: 8px;
-        flex-shrink: 0;
+    ::ng-deep .mat-mdc-form-field-flex {
+        height: 36px;
     }
 }
 
-// ─── Empty State ──────────────────────────────────────────────────────────────
+.order-hint {
+    margin: 0 0 8px;
+    color: #888;
+    font-size: 12px;
+}
+
 .empty-state {
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 48px 16px;
-    gap: 10px;
+    justify-content: center;
+    gap: 8px;
     color: #666;
     text-align: center;
+    padding: 48px 16px;
+    flex: 1;
 
     mat-icon {
-        font-size: 56px;
-        width: 56px;
-        height: 56px;
-        color: #333;
-        margin-bottom: 8px;
+        font-size: 40px;
+        width: 40px;
+        height: 40px;
+        color: #555;
     }
 
     p { margin: 0; }
-}
 
-// ─── Table ────────────────────────────────────────────────────────────────────
-.table-wrapper {
-    border-radius: 8px;
-    overflow: hidden;
-    border: 1px solid #2a2a2a;
-}
-
-.table-toolbar {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 12px 16px;
-    background: #1a1a1a;
-    border-bottom: 1px solid #2a2a2a;
-
-    .search-field {
-        flex: 1;
-        max-width: 340px;
-
-        ::ng-deep .mat-mdc-form-field-subscript-wrapper { display: none; }
+    .mat-body {
+        color: #aaa;
+        font-size: 15px;
     }
 
-    .result-count { color: #888; }
+    .mat-caption {
+        color: #666;
+        max-width: 360px;
+    }
+
+    button {
+        margin-top: 8px;
+    }
+}
+
+.table-wrapper {
+    overflow: auto;
 }
 
 .systems-table {
     width: 100%;
     background: transparent;
 
-    .mat-mdc-header-row {
-        background: #1a1a1a;
-        border-bottom: 1px solid #2a2a2a;
+    .mat-mdc-header-cell,
+    .mat-mdc-cell {
+        color: rgba(255, 255, 255, 0.82);
     }
 
-    .mat-mdc-header-cell {
-        color: #777;
-        font-size: 11px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        border-bottom: none;
-        padding: 0 16px;
+    .mat-column-drag {
+        flex: 0 0 36px;
+        width: 36px;
+        padding-left: 4px !important;
+        padding-right: 0 !important;
     }
 
-    .system-row {
-        cursor: pointer;
-        border-bottom: 1px solid #1e1e1e;
-        transition: background 0.12s ease;
-
-        &:last-child { border-bottom: none; }
-        &:hover { background: rgba(255, 255, 255, 0.04); }
-
-        .mat-mdc-cell {
-            border-bottom: none;
-            padding: 12px 16px;
-            vertical-align: middle;
-        }
+    .mat-column-systemRef {
+        flex: 0 0 88px;
+        width: 88px;
     }
 
-    .alerts-col {
-        width: 72px;
-        text-align: center;
+    .mat-column-type {
+        flex: 0 0 120px;
+        width: 120px;
     }
 
-    .actions-col {
-        width: 56px;
-        text-align: right;
-        padding-right: 8px !important;
+    .mat-column-talkgroups,
+    .mat-column-sites {
+        flex: 0 0 110px;
+        width: 110px;
     }
 
-    // Drag handle column
-    .drag-col {
-        width: 40px;
-        padding: 0 4px !important;
+    .mat-column-actions {
+        flex: 0 0 48px;
+        width: 48px;
+        justify-content: flex-end;
     }
 }
 
-// ─── Drag & drop ──────────────────────────────────────────────────────────────
+.system-row {
+    cursor: pointer;
+
+    &:hover {
+        background: rgba(255, 255, 255, 0.04);
+    }
+}
+
 .drag-handle {
     color: #555;
     cursor: grab;
     font-size: 20px;
     width: 20px;
     height: 20px;
-    display: block;
-    transition: color 0.15s ease;
 
-    &:hover { color: #aaa; }
-    &:active { cursor: grabbing; }
+    &:hover { color: #888; }
 
     &.drag-disabled {
-        cursor: not-allowed;
-        color: #333;
-        opacity: 0.4;
+        opacity: 0.35;
+        cursor: default;
     }
 }
 
-// Row placeholder while dragging
-.cdk-drag-placeholder {
-    opacity: 0;
-}
-
-// Animate rows moving out of the way
-.cdk-drop-list-dragging .system-row:not(.cdk-drag-placeholder) {
-    transition: transform 250ms cubic-bezier(0, 0, 0.2, 1);
-}
-
-// Preview card while dragging
 .cdk-drag-preview {
-    background: #222;
+    background: #242424;
     border: 1px solid #444;
     border-radius: 4px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-    opacity: 0.95;
-    display: flex;
-    align-items: center;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
-// ─── Cell content ─────────────────────────────────────────────────────────────
-.sys-id {
-    font-family: 'Roboto Mono', monospace;
+.cdk-drag-placeholder { opacity: 0.2; }
+
+code {
     font-size: 12px;
-    color: #999;
-    background: rgba(255, 255, 255, 0.05);
-    padding: 2px 8px;
-    border-radius: 4px;
-    border: 1px solid #2a2a2a;
-}
-
-.label-cell {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-
-    .sys-label {
-        font-weight: 500;
-        color: #e0e0e0;
-    }
-
-    .error-icon {
-        font-size: 16px;
-        width: 16px;
-        height: 16px;
-        color: #f44336;
-    }
-}
-
-.type-badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 600;
-    background: rgba(204, 0, 0, 0.12);
-    color: #ff6666;
-    border: 1px solid rgba(204, 0, 0, 0.25);
-    letter-spacing: 0.5px;
-}
-
-.no-type { color: #555; }
-
-.count-badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 12px;
-    font-weight: 600;
-    background: rgba(0, 120, 212, 0.15);
-    color: #64b5f6;
-    border: 1px solid rgba(0, 120, 212, 0.25);
-
-    &.secondary {
-        background: rgba(76, 175, 80, 0.1);
-        color: #81c784;
-        border-color: rgba(76, 175, 80, 0.2);
-    }
-}
-
-// ─── Pagination ───────────────────────────────────────────────────────────────
-.pagination {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    gap: 4px;
-    padding: 8px 16px;
-    background: #1a1a1a;
-    border-top: 1px solid #2a2a2a;
-    color: #888;
+    color: #9ad;
 }

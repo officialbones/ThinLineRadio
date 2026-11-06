@@ -83,10 +83,15 @@ type Call struct {
 	ToneSequence         *ToneSequence
 	HasTones             bool
 	Transcript           string
+	ReviewedTranscript   string
+	TrainingReviewStatus string // pending, submitted
 	TranscriptConfidence float64
 	TranscriptionStatus  string
-	AlertSummary         string  // Optional short LLM summary for alerts (when summarized alerts enabled)
-	ApiKeyId             *uint64 // API key used for upload (for preferred API key logic)
+	AlertSummary         string // Optional short LLM summary for alerts (when summarized alerts enabled)
+	// ExtractedAddress is an optional short scene address / place from Gemini
+	// when incident-mapping address extraction is enabled. Runtime + DB column.
+	ExtractedAddress string
+	ApiKeyId         *uint64 // API key used for upload (for preferred API key logic)
 
 	// Add back simple fields for compatibility with v6 uploads
 	SystemId    uint `json:"system"`
@@ -105,13 +110,28 @@ type Call struct {
 	// Not persisted to DB or included in JSON output.
 	Duration float64
 
-	IsDuplicate bool `json:"isDuplicate,omitempty"`
+	IsDuplicate bool   `json:"isDuplicate,omitempty"`
 	AudioHash   string `json:"audioHash,omitempty"`
 
 	// IsForwarded is set when this call was received from another TLR server via
 	// downstream forwarding. It is runtime-only (never stored in DB) and prevents
 	// the receiving server from re-forwarding the call, breaking circular loops.
 	IsForwarded bool `json:"-"`
+
+	// CoreRecordingId is the SDRTrunk Thinline Radio Core recording id.
+	// CoreAccepted is set once that recording has been stored.
+	// CoreRejectReason says why it was not stored.
+	// CoreFallback marks a held recording the site uploaded without being asked,
+	// after losing its connection, so another site may already have delivered it.
+	CoreRecordingId  string `json:"-"`
+	CoreAccepted     bool   `json:"-"`
+	CoreRejectReason string `json:"-"`
+	CoreFallback     bool   `json:"-"`
+
+	// ToneSourceTalkgroupId is runtime-only. When pending tones from one talkgroup
+	// attach to a voice call on another (linked-voice), this is the DB id of the
+	// talkgroup where tones were detected — used for alertCooldownSeconds lookup.
+	ToneSourceTalkgroupId uint64 `json:"-"`
 }
 
 func NewCall() *Call {
@@ -397,27 +417,6 @@ func NewCalls(controller *Controller) *Calls {
 	}
 }
 
-// timestampDurationRatioMin is the minimum ratio (shorter/longer) between the
-// incoming call's duration and a candidate's stored duration for the timestamp
-// fallback check. More lenient than the former energy ratio (0.85) because an
-// identical P25 timestamp is already strong evidence of the same grant — the
-// guard exists only to reject wildly different calls (e.g. 0.26s vs 2.6s) that
-// share a wall-clock second due to SDR Trunk not embedding true P25 timestamps.
-const timestampDurationRatioMin = 0.50
-
-// audioFingerprintWindow is the ±time window used when searching the DB for
-// duplicate candidates via audio fingerprinting (energy profiles and Chromaprint).
-// ±120s covers the worst observed delayed-upload scenario: an uploader whose
-// reported P25 timestamp is up to ~90s behind the actual wall clock. False
-// positives are prevented by the energy similarity (≥80%) and duration ratio
-// (≥85%) guards — a genuinely different call will not score above those
-// thresholds regardless of how close in time it is.
-const audioFingerprintWindow = 120 * time.Second
-
-// defaultTimestampFallbackWindow is the default ±window for timestamp-based
-// duplicate detection when the admin has not configured DuplicateTimestampWindow.
-const defaultTimestampFallbackWindow = 800 * time.Millisecond
-
 // CheckDuplicateByHash queries the DB for any call on the same system+talkgroup
 // whose PCM content hash matches this call's hash. A hash match means the decoded
 // audio samples are bit-identical — a guaranteed duplicate regardless of how far
@@ -444,28 +443,40 @@ func (calls *Calls) CheckDuplicateByHash(call *Call, db *Database) (bool, error)
 	return count > 0, nil
 }
 
-// CheckDuplicateByTimestamp is the last-resort fallback after audio fingerprinting
-// has already cleared the call. It queries the DB for any call on the same
-// system+talkgroup whose P25 timestamp is within ±timestampFallbackWindow.
-// A duration ratio guard (same as the energy path) is applied: if the candidate's
-// stored duration differs by more than 15% from this call's duration, it is skipped.
-// This prevents false positives when two genuinely different calls land at the same
-// wall-clock second (e.g. SDR Trunk uploaders that don't embed true P25 timestamps).
-func (calls *Calls) CheckDuplicateByTimestamp(call *Call, db *Database, windowMs int64) (bool, error) {
-	if call.System == nil || call.Talkgroup == nil {
+// CheckDuplicateByTimestamp is the last-pass duplicate check after arrival-time
+// matching. It looks for a prior call on the same system+talkgroup whose radio
+// (P25) timestamp is within ±windowMs. Soft radio-ID guard: known different
+// unit IDs do not match; missing sources still allow a timestamp match. Feeder
+// and API key are never considered. windowMs 0 disables this pass. When spanMs
+// is positive, a prior call with a known length only matches if its audio
+// overlaps [timestamp, timestamp+spanMs].
+func (calls *Calls) CheckDuplicateByTimestamp(call *Call, db *Database, windowMs uint, spanMs int64) (bool, error) {
+	if call.System == nil || call.Talkgroup == nil || windowMs == 0 {
+		return false, nil
+	}
+	ts := call.Timestamp.UnixMilli()
+	if ts == 0 {
 		return false, nil
 	}
 
 	formatError := errorFormatter("calls", "checkduplicatebytimestamp")
 
-	from := call.Timestamp.UnixMilli() - windowMs
-	to := call.Timestamp.UnixMilli() + windowMs
+	from := ts - int64(windowMs)
+	to := ts + int64(windowMs)
+	incomingSource := callPrimarySource(call)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	query := fmt.Sprintf(
-		`SELECT "audioDuration" FROM "calls" WHERE "timestamp" BETWEEN %d AND %d AND "systemId" = %d AND "talkgroupId" = %d`,
+		`SELECT (
+			SELECT cu."unitRef" FROM "callUnits" cu
+			WHERE cu."callId" = c."callId" AND cu."unitRef" > 0
+			ORDER BY cu."offset" ASC LIMIT 1
+		) AS "source", c."timestamp", c."audioDuration"
+		FROM "calls" c
+		WHERE c."timestamp" BETWEEN %d AND %d
+		  AND c."systemId" = %d AND c."talkgroupId" = %d`,
 		from, to, call.System.Id, call.Talkgroup.Id,
 	)
 
@@ -476,102 +487,200 @@ func (calls *Calls) CheckDuplicateByTimestamp(call *Call, db *Database, windowMs
 	defer rows.Close()
 
 	for rows.Next() {
-		var candidateDuration float64
-		if err := rows.Scan(&candidateDuration); err != nil {
+		var priorSource sql.NullInt64
+		var priorStart int64
+		var priorDuration sql.NullFloat64
+		if err := rows.Scan(&priorSource, &priorStart, &priorDuration); err != nil {
+			return false, formatError(err, query)
+		}
+		var prior uint
+		if priorSource.Valid && priorSource.Int64 > 0 {
+			prior = uint(priorSource.Int64)
+		}
+		if sourcesDisproveReceivedAtDuplicate(incomingSource, prior) {
 			continue
 		}
-		// If either duration is unknown, trust the timestamp match.
-		if call.Duration <= 0 || candidateDuration <= 0 {
-			return true, nil
+		if spanMs > 0 && priorDuration.Valid && priorDuration.Float64 > 0 &&
+			!timestampSpansOverlap(priorStart, int64(priorDuration.Float64*1000), ts, spanMs) {
+			continue
 		}
-		lo, hi := call.Duration, candidateDuration
-		if hi < lo {
-			lo, hi = hi, lo
-		}
-		if lo/hi >= timestampDurationRatioMin {
-			return true, nil
-		}
+		return true, nil
 	}
-
+	if err := rows.Err(); err != nil {
+		return false, formatError(err, query)
+	}
 	return false, nil
 }
 
-// receivedAtDuplicateWindow is the maximum gap between this call's server-arrival
-// time and a prior call's server-arrival time on the same system+talkgroup for the
-// receivedAt duplicate pass to fire. 1 second covers the common multi-recorder case
-// where two recorders upload the same transmission within a fraction of a second of
-// each other even when their P25 clocks are skewed.
-const receivedAtDuplicateWindow = 1000 * time.Millisecond
+// CheckCoveredByStoredCall is true when at least half of the call's audio falls
+// inside a call already stored on the same talkgroup. Start times of two
+// sites' copies can differ by seconds when one site caught only part of it.
+func (calls *Calls) CheckCoveredByStoredCall(call *Call, db *Database, spanMs int64) (bool, error) {
+	if call.System == nil || call.Talkgroup == nil || spanMs <= 0 {
+		return false, nil
+	}
+	ts := call.Timestamp.UnixMilli()
+	if ts == 0 {
+		return false, nil
+	}
 
-// audioDurationsSimilarForReceivedAtDup returns true when two audio durations are
-// close enough to be considered the same transmission. We use a generous tolerance
-// because the same transmission captured by two different SDRs can differ by a
-// fraction of a second in decode length.
-func audioDurationsSimilarForReceivedAtDup(a, b float64) bool {
-	if a <= 0 || b <= 0 {
+	formatError := errorFormatter("calls", "checkcoveredbystoredcall")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	query := fmt.Sprintf(
+		`SELECT c."timestamp", c."audioDuration" FROM "calls" c
+		WHERE c."timestamp" BETWEEN %d AND %d
+		  AND c."systemId" = %d AND c."talkgroupId" = %d AND c."audioDuration" > 0`,
+		ts-120000, ts+spanMs, call.System.Id, call.Talkgroup.Id,
+	)
+
+	rows, err := db.Sql.QueryContext(ctx, query)
+	if err != nil {
+		return false, formatError(err, query)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var priorStart int64
+		var priorDuration float64
+		if err := rows.Scan(&priorStart, &priorDuration); err != nil {
+			return false, formatError(err, query)
+		}
+		if coveredByStoredCall(priorStart, int64(priorDuration*1000), ts, spanMs) {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, formatError(err, query)
+	}
+	return false, nil
+}
+
+func coveredByStoredCall(storedStart int64, storedDuration int64, start int64, duration int64) bool {
+	if duration <= 0 || storedDuration <= 0 {
 		return false
 	}
-	diff := a - b
-	if diff < 0 {
-		diff = -diff
+	end := start + duration
+	if storedEnd := storedStart + storedDuration; storedEnd < end {
+		end = storedEnd
 	}
-	// Absolute tolerance: within 0.4 s
-	if diff <= 0.4 {
-		return true
+	begin := start
+	if storedStart > begin {
+		begin = storedStart
 	}
-	// Relative tolerance: within 15% of the longer duration
-	longer := a
-	if b > a {
-		longer = b
+	return (end-begin)*2 >= duration
+}
+
+func timestampSpansOverlap(aStart int64, aDuration int64, bStart int64, bDuration int64) bool {
+	return aStart < bStart+bDuration && bStart < aStart+aDuration
+}
+
+// receivedAtDuplicateWindowFromMs converts the admin "arrival match window"
+// option into a duration. Zero / unset falls back to the historical 1s default
+// used when this path was hardcoded (before the option was wired through).
+func receivedAtDuplicateWindowFromMs(ms uint) time.Duration {
+	if ms == 0 {
+		return time.Second
 	}
-	return diff/longer <= 0.15
+	if ms < 100 {
+		ms = 100
+	}
+	if ms > 30000 {
+		ms = 30000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// callPrimarySource returns the first positive upload `source` (unit/radio ID) on
+// the call, or 0 when unknown. Parsers map form/JSON `source` / `sources` into
+// call.Units[].UnitRef (and Meta.UnitRefs); there is no separate Call.Source field.
+func callPrimarySource(call *Call) uint {
+	if call == nil {
+		return 0
+	}
+	for _, unit := range call.Units {
+		if unit.UnitRef > 0 {
+			return unit.UnitRef
+		}
+	}
+	for _, ref := range call.Meta.UnitRefs {
+		if ref > 0 {
+			return ref
+		}
+	}
+	return 0
+}
+
+// sourcesDisproveReceivedAtDuplicate is a soft trunking guard: when both sides
+// have a known source (radio ID) and they differ, time-based matching alone
+// should not drop the later call. If either source is missing/zero, return false
+// so normal duplicate detection still applies (VHF analog / unknown unit).
+func sourcesDisproveReceivedAtDuplicate(a, b uint) bool {
+	return a > 0 && b > 0 && a != b
 }
 
 // CheckDuplicateByReceivedAt looks for a prior call on the same system+talkgroup
-// whose server-arrival time (receivedAt) is within receivedAtDuplicateWindow of
-// this call's arrival time AND whose audio duration is similar. This catches
-// multi-recorder near-duplicates where the audio bytes differ (different noise
-// floor or encoding) but the same transmission was received by the server within
-// ~1 second from two different uploaders.
+// whose server-arrival time (receivedAt) is within windowMs of this call's
+// arrival. Soft radio-ID guard: known different unit IDs do not count as
+// duplicates. Missing IDs fall back to arrival-time only. Feeder and API key
+// are never considered.
 //
 // Forwarded calls are excluded from this check — a call that arrived via
 // downstream forwarding will always have a different receivedAt than the original,
 // and we must not flag it as a duplicate of itself.
-func (calls *Calls) CheckDuplicateByReceivedAt(call *Call, db *Database) (bool, error) {
+func (calls *Calls) CheckDuplicateByReceivedAt(call *Call, db *Database, windowMs uint) (bool, error) {
 	if call.System == nil || call.Talkgroup == nil {
-		return false, nil
-	}
-
-	// We need the duration to guard against false positives.
-	if _, err := calls.controller.getCallDuration(call); err != nil || call.Duration <= 0 {
 		return false, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	windowStart := time.Now().Add(-receivedAtDuplicateWindow)
+	arrivedAt := time.Now()
+	if !call.ReceivedAt.IsZero() {
+		arrivedAt = call.ReceivedAt
+	}
+	window := receivedAtDuplicateWindowFromMs(windowMs)
+	windowStart := arrivedAt.Add(-window)
+	incomingSource := callPrimarySource(call)
 
-	// Look for the most recent call on this system+talkgroup that arrived within
-	// the window. The duration guard prevents false positives from genuinely
-	// different calls that happen to land in the same second.
 	query := fmt.Sprintf(
-		`SELECT "audioDuration" FROM "calls" WHERE "systemId" = %d AND "talkgroupId" = %d AND "receivedAt" >= $1 ORDER BY "receivedAt" DESC LIMIT 1`,
+		`SELECT (
+			SELECT cu."unitRef" FROM "callUnits" cu
+			WHERE cu."callId" = c."callId" AND cu."unitRef" > 0
+			ORDER BY cu."offset" ASC LIMIT 1
+		) AS "source"
+		FROM "calls" c
+		WHERE c."systemId" = %d AND c."talkgroupId" = %d
+		  AND c."receivedAt" >= $1 AND c."receivedAt" <= $2`,
 		call.System.Id, call.Talkgroup.Id,
 	)
 
-	var priorDur sql.NullFloat64
-	_ = db.Sql.QueryRowContext(ctx, query, windowStart).Scan(&priorDur)
-
-	if !priorDur.Valid {
-		return false, nil
+	rows, err := db.Sql.QueryContext(ctx, query, windowStart, arrivedAt)
+	if err != nil {
+		return false, err
 	}
+	defer rows.Close()
 
-	if !audioDurationsSimilarForReceivedAtDup(call.Duration, priorDur.Float64) {
-		return false, nil
+	for rows.Next() {
+		var priorSource sql.NullInt64
+		if err := rows.Scan(&priorSource); err != nil {
+			return false, err
+		}
+		var prior uint
+		if priorSource.Valid && priorSource.Int64 > 0 {
+			prior = uint(priorSource.Int64)
+		}
+		if !sourcesDisproveReceivedAtDuplicate(incomingSource, prior) {
+			return true, nil
+		}
 	}
-
-	return true, nil
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (calls *Calls) GetCall(id uint64) (*Call, error) {
@@ -606,19 +715,21 @@ func (calls *Calls) GetCall(id uint64) (*Call, error) {
 	call := Call{Id: id}
 
 	if calls.controller.Database.Config.DbType == DbTypePostgresql {
-		query = fmt.Sprintf(`SELECT c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", STRING_AGG(CAST(COALESCE(cpt."talkgroupRef", 0) AS text), ','), sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary" FROM "calls" AS c LEFT JOIN "callPatches" AS cp on cp."callId" = c."callId" LEFT JOIN "talkgroups" AS cpt ON cpt."talkgroupId" = cp."talkgroupId" LEFT JOIN "systems" AS sy ON sy."systemId" = c."systemId" LEFT JOIN "talkgroups" AS t ON t."talkgroupId" = c."talkgroupId" WHERE c."callId" = %d GROUP BY c."callId", c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary"`, id)
+		query = fmt.Sprintf(`SELECT c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", STRING_AGG(CAST(COALESCE(cpt."talkgroupRef", 0) AS text), ','), sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."reviewedTranscript", c."trainingReviewStatus", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary" FROM "calls" AS c LEFT JOIN "callPatches" AS cp on cp."callId" = c."callId" LEFT JOIN "talkgroups" AS cpt ON cpt."talkgroupId" = cp."talkgroupId" LEFT JOIN "systems" AS sy ON sy."systemId" = c."systemId" LEFT JOIN "talkgroups" AS t ON t."talkgroupId" = c."talkgroupId" WHERE c."callId" = %d GROUP BY c."callId", c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."reviewedTranscript", c."trainingReviewStatus", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary"`, id)
 
 	} else {
-		query = fmt.Sprintf(`SELECT c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", GROUP_CONCAT(COALESCE(cpt."talkgroupRef", 0)), sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary" FROM "calls" AS c LEFT JOIN "callPatches" AS cp on cp."callId" = c."callId" LEFT JOIN "talkgroups" AS cpt ON cpt."talkgroupId" = cp."talkgroupId" LEFT JOIN "systems" AS sy ON sy."systemId" = c."systemId" LEFT JOIN "talkgroups" AS t ON t."talkgroupId" = c."talkgroupId" WHERE c."callId" = %d GROUP BY c."callId", c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary"`, id)
+		query = fmt.Sprintf(`SELECT c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", GROUP_CONCAT(COALESCE(cpt."talkgroupRef", 0)), sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."reviewedTranscript", c."trainingReviewStatus", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary" FROM "calls" AS c LEFT JOIN "callPatches" AS cp on cp."callId" = c."callId" LEFT JOIN "talkgroups" AS cpt ON cpt."talkgroupId" = cp."talkgroupId" LEFT JOIN "systems" AS sy ON sy."systemId" = c."systemId" LEFT JOIN "talkgroups" AS t ON t."talkgroupId" = c."talkgroupId" WHERE c."callId" = %d GROUP BY c."callId", c."audio", c."audioFilename", c."audioMime", c."siteRef", c."timestamp", sy."systemId", t."talkgroupId", c."frequency", c."toneSequence", c."hasTones", c."transcript", c."reviewedTranscript", c."trainingReviewStatus", c."transcriptConfidence", c."transcriptionStatus", c."alertSummary"`, id)
 	}
 
 	var toneSequenceJson sql.NullString
 	var transcript sql.NullString
+	var reviewedTranscript sql.NullString
+	var trainingReviewStatus sql.NullString
 	var transcriptConfidence sql.NullFloat64
 	var transcriptionStatus sql.NullString
 	var alertSummary sql.NullString
 
-	if err = tx.QueryRow(query).Scan(&call.Audio, &call.AudioFilename, &call.AudioMime, &call.SiteRef, &timestamp, &patch, &systemId, &talkgroupId, &frequency, &toneSequenceJson, &call.HasTones, &transcript, &transcriptConfidence, &transcriptionStatus, &alertSummary); err != nil && err != sql.ErrNoRows {
+	if err = tx.QueryRow(query).Scan(&call.Audio, &call.AudioFilename, &call.AudioMime, &call.SiteRef, &timestamp, &patch, &systemId, &talkgroupId, &frequency, &toneSequenceJson, &call.HasTones, &transcript, &reviewedTranscript, &trainingReviewStatus, &transcriptConfidence, &transcriptionStatus, &alertSummary); err != nil && err != sql.ErrNoRows {
 		tx.Rollback()
 		return nil, formatError(err, query)
 	}
@@ -646,6 +757,12 @@ func (calls *Calls) GetCall(id uint64) (*Call, error) {
 	// Load transcript
 	if transcript.Valid {
 		call.Transcript = transcript.String
+	}
+	if reviewedTranscript.Valid {
+		call.ReviewedTranscript = reviewedTranscript.String
+	}
+	if trainingReviewStatus.Valid {
+		call.TrainingReviewStatus = trainingReviewStatus.String
 	}
 	if transcriptConfidence.Valid {
 		call.TranscriptConfidence = transcriptConfidence.Float64
@@ -873,11 +990,36 @@ func (calls *Calls) GetCallsBulk(ids []uint64) []*Call {
 	return ordered
 }
 
-func (calls *Calls) Prune(db *Database, pruneDays uint) error {
-	timestamp := time.Now().Add(-24 * time.Hour * time.Duration(pruneDays)).UnixMilli()
-	query := fmt.Sprintf(`DELETE FROM "calls" WHERE "timestamp" < %d`, timestamp)
+func (calls *Calls) Prune(db *Database, defaultPruneDays uint) error {
+	nowMs := time.Now().UnixMilli()
+	dayMs := int64(24 * 60 * 60 * 1000)
 
-	if _, err := db.Sql.Exec(query); err != nil {
+	effectiveDaysExpr := fmt.Sprintf(`CASE
+		WHEN t."retentionDays" > 0 THEN t."retentionDays"
+		WHEN s."retentionDays" > 0 THEN s."retentionDays"
+		ELSE %d
+	END`, defaultPruneDays)
+
+	var query string
+	if db.Config.DbType == DbTypePostgresql {
+		// Cast retention days and dayMs to bigint before multiply — integer *
+		// integer overflows for any retention >= 25 days (25 * 86400000 > 2^31-1).
+		query = fmt.Sprintf(`DELETE FROM "calls" c
+USING "talkgroups" t, "systems" s
+WHERE c."talkgroupId" = t."talkgroupId"
+	AND c."systemId" = s."systemId"
+	AND (%s) > 0
+	AND c."timestamp" < ($1::bigint - ((%s)::bigint * %d::bigint))`, effectiveDaysExpr, effectiveDaysExpr, dayMs)
+	} else {
+		query = fmt.Sprintf(`DELETE FROM "calls" WHERE "callId" IN (
+SELECT c."callId" FROM "calls" c
+INNER JOIN "talkgroups" t ON c."talkgroupId" = t."talkgroupId"
+INNER JOIN "systems" s ON c."systemId" = s."systemId"
+WHERE (%s) > 0
+	AND c."timestamp" < (? - CAST((%s) AS INTEGER) * %d))`, effectiveDaysExpr, effectiveDaysExpr, dayMs)
+	}
+
+	if _, err := db.Sql.Exec(query, nowMs); err != nil {
 		return fmt.Errorf("%s in %s", err, query)
 	}
 
@@ -1012,9 +1154,18 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 		conditions := []string{
 			fmt.Sprintf(`c."systemRef" = %d`, v),
 		}
-		switch v := searchOptions.Talkgroup.(type) {
-		case uint:
-			conditions = append(conditions, fmt.Sprintf(`c."talkgroupRef" = %d`, v))
+		tgRefs := searchOptions.resolvedTalkgroupRefs()
+		switch len(tgRefs) {
+		case 0:
+			// All talkgroups on this system
+		case 1:
+			conditions = append(conditions, fmt.Sprintf(`c."talkgroupRef" = %d`, tgRefs[0]))
+		default:
+			parts := make([]string, len(tgRefs))
+			for i, id := range tgRefs {
+				parts[i] = fmt.Sprintf("%d", id)
+			}
+			conditions = append(conditions, fmt.Sprintf(`c."talkgroupRef" IN (%s)`, strings.Join(parts, ", ")))
 		}
 		if len(conditions) > 0 {
 			where = append(where, fmt.Sprintf("(%s)", strings.Join(conditions, " AND ")))
@@ -1139,7 +1290,7 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 	searchResults.HasMore = false
 
 	queryLimit := limit + 1
-	baseSelect := fmt.Sprintf(`SELECT c."callId", c."timestamp", c."systemRef", c."talkgroupRef", c."frequency", c."siteRef", (SELECT cu."unitRef" FROM "callUnits" cu WHERE cu."callId" = c."callId" ORDER BY cu."offset" LIMIT 1) as "source" FROM "calls" AS c LEFT JOIN "delayed" AS d ON d."callId" = c."callId" %s ORDER BY c."timestamp" %s`, delayWhere, order)
+	baseSelect := fmt.Sprintf(`SELECT c."callId", c."timestamp", c."systemRef", c."talkgroupRef", c."frequency", c."siteRef", (SELECT cu."unitRef" FROM "callUnits" cu WHERE cu."callId" = c."callId" ORDER BY cu."offset" LIMIT 1) as "source", c."audioDuration" FROM "calls" AS c LEFT JOIN "delayed" AS d ON d."callId" = c."callId" %s ORDER BY c."timestamp" %s`, delayWhere, order)
 
 	enforcePlaybackACL := calls.controller.requiresUserAuth() && !client.BypassPlaybackSearchACL
 
@@ -1165,7 +1316,8 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 			var frequency sql.NullInt64
 			var siteRef sql.NullInt64
 			var source sql.NullInt64
-			if err = rows.Scan(&searchResult.Id, &timestamp, &searchResult.System, &searchResult.Talkgroup, &frequency, &siteRef, &source); err != nil {
+			var audioDuration sql.NullFloat64
+			if err = rows.Scan(&searchResult.Id, &timestamp, &searchResult.System, &searchResult.Talkgroup, &frequency, &siteRef, &source, &audioDuration); err != nil {
 				break
 			}
 
@@ -1183,6 +1335,9 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 			}
 			if source.Valid && source.Int64 > 0 {
 				searchResult.Source = uint(source.Int64)
+			}
+			if audioDuration.Valid && audioDuration.Float64 > 0 {
+				searchResult.Duration = audioDuration.Float64
 			}
 			totalCalls++
 
@@ -1223,7 +1378,8 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 			var frequency sql.NullInt64
 			var siteRef sql.NullInt64
 			var source sql.NullInt64
-			if err = chunkRows.Scan(&searchResult.Id, &timestamp, &searchResult.System, &searchResult.Talkgroup, &frequency, &siteRef, &source); err != nil {
+			var audioDuration sql.NullFloat64
+			if err = chunkRows.Scan(&searchResult.Id, &timestamp, &searchResult.System, &searchResult.Talkgroup, &frequency, &siteRef, &source, &audioDuration); err != nil {
 				break
 			}
 
@@ -1241,6 +1397,9 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 			}
 			if source.Valid && source.Int64 > 0 {
 				searchResult.Source = uint(source.Int64)
+			}
+			if audioDuration.Valid && audioDuration.Float64 > 0 {
+				searchResult.Duration = audioDuration.Float64
 			}
 
 			if !calls.playbackSearchRowPlayableNow(client, searchResult) {
@@ -1284,6 +1443,16 @@ func (calls *Calls) Search(searchOptions *CallsSearchOptions, client *Client) (*
 }
 
 func (calls *Calls) WriteCall(call *Call, db *Database) (uint64, error) {
+	var id uint64
+	err := withPostgresIndexHeal(db, func() error {
+		var writeErr error
+		id, writeErr = calls.writeCall(call, db)
+		return writeErr
+	})
+	return id, err
+}
+
+func (calls *Calls) writeCall(call *Call, db *Database) (uint64, error) {
 	var (
 		err   error
 		query string
@@ -1410,18 +1579,44 @@ func (calls *Calls) WriteCall(call *Call, db *Database) (uint64, error) {
 }
 
 type CallsSearchOptions struct {
-	Date      any `json:"date,omitempty"`
-	Group     any `json:"group,omitempty"`
-	Limit     any `json:"limit,omitempty"`
-	Offset    any `json:"offset,omitempty"`
-	Sort      any `json:"sort,omitempty"`
-	System    any `json:"system,omitempty"`
-	Tag       any `json:"tag,omitempty"`
-	Talkgroup any `json:"talkgroup,omitempty"`
+	Date       any    `json:"date,omitempty"`
+	Group      any    `json:"group,omitempty"`
+	Limit      any    `json:"limit,omitempty"`
+	Offset     any    `json:"offset,omitempty"`
+	Sort       any    `json:"sort,omitempty"`
+	System     any    `json:"system,omitempty"`
+	Tag        any    `json:"tag,omitempty"`
+	Talkgroup  any    `json:"talkgroup,omitempty"`
+	Talkgroups []uint `json:"talkgroups,omitempty"`
 }
 
 func NewCallSearchOptions() *CallsSearchOptions {
 	return &CallsSearchOptions{}
+}
+
+func (searchOptions *CallsSearchOptions) resolvedTalkgroupRefs() []uint {
+	if searchOptions == nil {
+		return nil
+	}
+	if len(searchOptions.Talkgroups) > 0 {
+		seen := map[uint]bool{}
+		out := make([]uint, 0, len(searchOptions.Talkgroups))
+		for _, id := range searchOptions.Talkgroups {
+			if id == 0 || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+		}
+		return out
+	}
+	switch v := searchOptions.Talkgroup.(type) {
+	case uint:
+		if v > 0 {
+			return []uint{v}
+		}
+	}
+	return nil
 }
 
 func (searchOptions *CallsSearchOptions) fromMap(m map[string]any) *CallsSearchOptions {
@@ -1462,9 +1657,37 @@ func (searchOptions *CallsSearchOptions) fromMap(m map[string]any) *CallsSearchO
 		searchOptions.Tag = v
 	}
 
+	parseTalkgroupList := func(items []any) []uint {
+		out := make([]uint, 0, len(items))
+		seen := map[uint]bool{}
+		for _, item := range items {
+			n, ok := item.(float64)
+			if !ok || n <= 0 {
+				continue
+			}
+			id := uint(n)
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+		}
+		return out
+	}
+
+	switch v := m["talkgroups"].(type) {
+	case []any:
+		searchOptions.Talkgroups = parseTalkgroupList(v)
+	}
+
 	switch v := m["talkgroup"].(type) {
 	case float64:
 		searchOptions.Talkgroup = uint(v)
+	case []any:
+		// Back-compat: allow talkgroup as an array too.
+		if len(searchOptions.Talkgroups) == 0 {
+			searchOptions.Talkgroups = parseTalkgroupList(v)
+		}
 	}
 
 	return searchOptions
@@ -1478,6 +1701,7 @@ type CallsSearchResult struct {
 	Frequency uint      `json:"frequency,omitempty"`
 	Source    uint      `json:"source,omitempty"`
 	Site      uint      `json:"site,omitempty"`
+	Duration  float64   `json:"duration,omitempty"`
 }
 
 type CallsSearchResults struct {

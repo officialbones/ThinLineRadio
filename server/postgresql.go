@@ -23,7 +23,11 @@ var PostgresqlSchema = []string{
     "ident" text NOT NULL,
     "key" text NOT NULL,
     "order" integer NOT NULL DEFAULT 0,
-    "systems" text NOT NULL DEFAULT ''
+    "systems" text NOT NULL DEFAULT '',
+    "lastCallAt" bigint NOT NULL DEFAULT 0,
+    "noAudioAlertsEnabled" boolean NOT NULL DEFAULT false,
+    "noAudioThresholdMinutes" integer NOT NULL DEFAULT 10,
+    "purpose" text NOT NULL DEFAULT 'upload'
   );`,
 
 	`CREATE TABLE IF NOT EXISTS "downstreams" (
@@ -126,6 +130,8 @@ var PostgresqlSchema = []string{
 	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "transcriptConfidence" real NOT NULL DEFAULT 0;`,
 	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "transcriptionStatus" text NOT NULL DEFAULT 'pending';`,
 	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "transcriptionFailureReason" text NOT NULL DEFAULT '';`,
+	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "reviewedTranscript" text NOT NULL DEFAULT '';`,
+	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "trainingReviewStatus" text NOT NULL DEFAULT '';`,
 	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "alertSummary" text NOT NULL DEFAULT '';`,
 	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "transmissionId" text NOT NULL DEFAULT '';`,
 	`ALTER TABLE "calls" ADD COLUMN IF NOT EXISTS "requestId" text NOT NULL DEFAULT '';`,
@@ -189,12 +195,14 @@ var PostgresqlSchema = []string{
 	`CREATE TABLE IF NOT EXISTS "logs" (
     "logId" bigserial NOT NULL PRIMARY KEY,
     "level" text NOT NULL,
+    "category" text NOT NULL DEFAULT 'system',
     "message" text NOT NULL,
     "timestamp" bigint NOT NULL
   );`,
 
 	// Index for fast timestamp-based sorting and filtering on the logs table
 	`CREATE INDEX IF NOT EXISTS "logs_timestamp_idx" ON "logs" ("timestamp" DESC);`,
+	// logs_category_timestamp_idx is created in migrateLogsCategory after the column is added.
 
 	`CREATE TABLE IF NOT EXISTS "options" (
     "optionId" bigserial NOT NULL PRIMARY KEY,
@@ -250,6 +258,7 @@ var PostgresqlSchema = []string{
     "subscriptionStatus" text NOT NULL DEFAULT '',
     "accountExpiresAt" bigint NOT NULL DEFAULT 0,
     "forcePasswordReset" boolean NOT NULL DEFAULT false,
+    "suspended" boolean NOT NULL DEFAULT false,
     "settings" text NOT NULL DEFAULT ''
   );`,
 
@@ -277,6 +286,16 @@ var PostgresqlSchema = []string{
     "createdAt" bigint NOT NULL DEFAULT 0
   );`,
 
+	`CREATE TABLE IF NOT EXISTS "callNatures" (
+    "callNatureId" bigserial NOT NULL PRIMARY KEY,
+    "label" text NOT NULL,
+    "phrases" text NOT NULL DEFAULT '[]',
+    "enabled" boolean NOT NULL DEFAULT true,
+    "order" integer NOT NULL DEFAULT 0,
+    "createdAt" bigint NOT NULL DEFAULT 0
+  );`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS "callNatures_label_uidx" ON "callNatures" ("label");`,
+
 	`CREATE TABLE IF NOT EXISTS "alerts" (
     "alertId" bigserial NOT NULL PRIMARY KEY,
     "callId" bigint NOT NULL,
@@ -295,6 +314,7 @@ var PostgresqlSchema = []string{
 
 	`CREATE INDEX IF NOT EXISTS "alerts_created_idx" ON "alerts" ("createdAt");`,
 	`CREATE INDEX IF NOT EXISTS "alerts_call_idx" ON "alerts" ("callId");`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS "alerts_keyword_call_uidx" ON "alerts" ("callId", "systemId", "talkgroupId") WHERE "alertType" = 'keyword';`,
 
 	`CREATE TABLE IF NOT EXISTS "transcriptions" (
     "transcriptionId" bigserial NOT NULL PRIMARY KEY,
@@ -343,6 +363,7 @@ var PostgresqlSchema = []string{
     "stripeTaxRateId" text NOT NULL DEFAULT '',
     "isPublicRegistration" boolean NOT NULL DEFAULT false,
     "allowAddExistingUsers" boolean NOT NULL DEFAULT false,
+    "autoEnableNewTalkgroups" boolean NOT NULL DEFAULT false,
     "createdAt" bigint NOT NULL DEFAULT 0
   );`,
 

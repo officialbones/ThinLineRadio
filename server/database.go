@@ -59,7 +59,11 @@ func NewDatabase(config *Config) *Database {
 
 	if err = database.migrate(); err != nil {
 		log.Printf("FATAL: Database migration failed: %v", err)
-		log.Printf("The database schema must be up to date for the server to run. Please fix the migration error and try again.")
+		if strings.Contains(err.Error(), "57P01") || strings.Contains(err.Error(), "administrator command") {
+			log.Printf("The database connection was terminated during migration — usually because the server was stopped mid-startup or PostgreSQL was restarted. Start again and let migration finish without closing the process.")
+		} else {
+			log.Printf("The database schema must be up to date for the server to run. Please fix the migration error and try again.")
+		}
 		os.Exit(1)
 	}
 
@@ -75,9 +79,55 @@ func NewDatabase(config *Config) *Database {
 	return database
 }
 
-func (db *Database) migrate() error {
-	var schema []string
+func isRetryableMigrationErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "unexpected eof") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "conn closed") ||
+		strings.Contains(s, "driver: bad connection") ||
+		strings.Contains(s, "sqlstate 57p01") ||
+		strings.Contains(s, "sqlstate 08006") ||
+		strings.Contains(s, "sqlstate 08003") ||
+		strings.Contains(s, "sqlstate 08001") ||
+		strings.Contains(s, "server closed the connection")
+}
 
+// runMigrationStep pings the DB, runs fn, and retries on transient connection drops
+// (common on Windows/Docker Postgres when a prior heavy ALTER kills the session).
+func (db *Database) runMigrationStep(name string, fn func(*Database) error) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := db.Sql.Ping(); err != nil {
+			log.Printf("migration %s: reconnecting (attempt %d/%d): %v", name, attempt, maxAttempts, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			if err := db.Sql.Ping(); err != nil {
+				lastErr = err
+				if attempt == maxAttempts || !isRetryableMigrationErr(err) {
+					return fmt.Errorf("%s: ping: %w", name, err)
+				}
+				continue
+			}
+		}
+		if err := fn(db); err != nil {
+			lastErr = err
+			if attempt < maxAttempts && isRetryableMigrationErr(err) {
+				log.Printf("migration %s: retryable error (attempt %d/%d): %v", name, attempt, maxAttempts, err)
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("%s: %w", name, lastErr)
+}
+
+func (db *Database) migrate() error {
 	formatError := errorFormatter("database", "migrate")
 
 	// Prepare migration table first (v6 style)
@@ -85,25 +135,12 @@ func (db *Database) migrate() error {
 		return formatError(err, "")
 	}
 
-	schema = PostgresqlSchema
-
-	if tx, err := db.Sql.Begin(); err == nil {
-		for i, query := range schema {
-			if _, err = tx.Exec(query); err != nil {
-				log.Printf("ERROR: Failed to execute schema statement %d: %v", i+1, err)
-				tx.Rollback()
-				return formatError(err, query)
-			}
-		}
-
-		if err = tx.Commit(); err != nil {
-			log.Printf("ERROR: Failed to commit schema transaction: %v", err)
-			tx.Rollback()
+	if !postgresqlBootstrapComplete(db) {
+		if err := runPostgresqlBootstrap(db); err != nil {
 			return formatError(err, "")
 		}
 	} else {
-		log.Printf("ERROR: Failed to begin schema transaction: %v", err)
-		return formatError(err, "")
+		log.Println("postgresql bootstrap already complete, skipping")
 	}
 
 	if err := migrateGroups(db); err != nil {
@@ -240,6 +277,16 @@ func (db *Database) migrate() error {
 		return formatError(err, "")
 	}
 
+	// Migrate users suspended column
+	if err := migrateUserSuspended(db); err != nil {
+		return formatError(err, "")
+	}
+
+	// Migrate users userGroupIds column (multi-group membership)
+	if err := migrateUserGroupIds(db); err != nil {
+		return formatError(err, "")
+	}
+
 	// Migrate users mobile setup token (one-time app sign-in link)
 	if err := migrateUserMobileSetupToken(db); err != nil {
 		return formatError(err, "")
@@ -325,101 +372,59 @@ func (db *Database) migrate() error {
 		return formatError(err, "")
 	}
 
-	// Add label column to callUnits for P25 talker aliases
-	if err := migrateCallUnitsLabel(db); err != nil {
-		return formatError(err, "")
+	// Remaining steps use ping+retry so a dropped Postgres session (unexpected EOF)
+	// after a heavy ALTER does not hard-fail startup on the next catalog query.
+	lateSteps := []struct {
+		name string
+		fn   func(*Database) error
+	}{
+		{"migrateLogsCategory", migrateLogsCategory},
+		{"migrateCallUnitsLabel", migrateCallUnitsLabel},
+		{"migrateAlertCooldown", migrateAlertCooldown},
+		{"migrateLinkedVoiceTalkgroup", migrateLinkedVoiceTalkgroup},
+		{"migrateAudioConversionModes", migrateAudioConversionModes},
+		{"migrateRemoveAudioCodecBitrate", migrateRemoveAudioCodecBitrate},
+		{"migrateRegistrationCodesLabel", migrateRegistrationCodesLabel},
+		{"migrateAlertsEnabled", migrateAlertsEnabled},
+		{"migrateChannelNotificationSounds", migrateChannelNotificationSounds},
+		{"migrateTranscriptionPrompt", migrateTranscriptionPrompt},
+		{"migrateAutoPopulateAlertsEnabled", migrateAutoPopulateAlertsEnabled},
+		{"migrateAutoPopulateUnits", migrateAutoPopulateUnits},
+		{"migratePagerAlert", migratePagerAlert},
+		{"migrateToneSetPagerAlerts", migrateToneSetPagerAlerts},
+		{"migrateCallsDuplicateAudioOf", migrateCallsDuplicateAudioOf},
+		{"migrateCallsAudioDuration", migrateCallsAudioDuration},
+		{"migrateCallsIsDuplicate", migrateCallsIsDuplicate},
+		{"migrateCallsAudioHash", migrateCallsAudioHash},
+		{"migrateCallsTrainingReview", migrateCallsTrainingReview},
+		{"migrateToneSetAutoLearn", migrateToneSetAutoLearn},
+		{"migrateBulkToneDetection", migrateBulkToneDetection},
+		{"migrateUnitAliasAutoLearn", migrateUnitAliasAutoLearn},
+		{"migrateAutoLearnTagRollout", migrateAutoLearnTagRollout},
+		{"migrateUnitAliasSuggestionsReview", migrateUnitAliasSuggestionsReview},
+		{"migrateCallsVerifiedDuplicate", migrateCallsVerifiedDuplicate},
+		{"migratePostgresSiteRefToText", migratePostgresSiteRefToText},
+		{"migrateApikeyNoAudioMonitoring", migrateApikeyNoAudioMonitoring},
+		{"migrateApikeyPurpose", migrateApikeyPurpose},
+		{"migrateSdrtrunkHealth", migrateSdrtrunkHealth},
+		{"migrateRetentionDays", migrateRetentionDays},
+		{"migrateSystemDuplicateDetection", migrateSystemDuplicateDetection},
+		{"migrateUserAlertPushPreferences", migrateUserAlertPushPreferences},
+		{"migrateIncidentMapping", migrateIncidentMapping},
+		{"migrateCallNatures", migrateCallNatures},
+		{"migrateCallNaturePhraseLearn", migrateCallNaturePhraseLearn},
+		{"migrateKeywordAlertUnique", migrateKeywordAlertUnique},
+		{"migrateAutoEnableNewTalkgroups", migrateAutoEnableNewTalkgroups},
+		{"migrateTalkgroupHidden", migrateTalkgroupHidden},
+		{"migrateTalkgroupTranscriptionExclude", migrateTalkgroupTranscriptionExclude},
+		{"migrateRequireListenerSignIn", migrateRequireListenerSignIn},
+		{"migratePublicApi", migratePublicApi},
+		{"migratePublicApiUsageAtIndex", migratePublicApiUsageAtIndex},
 	}
-
-	// Add alertCooldownSeconds to talkgroups for per-talkgroup alert suppression
-	if err := migrateAlertCooldown(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add cross-talkgroup voice association columns (Scenario 2: tones on TGID A, voice on TGID B)
-	if err := migrateLinkedVoiceTalkgroup(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Clamp removed audioConversion modes 4/5 to mode 3 (loud normalization)
-	if err := migrateAudioConversionModes(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Remove audioCodec and audioBitrate from options table (fixed to AAC/32k pipeline)
-	if err := migrateRemoveAudioCodecBitrate(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add label column to registrationCodes for human-readable code names
-	if err := migrateRegistrationCodesLabel(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add alertsEnabled to systems and talkgroups for admin-level alert/transcription gating
-	if err := migrateAlertsEnabled(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add per-channel and per-tone-set notification sound overrides to userAlertPreferences
-	if err := migrateChannelNotificationSounds(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add per-system and per-talkgroup transcription prompt overrides
-	if err := migrateTranscriptionPrompt(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add autoPopulateAlertsEnabled on systems (default true)
-	if err := migrateAutoPopulateAlertsEnabled(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add autoPopulateUnits on systems (default false)
-	if err := migrateAutoPopulateUnits(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add pagerAlert to userAlertPreferences for server-side persistence of the
-	// pager-style alert playback toggle
-	if err := migratePagerAlert(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add toneSetPagerAlerts JSON column for per-tone-set pager-alert toggles
-	if err := migrateToneSetPagerAlerts(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add duplicateAudioOf + duplicateAudioOfTgRef for cross-talkgroup patch suppression
-	if err := migrateCallsDuplicateAudioOf(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add audioDuration column for duration-ratio pre-filter in energy dedup
-	if err := migrateCallsAudioDuration(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add isDuplicate flag so duplicate calls are stored but not emitted
-	if err := migrateCallsIsDuplicate(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add PCM content hash for exact-duplicate detection across any time window
-	if err := migrateCallsAudioHash(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Add human-review column for duplicate verification
-	if err := migrateCallsVerifiedDuplicate(db); err != nil {
-		return formatError(err, "")
-	}
-
-	// Convert sites.siteRef from INTEGER to TEXT on PostgreSQL (the earlier
-	// migrateEnhancedDuplicateDetection only handled SQLite via pragma_table_info).
-	if err := migratePostgresSiteRefToText(db); err != nil {
-		return formatError(err, "")
+	for _, step := range lateSteps {
+		if err := db.runMigrationStep(step.name, step.fn); err != nil {
+			return formatError(err, "")
+		}
 	}
 
 	return nil

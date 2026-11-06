@@ -17,14 +17,16 @@
  * ****************************************************************************
  */
 
-import { Component, Input, OnInit, OnChanges, SimpleChanges, ChangeDetectorRef } from '@angular/core';
+import { Component, Input, OnInit, OnChanges, SimpleChanges, ChangeDetectorRef, ChangeDetectionStrategy } from '@angular/core';
 import { FormGroup, FormBuilder, FormControl } from '@angular/forms';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 
 @Component({
-  selector: 'rdio-scanner-admin-user-registration',
-  templateUrl: './user-registration.component.html',
-  styleUrls: ['./user-registration.component.scss']
+    selector: 'rdio-scanner-admin-user-registration',
+    templateUrl: './user-registration.component.html',
+    styleUrls: ['./user-registration.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminUserRegistrationComponent implements OnInit, OnChanges {
   @Input() form!: FormGroup;
@@ -528,6 +530,9 @@ export class RdioScannerAdminUserRegistrationComponent implements OnInit, OnChan
   }
 
   removeLogo(): void {
+    if (!confirm('Are you sure you want to delete the email logo?')) {
+      return;
+    }
     // Get auth token from session storage (admin service sends token without "Bearer" prefix)
     const token = sessionStorage.getItem('rdio-scanner-admin-token');
     if (!token) {

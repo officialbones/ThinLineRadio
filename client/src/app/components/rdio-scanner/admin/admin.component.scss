@@ -17,12 +17,17 @@
  * ****************************************************************************
  */
 rdio-scanner-admin {
-    display: block;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
 
     /* ── Master Search Bar ───────────────────── */
     .admin-search-wrap {
         position: relative;
-        margin-bottom: 16px;
+        padding: 8px 12px;
+        background: #141414;
+        border-bottom: 1px solid #2a2a2a;
 
         .admin-search-input-wrap {
             display: flex;
@@ -49,7 +54,7 @@ rdio-scanner-admin {
 
             .admin-search-input {
                 flex: 1;
-                height: 40px;
+                height: 34px;
                 background: transparent;
                 border: none;
                 outline: none;
@@ -77,9 +82,9 @@ rdio-scanner-admin {
 
         .admin-search-results {
             position: absolute;
-            top: calc(100% + 4px);
-            left: 0;
-            right: 0;
+            top: calc(100% - 4px);
+            left: 12px;
+            right: 12px;
             z-index: 9999;
             background: #1e1e1e;
             border: 1px solid #333;
@@ -167,92 +172,13 @@ rdio-scanner-admin {
         }
     }
 
-    /* ── Tab group ───────────────────────────── */
-    .admin-tab-group {
-        background: #1e1e1e;
-        border-radius: 10px;
-        overflow: hidden;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-
-        /* Tab header bar */
-        ::ng-deep .mat-mdc-tab-header {
-            background: #161616;
-            border-bottom: 2px solid #2a2a2a;
-        }
-
-        /* Individual tab labels */
-        ::ng-deep .mat-mdc-tab {
-            min-width: 120px;
-            opacity: 0.65;
-            transition: opacity 0.2s;
-
-            &.mdc-tab--active {
-                opacity: 1;
-            }
-        }
-
-        /* Active tab indicator */
-        ::ng-deep .mdc-tab-indicator__content--underline {
-            border-color: #cc0000 !important;
-            border-top-width: 3px !important;
-        }
-
-        /* Tab label text & icon */
-        ::ng-deep .mat-mdc-tab .mdc-tab__text-label {
-            color: #ccc;
-            display: flex;
-            align-items: center;
-            gap: 7px;
-            font-size: 14px;
-            font-weight: 500;
-        }
-
-        ::ng-deep .mat-mdc-tab.mdc-tab--active .mdc-tab__text-label {
-            color: #fff;
-        }
-
-        .tab-icon {
-            font-size: 18px;
-            width: 18px;
-            height: 18px;
-        }
-
-        /* Tab body */
-        ::ng-deep .mat-mdc-tab-body-content {
-            overflow: visible;
-        }
-
-        .tab-content {
-            padding: 24px;
-            min-height: 200px;
-        }
+    /* ── Main shell (replaces top tabs) ───────── */
+    .admin-shell {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background: #1a1a1a;
+        min-height: 120px;
     }
 
-}
-
-/* ── Responsive ──────────────────────────────── */
-@media (max-width: 719px) {
-    rdio-scanner-admin {
-        .admin-tab-group {
-            border-radius: 6px;
-
-            ::ng-deep .mat-mdc-tab {
-                min-width: 80px;
-            }
-
-            .tab-label {
-                display: none;
-            }
-
-            .tab-icon {
-                font-size: 22px;
-                width: 22px;
-                height: 22px;
-            }
-
-            .tab-content {
-                padding: 12px;
-            }
-        }
-    }
 }

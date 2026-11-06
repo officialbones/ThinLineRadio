@@ -17,6 +17,7 @@ server/models/*.bin
 
 # Config files (use templates instead)
 /config-sync/
+server/.geocodify-api-key
 rdio-scanner.json
 rdio-scanner(2).json
 server/ThinlineRadio/
@@ -52,6 +53,30 @@ run-server.sh
 
 # Docker
 .env
+
+# Local ops / migrate / one-off scripts (never commit secrets from these trees)
+/scripts/
+.nextcloud-migrate-staging/
+.nextcloud-vps-migrate-staging/
+.mail-migrate-staging/
+
+# Local SSH keys + host connection notes (never commit)
+ops-private/
+
+# Local server ops helpers and ad-hoc tools (keep icad_tone_bridge.py tracked)
+server/scripts/*.sh
+server/scripts/launchd/
+server/cmd/streetscan_prototype/
+server/*_main.go
+server/setup_*_main.go
+server/mapping/tmp_*.go
+
+# Built webapp / local binaries (produced by build-all; not source)
+server/webapp/
+/thinline-radio-*
+/thinline-radio
+
+TLR-Tones2Active911-main/
 docker/data/
 docker/logs/
 docker/config/*.pem
@@ -64,6 +89,8 @@ docker/config/*.ini
 
 # Separate repositories (Git managed independently)
 relay-server/
+nominatim-gateway/
+transcript-collector/
 ThinlineRadio-Mobile/
 ThinlineRadio-Website/
 ThinlineRadio-Web/
@@ -73,7 +100,8 @@ ThinlineRadio-Website/dist/
 ThinlineRadio-Website/*.zip
 ThinlineResponder/
 whisper/
-central-management/
+# Separate CM / AlertPage repo only (not client admin/central-management/)
+/central-management/
 TonesToActive/
 tlr-time-sync/
 
@@ -81,3 +109,6 @@ tlr-time-sync/
 
 ThinLineRadioV7-config.json
 node_modules
+
+# TLR DB migrate secrets
+scripts/tlr-db-migrate/migrate.env

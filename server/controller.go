@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,19 +69,25 @@ type Controller struct {
 	HydraTranscriptionRetrievalQueue *HydraTranscriptionRetrievalQueue
 	KeywordMatcher                   *KeywordMatcher
 	AlertEngine                      *AlertEngine
+	IncidentMappingQueue             *IncidentMappingQueue
 	HallucinationDetector            *HallucinationDetector
 	CentralManagement                *CentralManagementService
 	Health                           *HealthService
+	PublicApi                        *PublicApiService
 	// Performance caches
 	PreferencesCache  *PreferencesCache
 	KeywordListsCache *KeywordListsCache
+	CallNaturesCache  *CallNaturesCache
 	IdLookupsCache    *IdLookupsCache
 	RecentAlertsCache *RecentAlertsCache
 	DedupCache        *DedupCache
+	PagerAlertDedup   *PagerAlertDedup
 	Register          chan *Client
 	Unregister        chan *Client
 	Ingest            chan *Call
 	running           bool
+	startupReady      atomic.Bool
+	startupReadyAt    atomic.Int64       // unix nanos when config finished loading
 	workerCancel      context.CancelFunc // Function to cancel worker context
 	workersWg         sync.WaitGroup     // WaitGroup to track worker goroutines
 	workerStats       struct {
@@ -115,9 +122,29 @@ type Controller struct {
 	noAudioMonitorStops   map[uint64]chan struct{}
 	noAudioMonitorStopsMu sync.Mutex
 
+	// Stop channels and monitor start times for per-API-key no-audio monitoring
+	apikeyNoAudioMonitorStops   map[uint64]chan struct{}
+	apikeyNoAudioMonitorStarted map[uint64]int64
+	apikeyNoAudioMonitorStopsMu sync.Mutex
+
+	sdrtrunkHealth     map[uint64]*SdrtrunkHealthRecord
+	sdrtrunkHealthMu   sync.Mutex
+	sdrtrunkHealthStop chan struct{}
+	sdrtrunkSessions   *sdrtrunkHub
+	sdrtrunkHubOnce    sync.Once
+	coreCoord          *coreCoordinator
+	coreOnce           sync.Once
+
 	// Rate limiting
 	RateLimiter         *RateLimiter
 	LoginAttemptTracker *LoginAttemptTracker
+	// TileRateLimiter is a separate, much higher-ceiling limiter for the map
+	// tile proxy. A single page load/pan/zoom or a radar animation cycle can
+	// legitimately fire hundreds of tile requests in a few seconds — far more
+	// than any other endpoint — and the tile handler already protects the
+	// upstream providers with on-disk caching + singleflight de-duplication,
+	// so it doesn't need (and shouldn't share) the general anti-abuse budget.
+	TileRateLimiter *RateLimiter
 
 	// Auto-updater
 	Updater *Updater
@@ -141,6 +168,24 @@ type Controller struct {
 	RelaySuspensionMu   sync.RWMutex
 	RelayFullySuspended bool
 	RelaySuspendMessage string
+
+	// Relay account sign-in (see relay_account.go). Username + refresh token
+	// are persisted (Options); the short-lived access token and everything
+	// below is in-memory only — reacquired from the refresh token on restart.
+	RelayAccountMu              sync.RWMutex
+	RelayAccountAccessToken     string
+	RelayAccountAccessExpiresAt time.Time
+	RelayAccountLastError       string
+
+	// Nominatim geocoding add-on subscription state, mirrored from the
+	// relay's /api/geocode/status poll (see relay_account.go pollNominatimStatusOnce).
+	NominatimMu                 sync.RWMutex
+	NominatimSubscriptionStatus string
+	NominatimCurrentPeriodEnd   time.Time
+	// NominatimGatewayURL is the nominatim-gateway's public URL (e.g.
+	// https://geocode.thinlineradio.com), also learned from that same poll —
+	// this TLR server calls it DIRECTLY for geocoding, no relay proxying.
+	NominatimGatewayURL string
 }
 
 // WaitingShortCall represents a short voice call that is waiting for a longer one to arrive
@@ -196,6 +241,7 @@ func NewController(config *Config) *Controller {
 	controller.EmailService = NewEmailService(controller)
 	controller.CentralManagement = NewCentralManagementService(controller)
 	controller.Health = NewHealthService(controller)
+	controller.PublicApi = NewPublicApiService(controller)
 	controller.Delayer = NewDelayer(controller)
 	controller.Downstreams = NewDownstreams(controller)
 	controller.Scheduler = NewScheduler(controller)
@@ -203,12 +249,15 @@ func NewController(config *Config) *Controller {
 	// Initialize performance caches
 	controller.PreferencesCache = NewPreferencesCache(controller)
 	controller.KeywordListsCache = NewKeywordListsCache(controller)
+	controller.CallNaturesCache = NewCallNaturesCache(controller)
 	controller.IdLookupsCache = NewIdLookupsCache(controller)
 	controller.RecentAlertsCache = NewRecentAlertsCache(controller)
-	controller.DedupCache = NewDedupCache(defaults.options.duplicateDetectionTimeFrame)
+	controller.DedupCache = NewDedupCache(defaults.options.duplicateDetectionTimeFrame, defaults.options.duplicateTimestampWindow)
+	controller.PagerAlertDedup = NewPagerAlertDedup()
 
 	controller.Logs.setDaemon(config.daemon)
 	controller.Logs.setDatabase(controller.Database)
+	controller.Logs.InstallLogCapture()
 
 	// Initialize debug logger for tones/keywords if enabled in config
 	if config.EnableDebugLog {
@@ -234,11 +283,17 @@ func NewController(config *Config) *Controller {
 	controller.ToneDetector = NewToneDetector()
 	controller.KeywordMatcher = NewKeywordMatcher()
 	controller.AlertEngine = NewAlertEngine(controller)
+	controller.IncidentMappingQueue = NewIncidentMappingQueue(controller)
 	controller.HallucinationDetector = NewHallucinationDetector(controller)
 
 	// Initialize rate limiting
 	// General rate limiter: 1000 requests per minute per IP
 	controller.RateLimiter = NewRateLimiter(1000, 1*time.Minute)
+	// Tile rate limiter: much higher ceiling — map tiles are bulky by nature
+	// (a single viewport render or radar animation cycle needs hundreds of
+	// them) and are already disk-cached + singleflight-deduped, so they get
+	// their own budget instead of competing with API calls for the general one.
+	controller.TileRateLimiter = NewRateLimiter(12000, 1*time.Minute)
 	// Login attempt tracker: 6 failed attempts = 15 minute block
 	controller.LoginAttemptTracker = NewLoginAttemptTracker(6, 15*time.Minute)
 
@@ -279,30 +334,49 @@ func (controller *Controller) EmitCall(call *Call) {
 	go controller.Clients.EmitCall(controller, call)
 }
 
+// prepareCallEmit applies patch present-as-one-TG and universal cross-talkgroup
+// emit dedupe for this client. Returns nil when the client should not hear it.
+func (controller *Controller) prepareCallEmit(call *Call, client *Client) *Call {
+	if controller == nil || call == nil || client == nil {
+		return nil
+	}
+	presented := controller.presentCallForClient(call, client.Livefeed, client.User)
+	if presented == nil {
+		return nil
+	}
+	if client.EmitDedupe.ShouldSkip(presented) {
+		return nil
+	}
+	return presented
+}
+
 // EmitCallToClient sends a call to a specific client with their individual delay settings
 func (controller *Controller) EmitCallToClient(call *Call, client *Client) {
-	msg := &Message{Command: MessageCommandCall, Payload: call}
+	if client == nil {
+		return
+	}
+	presented := controller.prepareCallEmit(call, client)
+	if presented == nil {
+		return
+	}
 
 	// Prevent infinite recursion - don't check delay for already delayed calls
-	if call.Delayed {
-		// Non-blocking send
+	if call.Delayed || presented.Delayed {
+		msg := &Message{Command: MessageCommandCall, Payload: presented}
 		select {
 		case client.Send <- msg:
 		default:
-			// Skip if channel full
 		}
 		return
 	}
 
-	// Check if this specific client should delay this call
-	if controller.Delayer.CanDelayForClient(call, client) {
-		controller.Delayer.DelayForClient(call, client)
+	if controller.Delayer.CanDelayForClient(presented, client) {
+		controller.Delayer.DelayForClient(presented, client)
 	} else {
-		// Non-blocking send
+		msg := &Message{Command: MessageCommandCall, Payload: presented}
 		select {
 		case client.Send <- msg:
 		default:
-			// Skip if channel full
 		}
 	}
 }
@@ -312,17 +386,101 @@ func (controller *Controller) EmitConfig() {
 	go controller.Admin.BroadcastConfig()
 }
 
+// resolveGroupIdForLabel returns the database groupId for a label, refreshing from the DB
+// when the in-memory id is stale (e.g. after duplicate-label cleanup or config import).
+func (controller *Controller) resolveGroupIdForLabel(groupLabel string) (uint64, error) {
+	groupLabel = strings.TrimSpace(groupLabel)
+	if groupLabel == "" {
+		groupLabel = "Unknown"
+	}
+
+	if group, ok := controller.Groups.GetGroupByLabel(groupLabel); ok && group.Id > 0 {
+		var dbLabel string
+		query := fmt.Sprintf(`SELECT "label" FROM "groups" WHERE "groupId" = %d`, group.Id)
+		if err := controller.Database.Sql.QueryRow(query).Scan(&dbLabel); err == nil && dbLabel == group.Label {
+			return group.Id, nil
+		}
+	}
+
+	if err := controller.Groups.Read(controller.Database); err != nil {
+		return 0, err
+	}
+	if group, ok := controller.Groups.GetGroupByLabel(groupLabel); ok && group.Id > 0 {
+		return group.Id, nil
+	}
+
+	group := &Group{Label: groupLabel}
+	controller.Groups.List = append(controller.Groups.List, group)
+	if err := controller.Groups.Write(controller.Database); err != nil {
+		return 0, err
+	}
+	if err := controller.Groups.Read(controller.Database); err != nil {
+		return 0, err
+	}
+	if group, ok := controller.Groups.GetGroupByLabel(groupLabel); ok {
+		controller.SyncConfigToFile()
+		return group.Id, nil
+	}
+	return 0, fmt.Errorf("unable to resolve group %s", groupLabel)
+}
+
+// resolveTagIdForLabel returns the database tagId for a label, refreshing from the DB
+// when the in-memory id is stale.
+func (controller *Controller) resolveTagIdForLabel(tagLabel string) (uint64, error) {
+	tagLabel = strings.TrimSpace(tagLabel)
+	if tagLabel == "" {
+		tagLabel = "Untagged"
+	}
+
+	if tag, ok := controller.Tags.GetTagByLabel(tagLabel); ok && tag.Id > 0 {
+		var dbLabel string
+		query := fmt.Sprintf(`SELECT "label" FROM "tags" WHERE "tagId" = %d`, tag.Id)
+		if err := controller.Database.Sql.QueryRow(query).Scan(&dbLabel); err == nil && dbLabel == tag.Label {
+			return tag.Id, nil
+		}
+	}
+
+	if err := controller.Tags.Read(controller.Database); err != nil {
+		return 0, err
+	}
+	if tag, ok := controller.Tags.GetTagByLabel(tagLabel); ok && tag.Id > 0 {
+		return tag.Id, nil
+	}
+
+	tag := &Tag{Label: tagLabel}
+	controller.Tags.List = append(controller.Tags.List, tag)
+	if err := controller.Tags.Write(controller.Database); err != nil {
+		return 0, err
+	}
+	if err := controller.Tags.Read(controller.Database); err != nil {
+		return 0, err
+	}
+	if tag, ok := controller.Tags.GetTagByLabel(tagLabel); ok {
+		controller.SyncConfigToFile()
+		return tag.Id, nil
+	}
+	return 0, fmt.Errorf("unable to resolve tag %s", tagLabel)
+}
+
 func (controller *Controller) IngestCall(call *Call) {
+	if call != nil && call.CoreRecordingId != "" {
+		defer func() {
+			if call.CoreAccepted {
+				controller.core().stored(call)
+			} else {
+				controller.core().rejected(call)
+			}
+		}()
+	}
+
 	var (
 		err         error
-		group       *Group
 		groupId     uint64
 		groupLabel  string
 		ok          bool
 		populated   bool
 		system      *System
 		systemId    uint
-		tag         *Tag
 		tagId       uint64
 		tagLabel    string
 		talkgroup   *Talkgroup
@@ -330,6 +488,7 @@ func (controller *Controller) IngestCall(call *Call) {
 	)
 
 	logCall := func(call *Call, level string, message string) {
+		call.CoreRejectReason = message
 		var systemRef interface{} = "nil"
 		var talkgroupIdForLog uint = 0
 		if system != nil {
@@ -348,6 +507,7 @@ func (controller *Controller) IngestCall(call *Call) {
 	}
 
 	logError := func(err error) {
+		call.CoreRejectReason = err.Error()
 		controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("controller.ingestcall: %v", err.Error()))
 	}
 
@@ -431,6 +591,11 @@ func (controller *Controller) IngestCall(call *Call) {
 		}
 	}
 
+	if system != nil && talkgroup != nil && talkgroup.Hidden {
+		logCall(call, LogLevelInfo, "hidden channel")
+		return
+	}
+
 	if controller.Options.AutoPopulate && system == nil && systemId > 0 {
 		populated = true
 
@@ -448,11 +613,22 @@ func (controller *Controller) IngestCall(call *Call) {
 			system.Label = fmt.Sprintf("System %v", systemId)
 		}
 
+		maxOrder := uint(0)
+		for _, existing := range controller.Systems.List {
+			if existing != nil && existing.Order > maxOrder {
+				maxOrder = existing.Order
+			}
+		}
+		system.Order = maxOrder + 1
+
 		controller.Systems.List = append(controller.Systems.List, system)
 	}
 
-	if controller.Options.AutoPopulate || (system != nil && system.AutoPopulate) {
-		if system != nil && talkgroup == nil && talkgroupId > 0 {
+	// Per-system AutoPopulate is authoritative for talkgroups. Global AutoPopulate
+	// only creates unknown systems (above); it must not keep adding TGs after the
+	// system switch is turned off.
+	if system != nil && system.AutoPopulate {
+		if talkgroup == nil && talkgroupId > 0 {
 			populated = true
 
 			groupLabels := []string{"Unknown"}
@@ -466,57 +642,19 @@ func (controller *Controller) IngestCall(call *Call) {
 				tagLabel = call.Meta.TalkgroupTag
 			}
 
-			if group, ok = controller.Groups.GetGroupByLabel(groupLabel); !ok {
-				group = &Group{Label: groupLabel}
-
-				controller.Groups.List = append(controller.Groups.List, group)
-
-				if err = controller.Groups.Write(controller.Database); err != nil {
-					logError(err)
-					return
-				}
-
-				if err = controller.Groups.Read(controller.Database); err != nil {
-					logError(err)
-					return
-				}
-
-				// Sync config to file if enabled
-				controller.SyncConfigToFile()
-
-				if group, ok = controller.Groups.GetGroupByLabel(groupLabel); !ok {
-					logError(fmt.Errorf("unable to get group %s", groupLabel))
-					return
-				}
+			if resolvedGroupId, resolveErr := controller.resolveGroupIdForLabel(groupLabel); resolveErr != nil {
+				logError(resolveErr)
+				return
+			} else {
+				groupId = resolvedGroupId
 			}
 
-			groupId = group.Id
-
-			if tag, ok = controller.Tags.GetTagByLabel(tagLabel); !ok {
-				tag = &Tag{Label: tagLabel}
-
-				controller.Tags.List = append(controller.Tags.List, tag)
-
-				if err = controller.Tags.Write(controller.Database); err != nil {
-					logError(err)
-					return
-				}
-
-				if err = controller.Tags.Read(controller.Database); err != nil {
-					logError(err)
-					return
-				}
-
-				// Sync config to file if enabled
-				controller.SyncConfigToFile()
-
-				if tag, ok = controller.Tags.GetTagByLabel(tagLabel); !ok {
-					logError(fmt.Errorf("unable to get tag %s", tagLabel))
-					return
-				}
+			if resolvedTagId, resolveErr := controller.resolveTagIdForLabel(tagLabel); resolveErr != nil {
+				logError(resolveErr)
+				return
+			} else {
+				tagId = resolvedTagId
 			}
-
-			tagId = tag.Id
 
 			// Find the max Order value among existing talkgroups to assign new talkgroup at the end
 			maxOrder := uint(0)
@@ -584,6 +722,11 @@ func (controller *Controller) IngestCall(call *Call) {
 		if ok := system.Units.Merge(units); ok {
 			populated = true
 		}
+	}
+
+	// Unit alias auto-learn: record radio unitRef observations (transcript filled in later).
+	if unitLearnEnabled(call) && callHasUnitRefs(call) {
+		go controller.processUnitAutoLearn(call, "")
 	}
 
 	if populated {
@@ -742,16 +885,24 @@ func (controller *Controller) IngestCall(call *Call) {
 		}
 	}
 
-	if !controller.Options.DisableDuplicateDetection {
-		// ── Arrival-time duplicate detection ─────────────────────────────────
-		// Two passes using server receivedAt only — no P25 timestamp, no hash.
-		// Catches multi-recorder uploads of the same transmission that arrive
-		// at the server within 1 second of each other.
+	if !controller.Options.DisableDuplicateDetection && (system == nil || system.DuplicateDetectionEnabled) {
+		// ── Duplicate detection ──────────────────────────────────────────────
+		// Pass 1–2: server receivedAt (cache + DB). Pass 3: radio/P25 timestamp.
+		// Soft RID on all passes: known different radio IDs are kept. Feeder /
+		// API key are never part of ingest matching.
+
+		windowMs := controller.Options.DuplicateTimestampWindow
+		source := callPrimarySource(call)
+
+		// Core has already chosen one copy per transmission, and a site that
+		// reconnects uploads its backlog back to back, so arrival time says
+		// nothing about a Core upload. Only the radio timestamp pass applies.
+		arrivalChecks := call.CoreRecordingId == ""
 
 		// Pass 1: in-memory cache — catches simultaneous arrivals before either
 		// has been written to the database (closes the race window).
-		if !call.IsDuplicate && controller.DedupCache != nil {
-			if controller.DedupCache.CheckAndMarkReceivedAt(call.System.Id, call.Talkgroup.Id) {
+		if arrivalChecks && !call.IsDuplicate && controller.DedupCache != nil && call.System != nil && call.Talkgroup != nil {
+			if controller.DedupCache.CheckAndMarkReceivedAt(call.System.Id, call.Talkgroup.Id, source) {
 				logCall(call, LogLevelWarn, "duplicate (receivedAt cache)")
 				call.IsDuplicate = true
 			}
@@ -759,13 +910,45 @@ func (controller *Controller) IngestCall(call *Call) {
 
 		// Pass 2: database — catches near-simultaneous arrivals where the first
 		// call was already committed before the second arrived.
-		if !call.IsDuplicate {
-			isDupRA, raErr := controller.Calls.CheckDuplicateByReceivedAt(call, controller.Database)
+		if arrivalChecks && !call.IsDuplicate {
+			isDupRA, raErr := controller.Calls.CheckDuplicateByReceivedAt(call, controller.Database, windowMs)
 			if raErr != nil {
 				logError(raErr)
 			} else if isDupRA {
 				logCall(call, LogLevelWarn, "duplicate (receivedAt db)")
 				call.IsDuplicate = true
+			}
+		}
+
+		// Pass 3: radio timestamp — last check for delayed multi-site copies.
+		if !call.IsDuplicate {
+			radioWin := controller.Options.DuplicateRadioTimestampWindow
+			// A Core upload is one transmission, so a short call just before it is not its copy.
+			var spanMs int64
+			if call.CoreRecordingId != "" {
+				if seconds, err := controller.getCallDuration(call); err == nil && seconds > 0 {
+					spanMs = int64(seconds * 1000)
+				}
+			}
+			isDupTS, tsErr := controller.Calls.CheckDuplicateByTimestamp(call, controller.Database, radioWin, spanMs)
+			if tsErr != nil {
+				logError(tsErr)
+			} else if isDupTS {
+				logCall(call, LogLevelWarn, "duplicate (radio timestamp)")
+				call.IsDuplicate = true
+			}
+		}
+
+		// Pass 4: a held Core recording uploaded after its site lost the server.
+		if !call.IsDuplicate && call.CoreFallback {
+			if seconds, err := controller.getCallDuration(call); err == nil && seconds > 0 {
+				isCovered, covErr := controller.Calls.CheckCoveredByStoredCall(call, controller.Database, int64(seconds*1000))
+				if covErr != nil {
+					logError(covErr)
+				} else if isCovered {
+					logCall(call, LogLevelWarn, "duplicate (inside a stored call)")
+					call.IsDuplicate = true
+				}
 			}
 		}
 	}
@@ -786,6 +969,7 @@ func (controller *Controller) processCallAfterDuplicateCheck(call *Call) {
 	}
 
 	logError := func(err error) {
+		call.CoreRejectReason = err.Error()
 		logCall(call, "error", err.Error())
 	}
 
@@ -810,14 +994,6 @@ func (controller *Controller) processCallAfterDuplicateCheck(call *Call) {
 	copy(call.OriginalAudio, call.Audio)
 	call.OriginalAudioMime = call.AudioMime
 
-	// Stage 3.5: Optionally enhance transcription audio with denoising and compression.
-	if controller.Options.TranscriptionEnhancement {
-		if enhanced := controller.FFMpeg.ProcessForTranscription(call.OriginalAudio); len(enhanced) > 0 {
-			call.OriginalAudio = enhanced
-			call.OriginalAudioMime = "audio/wav"
-		}
-	}
-
 	// Stage 4: Encode audio to AAC/M4A for storage and streaming.
 	if convertErr := controller.FFMpeg.Convert(call, controller.Systems, controller.Tags, controller.Options.AudioConversion); convertErr != nil {
 		controller.Logs.LogEvent(LogLevelWarn, convertErr.Error())
@@ -825,6 +1001,7 @@ func (controller *Controller) processCallAfterDuplicateCheck(call *Call) {
 
 	if id, err := controller.Calls.WriteCall(call, controller.Database); err == nil {
 		call.Id = id
+		call.CoreAccepted = true
 		// After writing, query the database to get the talkgroup ID that was actually written
 		// This ensures we have the correct database ID for logging (like v6 did)
 		// First try to get from cache, fallback to database query if needed
@@ -854,20 +1031,34 @@ func (controller *Controller) processCallAfterDuplicateCheck(call *Call) {
 			}
 		}
 
-
 		// IMMEDIATE: Emit call to clients (users can play NOW - zero delay)
 		controller.EmitCall(call)
 
 		// Tone detection runs after WriteCall so call.Id is valid for DB updates, pending tones, and orphan alerts.
+		// Transcription waits on toneDone so MinCallDuration can see detected tones (bypass / remaining-after-tones).
+		var toneDone <-chan struct{}
 		if shouldDetectTones {
+			done := make(chan struct{})
+			toneDone = done
 			toneDetectionCall := *call
 			toneDetectionCall.Audio = rawAudio
 			toneDetectionCall.AudioMime = rawAudioMime
-			go controller.processToneDetectionAsync(&toneDetectionCall, call)
+			go func() {
+				defer close(done)
+				controller.processToneDetectionAsync(&toneDetectionCall, call)
+			}()
+		}
+
+		// Auto-learn tone sets from raw ingest audio (does not require configured tone sets).
+		if toneAutoLearnEnabled(call) {
+			learnCall := *call
+			learnCall.Audio = rawAudio
+			learnCall.AudioMime = rawAudioMime
+			go controller.processToneAutoLearnAsync(&learnCall, call, "")
 		}
 
 		// Queue transcription with tone-aware decision
-		go controller.queueTranscriptionIfNeeded(call)
+		go controller.queueTranscriptionIfNeeded(call, toneDone)
 
 		// Note: Pending tones are checked and attached AFTER transcription completes
 		// This ensures we only attach pending tones to calls that actually have voice (not tone-only)
@@ -1142,9 +1333,13 @@ func (controller *Controller) processToneDetection(call *Call) {
 		// This prevents a race condition where transcription checks for tones before the DB is updated
 		controller.updateCallToneSequence(call.Id, toneSequence)
 
-		// IMMEDIATE PRE-ALERT: Send notification as soon as tones are detected
-		// This allows users to tune in right away without waiting for transcription
-		// Pre-alerts are not saved to database - they're instant notifications only
+		if len(matchedToneSets) > 0 {
+			go controller.remapIncidentIfTranscriptReady(call.Id)
+		}
+
+		// IMMEDIATE PRE-ALERT: notify + persist as soon as tones are detected so the
+		// Alerts tab matches the phone push (issue #229). Voice/orphan paths reuse
+		// the same tone alert row via RecentAlertsCache.
 		if len(matchedToneSets) > 0 {
 			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("sending pre-alert notifications for call with %d matched tone sets", len(matchedToneSets)))
 			if call.System != nil && call.System.AlertsEnabled && call.Talkgroup != nil && call.Talkgroup.AlertsEnabled {
@@ -1172,6 +1367,32 @@ func (controller *Controller) processToneDetection(call *Call) {
 		}
 	} else {
 		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("tone detection completed for call %d: no tones detected", call.Id))
+	}
+}
+
+// DisconnectUserClients kicks all active WebSocket clients for a user and sends an error payload.
+func (controller *Controller) DisconnectUserClients(userId uint64, reason string) {
+	if controller == nil || controller.Clients == nil || userId == 0 {
+		return
+	}
+	if reason == "" {
+		reason = "Access revoked"
+	}
+	controller.Clients.mutex.Lock()
+	defer controller.Clients.mutex.Unlock()
+	for client := range controller.Clients.Map {
+		if client.User == nil || client.User.Id != userId {
+			continue
+		}
+		msg := &Message{Command: MessageCommandError, Payload: reason}
+		select {
+		case client.Send <- msg:
+		default:
+		}
+		select {
+		case controller.Unregister <- client:
+		default:
+		}
 	}
 }
 
@@ -1328,9 +1549,19 @@ func (controller *Controller) isToneOnlyCall(call *Call) bool {
 		return true
 	}
 
-	// If call has transcript already, it's not tone-only
-	if call.Transcript != "" {
-		return false
+	// A non-empty transcript is NOT enough to call this a voice clip. After tone removal the
+	// leftover silence/static is often transcribed as filler ("you", "Thank you.", "Bye.").
+	// Treating that as voice fires the tone alert on the junk transcript and leaves the real
+	// dispatch voice call (which follows) with no tones to attach. Require real dispatch voice.
+	if strings.TrimSpace(call.Transcript) != "" {
+		if controller.isVoiceForToneAlerts(call.Transcript) {
+			return false
+		}
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf(
+			"call %d: transcript %q after tone removal is not dispatch voice, treating as tone-only (pending for voice call)",
+			call.Id, strings.TrimSpace(call.Transcript),
+		))
+		return true
 	}
 
 	// If transcription is already completed with no transcript, it's tone-only
@@ -1665,8 +1896,14 @@ func (controller *Controller) mergePendingTones(existing *ToneSequence, new *Ton
 		for _, ts := range matchedToneSetMap {
 			merged.MatchedToneSets = append(merged.MatchedToneSets, ts)
 		}
-		// Set first one for backward compatibility
-		merged.MatchedToneSet = merged.MatchedToneSets[0]
+		// Voice attach uses the most recent tone-page match (closest preceding page).
+		if new.MatchedToneSet != nil {
+			merged.MatchedToneSet = new.MatchedToneSet
+		} else if existing.MatchedToneSet != nil {
+			merged.MatchedToneSet = existing.MatchedToneSet
+		} else if len(merged.MatchedToneSets) > 0 {
+			merged.MatchedToneSet = merged.MatchedToneSets[0]
+		}
 	}
 
 	return merged
@@ -1724,8 +1961,10 @@ func (controller *Controller) checkOrphanedTones(key string, callId uint64, time
 		}
 	}
 
-	// Set a special transcript to indicate no voice was available
-	if call.Transcript == "" {
+	// Set a special transcript to indicate no voice was available.
+	// Also replace filler left over from tone removal ("you", "Thank you.") - that is not
+	// dispatch voice and must not be forwarded downstream as the alert's transcript.
+	if strings.TrimSpace(call.Transcript) == "" || !controller.isVoiceForToneAlerts(call.Transcript) {
 		call.Transcript = "TONES DETECTED - NO VOICE CALL AVAILABLE"
 
 		// Update the call in the database with this transcript
@@ -1883,6 +2122,18 @@ func (controller *Controller) checkAndAttachPendingTones(call *Call) bool {
 	call.ToneSequence = pending.ToneSequence
 	call.HasTones = pending.ToneSequence != nil && len(pending.ToneSequence.Tones) > 0
 
+	// Cooldown is configured on the talkgroup where tones were detected.
+	if pending.CrossTalkgroupSourceKey != "" {
+		parts := strings.Split(pending.CrossTalkgroupSourceKey, ":")
+		if len(parts) == 2 {
+			if id, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
+				call.ToneSourceTalkgroupId = id
+			}
+		}
+	} else {
+		call.ToneSourceTalkgroupId = pending.TalkgroupId
+	}
+
 	// Use the matched tone sets that were already accumulated during merging
 	// Do NOT re-match here (neither A-B pairs nor long tones), as merging tones from multiple calls can cause false matches
 	// where A-tones from one call incorrectly pair with B-tones from another call
@@ -1907,8 +2158,8 @@ func (controller *Controller) checkAndAttachPendingTones(call *Call) bool {
 		}
 	}
 
-	// Update call in database with attached tones
-	go controller.updateCallToneSequence(call.Id, pending.ToneSequence)
+	// Persist attached tones before incident mapping reloads the call from the DB.
+	controller.updateCallToneSequence(call.Id, pending.ToneSequence)
 
 	// Clear pending tones (only attach to FIRST voice call)
 	controller.pendingTonesMutex.Lock()
@@ -2175,7 +2426,7 @@ func (controller *Controller) hasMeaningfulVoiceContent(transcript string) bool 
 	return len(words) >= minVoiceWordCount
 }
 
-// updateCallToneSequence updates tone sequence in database (async)
+// updateCallToneSequence persists tone sequence and hasTones on the call row.
 func (controller *Controller) updateCallToneSequence(callId uint64, toneSequence *ToneSequence) {
 	toneSequenceJson, err := SerializeToneSequence(toneSequence)
 	if err != nil {
@@ -2271,7 +2522,10 @@ func (controller *Controller) storeWaitingShortCall(call *Call, pending *Pending
 		}
 
 		// Update call in database with attached tones
-		go controller.updateCallToneSequence(shortCall.Id, waiting.PendingTones.ToneSequence)
+		controller.updateCallToneSequence(shortCall.Id, waiting.PendingTones.ToneSequence)
+		if strings.TrimSpace(shortCall.Transcript) != "" {
+			go controller.remapIncidentIfTranscriptReady(shortCall.Id)
+		}
 
 		// Clear pending tones
 		controller.pendingTonesMutex.Lock()
@@ -2380,14 +2634,148 @@ func (controller *Controller) resetStuckTranscriptions() {
 	}
 }
 
-// queueTranscriptionIfNeeded queues transcription if at least one user has alerts enabled for this talkgroup
-func (controller *Controller) queueTranscriptionIfNeeded(call *Call) {
-	// Admin-level gate: skip transcription entirely if alerts are disabled at system or talkgroup level
-	if call.System != nil && !call.System.AlertsEnabled {
+// markTranscriptionSkipped records that a call was deliberately never queued
+// for transcription (too short, no alert/tone/keyword/auto-learn reason,
+// alerts disabled, etc.) so it doesn't sit at the 'pending' default forever —
+// 'pending' should only mean "queued and waiting," not "will never run."
+func (controller *Controller) markTranscriptionSkipped(callId uint64, reason string) {
+	reason = escapeQuotes(reason)
+	if len(reason) > 500 {
+		reason = reason[:500]
+	}
+	query := fmt.Sprintf(`UPDATE "calls" SET "transcriptionStatus" = 'skipped', "transcriptionFailureReason" = '%s' WHERE "callId" = %d AND "transcriptionStatus" = 'pending'`, reason, callId)
+	if _, err := controller.Database.Sql.Exec(query); err != nil {
+		controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to mark call %d transcription skipped: %v", callId, err))
+	}
+}
+
+// markTranscriptionFailed records a real error that prevented queueing (e.g.
+// ffprobe failure) as 'failed' rather than leaving the call stuck at
+// 'pending' — 'failed' calls are already surfaced/retryable via the admin
+// transcription-failures tool, unlike deliberate 'skipped' calls.
+func (controller *Controller) markTranscriptionFailed(callId uint64, reason string) {
+	reason = escapeQuotes(reason)
+	if len(reason) > 500 {
+		reason = reason[:500]
+	}
+	query := fmt.Sprintf(`UPDATE "calls" SET "transcriptionStatus" = 'failed', "transcriptionFailureReason" = '%s' WHERE "callId" = %d AND "transcriptionStatus" = 'pending'`, reason, callId)
+	if _, err := controller.Database.Sql.Exec(query); err != nil {
+		controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to mark call %d transcription failed: %v", callId, err))
+	}
+}
+
+// callToneDurationSeconds is the span of audio occupied by detected tones
+// (latest tone end time). Falls back to summed durations when EndTime is unset.
+func callToneDurationSeconds(call *Call) float64 {
+	if call == nil || !call.HasTones || call.ToneSequence == nil {
+		return 0
+	}
+	var end float64
+	var sum float64
+	for _, tone := range call.ToneSequence.Tones {
+		sum += tone.Duration
+		if tone.EndTime > end {
+			end = tone.EndTime
+		}
+	}
+	if end > 0 {
+		return end
+	}
+	return sum
+}
+
+// effectiveTranscriptionAudioSeconds is the audio length that should be compared
+// against MinCallDuration — full clip, or remaining after known tones.
+func effectiveTranscriptionAudioSeconds(audioDuration float64, call *Call) float64 {
+	toneDuration := callToneDurationSeconds(call)
+	if toneDuration <= 0 {
+		return audioDuration
+	}
+	remaining := audioDuration - toneDuration
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// bypassMinCallDurationForCall reports whether MinCallDuration should be skipped.
+// Talkgroup-level AlertingTalkgroup and ToneDetectionEnabled both bypass (same
+// idea as "always STT this channel"). User alert preferences alone do not.
+// Tone-only clips are still skipped via remaining-after-tones / tone removal.
+func bypassMinCallDurationForCall(call *Call) bool {
+	if call == nil || call.Talkgroup == nil {
+		return false
+	}
+	return call.Talkgroup.AlertingTalkgroup || call.Talkgroup.ToneDetectionEnabled
+}
+
+// transcriptionDurationDecision evaluates MinCallDuration / tone-only floors.
+// When skip is true, reason is a short machine-readable skip reason.
+func (controller *Controller) transcriptionDurationDecision(call *Call, minDuration float64) (skip bool, reason string, audioDuration float64, err error) {
+	audioDuration, err = controller.getCallDuration(call)
+	if err != nil {
+		return true, fmt.Sprintf("ffprobe_error: %v", err), 0, err
+	}
+	effective := effectiveTranscriptionAudioSeconds(audioDuration, call)
+	const minRemainingAfterTones = 2.0
+
+	// Tone-heavy clips with almost no speech left — never worth STT.
+	if callToneDurationSeconds(call) > 0 && effective < minRemainingAfterTones {
+		return true, fmt.Sprintf("tone_only_remaining (%.1fs < %.1fs)", effective, minRemainingAfterTones), audioDuration, nil
+	}
+	// Alerting / tone-detection talkgroups bypass the admin min-duration floor.
+	// Plain talkgroups still honor minDuration.
+	if bypassMinCallDurationForCall(call) {
+		return false, "", audioDuration, nil
+	}
+	if minDuration > 0 && effective < minDuration {
+		return true, fmt.Sprintf("duration_below_minimum (%.1fs < %.1fs)", effective, minDuration), audioDuration, nil
+	}
+	return false, "", audioDuration, nil
+}
+
+const toneDetectionWaitTimeout = 4 * time.Second
+
+// waitForToneDetectionBeforeTranscription blocks until tone detection finishes
+// (or times out) so duration decisions see HasTones / remaining-after-tones.
+func (controller *Controller) waitForToneDetectionBeforeTranscription(call *Call, toneDone <-chan struct{}) {
+	if toneDone == nil {
 		return
 	}
-	if call.Talkgroup != nil && !call.Talkgroup.AlertsEnabled {
+	select {
+	case <-toneDone:
+	case <-time.After(toneDetectionWaitTimeout):
+		id := uint64(0)
+		if call != nil {
+			id = call.Id
+		}
+		controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf(
+			"tone detection wait timed out after %s for call %d — applying duration gate without tones",
+			toneDetectionWaitTimeout, id))
+	}
+}
+
+// queueTranscriptionIfNeeded queues transcription when TranscribeAllCalls is on, or when
+// at least one alert / auto-learn reason applies for this talkgroup.
+// toneDone is closed when async tone detection finishes; pass nil when tones are not being detected.
+func (controller *Controller) queueTranscriptionIfNeeded(call *Call, toneDone <-chan struct{}) {
+	if call.Talkgroup != nil && call.Talkgroup.TranscriptionExclude {
+		controller.markTranscriptionSkipped(call.Id, "transcription_excluded")
 		return
+	}
+
+	transcribeAll := controller.Options.TranscriptionConfig.TranscribeAllCalls
+
+	// Admin-level gate (skipped when TranscribeAllCalls — use talkgroup TranscriptionExclude to opt out)
+	if !transcribeAll {
+		if call.System != nil && !call.System.AlertsEnabled {
+			controller.markTranscriptionSkipped(call.Id, "system_alerts_disabled")
+			return
+		}
+		if call.Talkgroup != nil && !call.Talkgroup.AlertsEnabled {
+			controller.markTranscriptionSkipped(call.Id, "talkgroup_alerts_disabled")
+			return
+		}
 	}
 
 	// Check if Hydra transcription is enabled and call has transmission_id
@@ -2397,41 +2785,58 @@ func (controller *Controller) queueTranscriptionIfNeeded(call *Call) {
 	controller.Options.mutex.Unlock()
 
 	if hydraEnabled && hydraAPIKey != "" && call.TransmissionId != "" {
-		// Queue for Hydra retrieval instead of local transcription
-		// Verify transmission_id from database to ensure it matches what was stored
-		var dbTransmissionId string
-		verifyQuery := `SELECT "transmissionId" FROM "calls" WHERE "callId" = $1`
-		if controller.Database.Config.DbType != DbTypePostgresql {
-			verifyQuery = `SELECT "transmissionId" FROM "calls" WHERE "callId" = ?`
-		}
-		err := controller.Database.Sql.QueryRow(verifyQuery, call.Id).Scan(&dbTransmissionId)
-		if err != nil {
-			controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to verify transmission_id for call %d: %v, using in-memory value", call.Id, err))
-			dbTransmissionId = call.TransmissionId // Fallback to in-memory value
-		}
+		// Same duration gate as local STT — Hydra previously skipped MinCallDuration.
+		minDuration := controller.Options.TranscriptionConfig.MinCallDuration
+		go func() {
+			controller.waitForToneDetectionBeforeTranscription(call, toneDone)
+			skip, reason, audioDuration, err := controller.transcriptionDurationDecision(call, minDuration)
+			if err != nil {
+				controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("ffprobe failed for call %d (will skip Hydra transcription): %v", call.Id, err))
+				controller.markTranscriptionFailed(call.Id, reason)
+				return
+			}
+			if skip {
+				if strings.HasPrefix(reason, "tone_only_remaining") {
+					controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping Hydra transcription for call %d: %s (total %.1fs)", call.Id, reason, audioDuration))
+					updateQuery := fmt.Sprintf(`UPDATE "calls" SET "transcriptionStatus" = 'completed' WHERE "callId" = %d`, call.Id)
+					controller.Database.Sql.Exec(updateQuery)
+					return
+				}
+				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping Hydra transcription for call %d: %s (total %.1fs)", call.Id, reason, audioDuration))
+				controller.markTranscriptionSkipped(call.Id, reason)
+				return
+			}
 
-		// Use database value if available, otherwise fall back to in-memory value
-		transmissionIdToUse := dbTransmissionId
-		if transmissionIdToUse == "" {
-			transmissionIdToUse = call.TransmissionId
-		}
-
-		if transmissionIdToUse == "" {
-			controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("skipping Hydra transcription for call %d: no transmission_id found", call.Id))
-			return
-		}
-
-		if controller.HydraTranscriptionRetrievalQueue == nil {
-			log.Printf("queueTranscriptionIfNeeded: initializing Hydra retrieval queue for call %d", call.Id)
-			controller.HydraTranscriptionRetrievalQueue = NewHydraTranscriptionRetrievalQueue(controller)
-		}
-		controller.HydraTranscriptionRetrievalQueue.QueueJob(HydraTranscriptionRetrievalJob{
-			CallId:         call.Id,
-			TransmissionId: transmissionIdToUse,
-			RequestId:      call.RequestId,
-			QueuedAt:       time.Now(),
-		})
-		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("queued call %d for Hydra transcription retrieval (transmission_id=%s)", call.Id, transmissionIdToUse))
+			var dbTransmissionId string
+			verifyQuery := `SELECT "transmissionId" FROM "calls" WHERE "callId" = $1`
+			if controller.Database.Config.DbType != DbTypePostgresql {
+				verifyQuery = `SELECT "transmissionId" FROM "calls" WHERE "callId" = ?`
+			}
+			if qerr := controller.Database.Sql.QueryRow(verifyQuery, call.Id).Scan(&dbTransmissionId); qerr != nil {
+				controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to verify transmission_id for call %d: %v, using in-memory value", call.Id, qerr))
+				dbTransmissionId = call.TransmissionId
+			}
+			transmissionIdToUse := dbTransmissionId
+			if transmissionIdToUse == "" {
+				transmissionIdToUse = call.TransmissionId
+			}
+			if transmissionIdToUse == "" {
+				controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("skipping Hydra transcription for call %d: no transmission_id found", call.Id))
+				controller.markTranscriptionFailed(call.Id, "hydra_missing_transmission_id")
+				return
+			}
+			if controller.HydraTranscriptionRetrievalQueue == nil {
+				log.Printf("queueTranscriptionIfNeeded: initializing Hydra retrieval queue for call %d", call.Id)
+				controller.HydraTranscriptionRetrievalQueue = NewHydraTranscriptionRetrievalQueue(controller)
+			}
+			controller.HydraTranscriptionRetrievalQueue.QueueJob(HydraTranscriptionRetrievalJob{
+				CallId:         call.Id,
+				TransmissionId: transmissionIdToUse,
+				RequestId:      call.RequestId,
+				QueuedAt:       time.Now(),
+			})
+			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("queued call %d for Hydra transcription retrieval (transmission_id=%s)", call.Id, transmissionIdToUse))
+		}()
 		return // Skip normal transcription queue
 	}
 
@@ -2444,134 +2849,46 @@ func (controller *Controller) queueTranscriptionIfNeeded(call *Call) {
 		return
 	}
 
-	// Check if transcription is needed
-	needsTranscription := false
 	priority := 50
-	reasons := []string{}
-
-	// Check minimum call duration if configured
-	// EXCEPTION: Tone-enabled talkgroups bypass this check if they have > 2s after tone removal
-	// Do this check asynchronously to avoid blocking the worker
 	minDuration := controller.Options.TranscriptionConfig.MinCallDuration
-	toneDetectionEnabled := call.Talkgroup != nil && call.Talkgroup.ToneDetectionEnabled
 
-	if minDuration > 0 {
-		// Check duration in a separate goroutine to avoid blocking
-		go func() {
-			audioDuration, err := controller.getCallDuration(call)
-			if err != nil {
-				// ffprobe failed - log but don't block
-				controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("ffprobe failed for call %d (will skip transcription): %v", call.Id, err))
+	// Duration check (and tone-only floor) always runs async so ffprobe never
+	// blocks the ingest path. Wait for tone detection when in flight so
+	// remaining-after-tones can skip pure tone pages. AlertingTalkgroup and
+	// ToneDetectionEnabled bypass MinCallDuration; plain talkgroups honor it.
+	go func() {
+		controller.waitForToneDetectionBeforeTranscription(call, toneDone)
+		skip, reason, audioDuration, err := controller.transcriptionDurationDecision(call, minDuration)
+		if err != nil {
+			controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("ffprobe failed for call %d (will skip transcription): %v", call.Id, err))
+			controller.markTranscriptionFailed(call.Id, reason)
+			return
+		}
+		if skip {
+			if strings.HasPrefix(reason, "tone_only_remaining") {
+				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping transcription for call %d: %s (total %.1fs)", call.Id, reason, audioDuration))
+				// Mark completed so pending-tone attach does not wait forever.
+				updateQuery := fmt.Sprintf(`UPDATE "calls" SET "transcriptionStatus" = 'completed' WHERE "callId" = %d`, call.Id)
+				controller.Database.Sql.Exec(updateQuery)
 				return
 			}
-
-			// For tone-enabled talkgroups with detected tones, check remaining audio
-			if toneDetectionEnabled && call.HasTones && call.ToneSequence != nil && len(call.ToneSequence.Tones) > 0 {
-				// Calculate total tone duration
-				toneDuration := 0.0
-				for _, tone := range call.ToneSequence.Tones {
-					toneDuration += tone.Duration
-				}
-
-				// Calculate remaining audio duration after tones would be removed
-				remainingDuration := audioDuration - toneDuration
-				const minRemainingDuration = 2.0
-
-				if remainingDuration < minRemainingDuration {
-					// Tone-only call - don't queue for transcription (avoids locking pending tones)
-					controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping transcription for call %d on tone-enabled talkgroup: remaining audio after tone removal (%.1fs) is less than minimum (%.1fs) - tone-only", call.Id, remainingDuration, minRemainingDuration))
-					updateQuery := fmt.Sprintf(`UPDATE "calls" SET "transcriptionStatus" = 'completed' WHERE "callId" = %d`, call.Id)
-					controller.Database.Sql.Exec(updateQuery)
-					return
-				}
-
-				// Has > 2s remaining after tones - bypass global minimum and transcribe
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("call %d on tone-enabled talkgroup: bypassing global minimum (%.1fs < %.1fs), %.1fs remaining after %.1fs tones", call.Id, audioDuration, minDuration, remainingDuration, toneDuration))
-				// Continue to alert checks (bypassed global minimum)
-			} else if toneDetectionEnabled && audioDuration >= minDuration {
-				// Tone-enabled talkgroup without tones but meets global minimum - allow
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("call %d on tone-enabled talkgroup: meets global minimum (%.1fs >= %.1fs)", call.Id, audioDuration, minDuration))
-				// Continue to alert checks
-			} else if toneDetectionEnabled && audioDuration < minDuration {
-				// Tone-detection talkgroups always bypass the minimum duration — short calls may be
-				// the voice dispatch that follows a tone page on a separate call
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("call %d on tone-enabled talkgroup: bypassing global minimum (%.1fs < %.1fs)", call.Id, audioDuration, minDuration))
-				// Continue to alert checks
-			} else if audioDuration < minDuration {
-				// Normal check for non-tone-enabled talkgroups or calls without tones
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping transcription for call %d: duration %.1fs is less than minimum %.1fs", call.Id, audioDuration, minDuration))
-				return
-			}
-
-			// NEW: Check if audio is mostly tones (would result in very short remaining audio after tone removal)
-			// This applies to calls with tones but NOT on tone-enabled talkgroups (already handled above)
-			if !toneDetectionEnabled && call.HasTones && call.ToneSequence != nil && len(call.ToneSequence.Tones) > 0 {
-				// Calculate total tone duration
-				toneDuration := 0.0
-				for _, tone := range call.ToneSequence.Tones {
-					toneDuration += tone.Duration
-				}
-
-				// Calculate remaining audio duration after tones would be removed
-				remainingDuration := audioDuration - toneDuration
-				const minRemainingDuration = 2.0
-
-				if remainingDuration < minRemainingDuration {
-					controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping transcription for call %d: remaining audio after tone removal (%.1fs) is less than minimum (%.1fs) - likely tone-only", call.Id, remainingDuration, minRemainingDuration))
-					// Mark as completed so pending tones don't wait forever
-					updateQuery := fmt.Sprintf(`UPDATE "calls" SET "transcriptionStatus" = 'completed' WHERE "callId" = %d`, call.Id)
-					controller.Database.Sql.Exec(updateQuery)
-					return
-				}
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("call %d has sufficient remaining audio after tone removal (%.1fs of %.1fs total, %.1fs tones)", call.Id, remainingDuration, audioDuration, toneDuration))
-			}
-
-			// Duration check passed, now check if any user has alerts enabled
-			hasToneAlerts := controller.hasUsersWithToneAlerts(call.System.Id, call.Talkgroup.Id)
-			hasKeywordAlerts := controller.hasUsersWithKeywordAlerts(call.System.Id, call.Talkgroup.Id)
-
-			localReasons := []string{}
-			if hasToneAlerts {
-				localReasons = append(localReasons, "tone_alerts")
-			}
-			if hasKeywordAlerts {
-				localReasons = append(localReasons, "keyword_alerts")
-			}
-
-			if len(localReasons) == 0 {
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no users with alerts enabled for call %d (system=%d, talkgroup=%d)", call.Id, call.System.Id, call.Talkgroup.Id))
-				return
-			}
-
-			// Both duration and alert checks passed, queue transcription
-			controller.queueTranscriptionJobIfNeeded(call, priority, localReasons)
-		}()
-		return // Exit early, goroutine will handle queueing
-	}
-
-	// Reason 2: Any user has tone alerts OR keyword alerts enabled for this talkgroup
-	if !needsTranscription {
-		hasToneAlerts := controller.hasUsersWithToneAlerts(call.System.Id, call.Talkgroup.Id)
-		hasKeywordAlerts := controller.hasUsersWithKeywordAlerts(call.System.Id, call.Talkgroup.Id)
-
-		if hasToneAlerts {
-			needsTranscription = true
-			reasons = append(reasons, "tone_alerts")
+			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping transcription for call %d: %s (total %.1fs)", call.Id, reason, audioDuration))
+			controller.markTranscriptionSkipped(call.Id, reason)
+			return
 		}
 
-		if hasKeywordAlerts {
-			needsTranscription = true
-			reasons = append(reasons, "keyword_alerts")
+		if transcribeAll {
+			controller.queueTranscriptionJobIfNeeded(call, priority, []string{"transcribe_all"})
+			return
 		}
-
-		if !needsTranscription {
-			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no users with alerts enabled for call %d (system=%d, talkgroup=%d)", call.Id, call.System.Id, call.Talkgroup.Id))
+		localReasons := controller.transcriptionReasonsForCall(call)
+		if len(localReasons) == 0 {
+			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no transcription reasons for call %d (system=%d, talkgroup=%d)", call.Id, call.System.Id, call.Talkgroup.Id))
+			controller.markTranscriptionSkipped(call.Id, "no_alert_tone_keyword_or_autolearn_reason")
+			return
 		}
-	}
-
-	if needsTranscription {
-		controller.queueTranscriptionJobIfNeeded(call, priority, reasons)
-	}
+		controller.queueTranscriptionJobIfNeeded(call, priority, localReasons)
+	}()
 }
 
 // queueTranscriptionJobIfNeeded is a helper to queue a transcription job
@@ -2602,6 +2919,42 @@ func (controller *Controller) queueTranscriptionJobIfNeeded(call *Call, priority
 	} else {
 		controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("transcription queue became unavailable while processing call %d", call.Id))
 	}
+}
+
+func (controller *Controller) transcriptionReasonsForCall(call *Call) []string {
+	if call == nil || call.System == nil || call.Talkgroup == nil {
+		return nil
+	}
+	reasons := []string{}
+	if call.Talkgroup.AutoLearnToneSets &&
+		call.System.AlertsEnabled && call.Talkgroup.AlertsEnabled {
+		reasons = append(reasons, "auto_learn_tone_sets")
+	}
+	if unitLearnEnabled(call) && callHasUnitRefs(call) {
+		reasons = append(reasons, "auto_learn_unit_aliases")
+	}
+	if call.Talkgroup.AlertingTalkgroup && controller.hasUsersWithAlertsEnabled(call.System.Id, call.Talkgroup.Id) {
+		reasons = append(reasons, "alerting_talkgroup")
+	}
+	if controller.hasUsersWithToneAlerts(call.System.Id, call.Talkgroup.Id) {
+		reasons = append(reasons, "tone_alerts")
+	}
+	if controller.hasUsersWithKeywordAlerts(call.System.Id, call.Talkgroup.Id) {
+		reasons = append(reasons, "keyword_alerts")
+	}
+	return reasons
+}
+
+// hasUsersWithAlertsEnabled checks if any user has alertEnabled for this talkgroup.
+func (controller *Controller) hasUsersWithAlertsEnabled(systemId uint64, talkgroupId uint64) bool {
+	userIds := controller.PreferencesCache.GetUsersForTalkgroup(systemId, talkgroupId)
+	for _, userId := range userIds {
+		pref := controller.PreferencesCache.GetPreference(userId, systemId, talkgroupId)
+		if pref != nil && pref.AlertEnabled {
+			return true
+		}
+	}
+	return false
 }
 
 // hasUsersWithToneAlerts checks if any user has tone alerts enabled for this talkgroup
@@ -2640,6 +2993,13 @@ func (controller *Controller) ProcessMessage(client *Client, message *Message) e
 	if message.Command == MessageCommandVersion {
 		controller.ProcessMessageCommandVersion(client)
 
+	} else if message.Command == MessageCommandPing {
+		// Keep-alive; allowed before auth so PNG does not look like a failed PIN.
+		select {
+		case client.Send <- &Message{Command: MessageCommandPing}:
+		default:
+		}
+
 	} else if restricted && client.User == nil && message.Command != MessageCommandPin {
 		msg := &Message{Command: MessageCommandPin}
 		select {
@@ -2647,8 +3007,8 @@ func (controller *Controller) ProcessMessage(client *Client, message *Message) e
 		default:
 		}
 
-	} else if client.PinExpired && message.Command != MessageCommandPin && message.Command != MessageCommandVersion {
-		// PIN is expired - ignore all messages except PIN (for re-authentication) and Version
+	} else if client.PinExpired && message.Command != MessageCommandPin && message.Command != MessageCommandVersion && message.Command != MessageCommandPing {
+		// PIN is expired - ignore all messages except PIN (for re-authentication), Version, and Ping
 		// This prevents the client from interacting with the scanner when their subscription is expired
 		return nil
 
@@ -2803,6 +3163,11 @@ func (controller *Controller) ProcessMessageCommandLivefeedMap(client *Client, m
 	wasAllOff := client.Livefeed.IsAllOff()
 
 	client.Livefeed.FromMap(message.Payload)
+	// Drop unauthorized / out-of-scope channels so stale LFM keys cannot play
+	// traffic for systems/talkgroups outside the user's group plan.
+	if client.SystemsMap != nil {
+		client.Livefeed.ScrubToScopedSystems(client.SystemsMap)
+	}
 	msg := &Message{Command: MessageCommandLivefeedMap, Payload: !client.Livefeed.IsAllOff()}
 	select {
 	case client.Send <- msg:
@@ -2916,26 +3281,22 @@ func (controller *Controller) sendAvailableCallsToClient(client *Client) {
 	backlogCalls := controller.Calls.GetCallsBulk(ids)
 
 	for _, call := range backlogCalls {
-
-		if controller.requiresUserAuth() {
-			if client.User == nil || !controller.userHasAccess(client.User, call) {
-				continue
-			}
+		presented := controller.prepareCallEmit(call, client)
+		if presented == nil {
+			continue
 		}
 
 		// For delayed feed catchup: send all calls from the delayed window
 		// The cutoff time was already calculated based on user's delay
 		// So all calls in the query result should be sent (no additional delay checks)
-		if client.Livefeed.IsEnabled(call) {
-			msg := &Message{Command: MessageCommandCall, Payload: call}
-			// Use non-blocking send for safety, with small delay to preserve order
-			select {
-			case client.Send <- msg:
-				// Small delay to ensure chronological order is preserved
-				time.Sleep(1 * time.Millisecond)
-			default:
-				// Channel full or client disconnected, skip to avoid blocking
-			}
+		msg := &Message{Command: MessageCommandCall, Payload: presented}
+		// Use non-blocking send for safety, with small delay to preserve order
+		select {
+		case client.Send <- msg:
+			// Small delay to ensure chronological order is preserved
+			time.Sleep(1 * time.Millisecond)
+		default:
+			// Channel full or client disconnected, skip to avoid blocking
 		}
 	}
 }
@@ -2944,16 +3305,7 @@ func (controller *Controller) requiresUserAuth() bool {
 	if controller.Options == nil {
 		return false
 	}
-
-	if controller.Options.UserRegistrationEnabled {
-		return true
-	}
-
-	if controller.Users != nil && controller.Users.HasPins() {
-		return true
-	}
-
-	return false
+	return controller.Options.RequireListenerSignIn
 }
 
 func (controller *Controller) ProcessMessageCommandPin(client *Client, message *Message) error {
@@ -2983,6 +3335,17 @@ func (controller *Controller) ProcessMessageCommandPin(client *Client, message *
 		if controller.requiresUserAuth() && user == nil {
 			controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("invalid user pin %s for ip %s", code, client.GetRemoteAddr()))
 			msg := &Message{Command: MessageCommandPin}
+			select {
+			case client.Send <- msg:
+			default:
+			}
+			return nil
+		}
+
+		// Suspended accounts cannot authenticate at all (unlike expired PIN, which can still see pricing)
+		if user != nil && user.IsSuspended() {
+			controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("suspended user pin auth denied for %s from %s", user.Email, client.GetRemoteAddr()))
+			msg := &Message{Command: MessageCommandError, Payload: "Account suspended"}
 			select {
 			case client.Send <- msg:
 			default:
@@ -3055,6 +3418,9 @@ func (controller *Controller) ProcessMessageCommandPin(client *Client, message *
 
 		if user != nil {
 			if !pinExpired {
+				if err := controller.Users.RecordLastLogin(user, controller.Database); err != nil {
+					controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("failed to record last login for user %s: %v", user.Email, err))
+				}
 			} else {
 				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("user connected with expired pin email=%s ip=%s (sending config for subscription)", user.Email, client.GetRemoteAddr()))
 			}
@@ -3121,10 +3487,14 @@ func (controller *Controller) Start() error {
 
 	// Batch database reads for better performance
 	dbReadStart := time.Now()
+	log.Printf("startup: loading configuration from database...")
 	if err = controller.readAllData(); err != nil {
 		return err
 	}
+	log.Printf("startup: database load completed in %s", time.Since(dbReadStart).Round(time.Millisecond))
 	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("startup: database load completed in %s", time.Since(dbReadStart).Round(time.Millisecond)))
+
+	controller.markStartupReady(startupStart)
 
 	controller.Users.SetRelayListenerEmailSyncCallbacks(
 		controller.relayListenerEmailAdded,
@@ -3142,12 +3512,12 @@ func (controller *Controller) Start() error {
 	// Fetch the AES-256-GCM audio encryption key and the client token from the relay
 	// server if encryption is enabled. Both are held in memory only — never in the DB.
 	if controller.Options.AudioEncryptionEnabled {
-		if controller.Options.RelayServerURL == "" || controller.Options.RelayServerAPIKey == "" {
-			controller.Logs.LogEvent(LogLevelWarn, "audio encryption enabled but relay server URL or API key not configured — encryption disabled")
+		if controller.Options.RelayServerAPIKey == "" {
+			controller.Logs.LogEvent(LogLevelWarn, "audio encryption enabled but relay server API key not configured — encryption disabled")
 		} else {
 			go func() {
 				// Fetch the master AES key (via ECDH — raw key never transmitted).
-				key, err := FetchAudioKeyFromRelay(controller.Options.RelayServerURL, controller.Options.RelayServerAPIKey)
+				key, err := FetchAudioKeyFromRelay(getRelayServerURL(), controller.Options.RelayServerAPIKey)
 				if err != nil {
 					controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("audio encryption: failed to fetch key from relay: %v — audio will be sent unencrypted", err))
 					return
@@ -3162,8 +3532,12 @@ func (controller *Controller) Start() error {
 	}
 
 	// Poll relay for full-suspension state (and receive updates via webhook when relay changes it).
-	if controller.Options.RelayServerURL != "" && controller.Options.RelayServerAPIKey != "" {
+	if controller.Options.RelayServerAPIKey != "" {
 		go controller.startRelaySuspensionPoller()
+		// Relay account sign-in refresh + Nominatim subscription status poll.
+		// Safe to start even with no account yet — refresh is a no-op without
+		// a stored refresh token, and the status poll works off the API key alone.
+		go controller.startRelayAccountRefreshLoop()
 	}
 
 	// Initialize transcription queue after options are loaded
@@ -3204,24 +3578,15 @@ func (controller *Controller) Start() error {
 	// Runs once in the background at startup; deletes in small batches to avoid locking.
 	go controller.purgeLegacyDuplicates()
 
-	if err = controller.Admin.Start(); err != nil {
-		return err
-	}
-	if err := controller.Delayer.Start(); err != nil {
-		return err
-	}
-	if err := controller.Scheduler.Start(); err != nil {
-		return err
-	}
-
 	// Create a context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	controller.workerCancel = cancel
 
-	// Create worker pool to process calls from Ingest channel
-	// Use 2x CPU cores to prevent worker pool exhaustion during blocking operations
+	// Start call workers before any optional restore work so ingest and clients
+	// are not blocked behind delayed-call replay or maintenance tasks.
 	workerCount := runtime.NumCPU() * 2
 	controller.workerStats.activeWorkers = workerCount
+	log.Printf("startup: starting %d call processing workers", workerCount)
 	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("Starting %d call processing workers", workerCount))
 
 	for i := 0; i < workerCount; i++ {
@@ -3259,6 +3624,7 @@ func (controller *Controller) Start() error {
 		}(i)
 	}
 
+	log.Printf("startup: worker pool ready")
 	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("Worker pool started - %d workers ready", workerCount))
 
 	// Start client management goroutine
@@ -3299,9 +3665,51 @@ func (controller *Controller) Start() error {
 
 	controller.Dirwatches.Start(controller)
 
-	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("startup: server ready in %s", time.Since(startupStart).Round(time.Millisecond)))
+	if err = controller.Admin.Start(); err != nil {
+		return err
+	}
+	if err := controller.Delayer.Start(); err != nil {
+		return err
+	}
+	if err := controller.Scheduler.Start(); err != nil {
+		return err
+	}
+
+	readyIn := time.Since(startupStart).Round(time.Millisecond)
+	log.Printf("startup: all services started in %s", readyIn)
+	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("startup: all services started in %s", readyIn))
 
 	return nil
+}
+
+func (controller *Controller) markStartupReady(startupStart time.Time) {
+	if !controller.startupReady.CompareAndSwap(false, true) {
+		return
+	}
+	controller.startupReadyAt.Store(time.Now().UnixNano())
+	readyIn := time.Since(startupStart).Round(time.Millisecond)
+	log.Printf("startup: config loaded, accepting connections in %s", readyIn)
+	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("startup: config loaded, accepting connections in %s", readyIn))
+}
+
+// IsStartupReady reports whether configuration finished loading from the database.
+func (controller *Controller) IsStartupReady() bool {
+	if controller == nil {
+		return false
+	}
+	return controller.startupReady.Load()
+}
+
+// StartupReadyAt is when markStartupReady ran, or zero if not ready yet.
+func (controller *Controller) StartupReadyAt() time.Time {
+	if controller == nil {
+		return time.Time{}
+	}
+	ns := controller.startupReadyAt.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // rebuildTranscriptParser compiles a new TranscriptParser from the current
@@ -3329,6 +3737,30 @@ func (controller *Controller) RestartTranscriptionQueue() {
 	}
 }
 
+// ApplyOptionsRuntimeSideEffects applies in-memory runtime updates after a partial
+// options save (PATCH /api/admin/options). Keeps all provider credentials in the
+// database; only rebinds the active transcription queue to the selected provider.
+func (controller *Controller) ApplyOptionsRuntimeSideEffects(partial map[string]any) {
+	if OptionsPatchTouchesTranscriptionWithCurrent(partial, controller.Options) {
+		controller.RestartTranscriptionQueue()
+	}
+	if _, ok := partial["transcriptParserConfig"]; ok {
+		controller.rebuildTranscriptParser()
+	}
+	if OptionsPatchTouchesNoAudioMonitoring(partial) {
+		go controller.StartNoAudioMonitoringForAllSystems()
+		go controller.StartNoAudioMonitoringForAllApiKeys()
+	}
+	if controller.DedupCache != nil {
+		if _, ok := partial["duplicateDetectionTimeFrame"]; ok {
+			controller.DedupCache.UpdateTTL(controller.Options.DuplicateDetectionTimeFrame)
+		}
+		if _, ok := partial["duplicateTimestampWindow"]; ok {
+			controller.DedupCache.UpdateMatchWindow(controller.Options.DuplicateTimestampWindow)
+		}
+	}
+}
+
 // readAllData reads all data from the database in a single function for better organization
 func (controller *Controller) readAllData() error {
 	// Read all data in parallel for better performance
@@ -3348,7 +3780,7 @@ func (controller *Controller) readAllData() error {
 		}
 	}
 
-	wg.Add(16)
+	wg.Add(17)
 	go readFunc(func() error { return controller.Apikeys.Read(controller.Database) }, "apikeys")
 	go readFunc(func() error { return controller.Dirwatches.Read(controller.Database) }, "dirwatches")
 	go readFunc(func() error { return controller.Downstreams.Read(controller.Database) }, "downstreams")
@@ -3367,6 +3799,7 @@ func (controller *Controller) readAllData() error {
 	// Load performance caches
 	go readFunc(func() error { return controller.PreferencesCache.Read(controller.Database) }, "preferencesCache")
 	go readFunc(func() error { return controller.KeywordListsCache.Read(controller.Database) }, "keywordListsCache")
+	go readFunc(func() error { return controller.CallNaturesCache.Read(controller.Database) }, "callNaturesCache")
 	go readFunc(func() error { return controller.IdLookupsCache.Read(controller.Database) }, "idLookupsCache")
 	go readFunc(func() error { return controller.RecentAlertsCache.Read(controller.Database) }, "recentAlertsCache")
 
@@ -3384,6 +3817,10 @@ func (controller *Controller) readAllData() error {
 	// Check for duplicate emails and log them
 	controller.checkDuplicateEmails()
 
+	// Issue #283: with auto-enable off (default), freeze All/"*" grants so newly
+	// created systems/talkgroups are not silently included in existing groups.
+	controller.freezeUserGroupWildcards()
+
 	// Update reconnection manager settings from options
 	if controller.ReconnectionMgr != nil {
 		controller.ReconnectionMgr.HoldDuration = time.Duration(controller.Options.ReconnectionGracePeriod) * time.Second
@@ -3395,38 +3832,144 @@ func (controller *Controller) readAllData() error {
 			controller.Options.ReconnectionMaxBufferSize)
 	}
 
+	// Align in-memory duplicate cache with persisted arrival-window / retention options.
+	if controller.DedupCache != nil {
+		controller.DedupCache.UpdateTTL(controller.Options.DuplicateDetectionTimeFrame)
+		controller.DedupCache.UpdateMatchWindow(controller.Options.DuplicateTimestampWindow)
+	}
+
 	return nil
 }
 
+// freezeUserGroupWildcards expands talkgroups:"*" to explicit TG lists for
+// usergroups with autoEnableNewTalkgroups=false. Does not rewrite empty All
+// (that would incorrectly grant every existing system); admins freeze All by
+// saving the group with the toggle off.
+func (controller *Controller) freezeUserGroupWildcards() {
+	if controller == nil || controller.UserGroups == nil || controller.Systems == nil || controller.Database == nil {
+		return
+	}
+	for _, group := range controller.UserGroups.GetAll() {
+		if group == nil || group.AutoEnableNewTalkgroups {
+			continue
+		}
+		before := group.SystemAccess
+		group.ExpandStarTalkgroups(controller.Systems)
+		if group.SystemAccess == before {
+			continue
+		}
+		if err := controller.UserGroups.Update(group, controller.Database); err != nil {
+			log.Printf("freezeUserGroupWildcards: failed to update group %d (%s): %v", group.Id, group.Name, err)
+			continue
+		}
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf(
+			"usergroup %d (%s): expanded talkgroup wildcards so new talkgroups are not auto-granted",
+			group.Id, group.Name,
+		))
+	}
+}
+
 // Helper method to check if user has access to a call (uses group settings if available)
+// userGroups resolves all of a user's group memberships to live *UserGroup.
+func (controller *Controller) userGroups(user *User) []*UserGroup {
+	if user == nil {
+		return nil
+	}
+	ids := user.GroupIds()
+	groups := make([]*UserGroup, 0, len(ids))
+	for _, id := range ids {
+		if g := controller.UserGroups.Get(id); g != nil {
+			groups = append(groups, g)
+		}
+	}
+	return groups
+}
+
+// groupsGrantAccess reports whether ANY of the user's groups grants access to
+// the system (and talkgroup when present). With multiple memberships a user's
+// access is the UNION of their groups. Returns true when the user has no groups
+// (no group ceiling to apply).
+func (controller *Controller) groupsGrantAccess(user *User, systemRef uint, talkgroup *Talkgroup) bool {
+	groups := controller.userGroups(user)
+	if len(groups) == 0 {
+		return true
+	}
+	for _, group := range groups {
+		if !group.HasSystemAccess(uint64(systemRef)) {
+			continue
+		}
+		if talkgroup != nil && !group.HasTalkgroupAccess(uint64(systemRef), talkgroup.TalkgroupRef) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (controller *Controller) userHasAccess(user *User, call *Call) bool {
 	if user == nil || call == nil || call.System == nil {
 		return true
 	}
 
-	// Check group access first if user has a group
-	if user.UserGroupId > 0 {
-		group := controller.UserGroups.Get(user.UserGroupId)
-		if group != nil {
-			// Check if group has access to the system
-			if !group.HasSystemAccess(uint64(call.System.SystemRef)) {
-				return false
-			}
-
-			// CRITICAL: Also check talkgroup-level access if talkgroup exists
-			if call.Talkgroup != nil {
-				if !group.HasTalkgroupAccess(uint64(call.System.SystemRef), call.Talkgroup.TalkgroupRef) {
-					return false
-				}
-			}
-
-			// Group allows this system and talkgroup
-			// Still check user-level restrictions (user can be more restrictive than group)
-		}
+	// Group access is a ceiling: any group granting the system+talkgroup is enough.
+	if !controller.groupsGrantAccess(user, call.System.SystemRef, call.Talkgroup) {
+		return false
 	}
 
-	// Check user-level access (can further restrict access beyond group)
+	// Check user-level access (can further restrict access beyond the groups)
 	return user.HasAccess(call)
+}
+
+func (controller *Controller) userEligibleForTalkgroupAlert(userId uint64, call *Call) bool {
+	if call == nil || call.System == nil || call.Talkgroup == nil {
+		return false
+	}
+	user := controller.Users.GetUserById(userId)
+	if user == nil {
+		return false
+	}
+	return controller.userHasAccess(user, call)
+}
+
+func (controller *Controller) userHasSystemScopeAccess(user *User, systemRef uint) bool {
+	if user == nil || systemRef == 0 {
+		return false
+	}
+	groups := controller.userGroups(user)
+	if len(groups) > 0 {
+		granted := false
+		for _, group := range groups {
+			if group.HasSystemAccess(uint64(systemRef)) {
+				granted = true
+				break
+			}
+		}
+		if !granted {
+			return false
+		}
+	}
+	return user.HasSystemScopeAccess(systemRef)
+}
+
+func (controller *Controller) userHasTalkgroupScopeAccess(user *User, systemRef uint, talkgroupRef uint) bool {
+	if user == nil || systemRef == 0 || talkgroupRef == 0 {
+		return false
+	}
+	call := &Call{
+		System:    &System{SystemRef: systemRef},
+		Talkgroup: &Talkgroup{TalkgroupRef: talkgroupRef},
+	}
+	return controller.userHasAccess(user, call)
+}
+
+func (controller *Controller) userCanViewSystemAlerts(user *User) bool {
+	if user == nil {
+		return false
+	}
+	if user.SystemAdmin {
+		return true
+	}
+	return user.HasAnySystemNoAudioAlertScope() || user.HasAnyApiKeyNoAudioAlertScope()
 }
 
 // Helper method to get effective delay for a user (uses group settings if available)
@@ -3435,16 +3978,26 @@ func (controller *Controller) userEffectiveDelay(user *User, call *Call, default
 		return defaultDelay
 	}
 
-	// Check group delays first if user has a group
-	if user.UserGroupId > 0 {
-		group := controller.UserGroups.Get(user.UserGroupId)
-		if group != nil {
-			groupDelay := group.EffectiveDelay(call, defaultDelay)
-			// If group has a delay, use it (group settings override user settings)
-			if groupDelay != defaultDelay || group.Delay > 0 || len(group.systemDelaysMap) > 0 || len(group.talkgroupDelaysMap) > 0 {
-				return groupDelay
+	// Across the groups that actually grant access to this call, use the most
+	// permissive (minimum) configured group delay. Fall back to the user's own
+	// delay when no group configures one.
+	best := defaultDelay
+	found := false
+	for _, group := range controller.userGroups(user) {
+		if !group.HasSystemAccess(uint64(call.System.SystemRef)) ||
+			!group.HasTalkgroupAccess(uint64(call.System.SystemRef), call.Talkgroup.TalkgroupRef) {
+			continue
+		}
+		groupDelay := group.EffectiveDelay(call, defaultDelay)
+		if groupDelay != defaultDelay || group.Delay > 0 || len(group.systemDelaysMap) > 0 || len(group.talkgroupDelaysMap) > 0 {
+			if !found || groupDelay < best {
+				best = groupDelay
+				found = true
 			}
 		}
+	}
+	if found {
+		return best
 	}
 
 	// Fall back to user-level delays
@@ -3457,13 +4010,16 @@ func (controller *Controller) userEffectiveConnectionLimit(user *User) uint {
 		return 0
 	}
 
-	// Check group connection limit first if user has a group
-	if user.UserGroupId > 0 {
-		group := controller.UserGroups.Get(user.UserGroupId)
-		if group != nil && group.ConnectionLimit > 0 {
-			// Group connection limit overrides user limit
-			return group.ConnectionLimit
+	// Across a user's groups, take the most generous (maximum) group connection
+	// limit; fall back to the user's own limit when no group sets one.
+	best := uint(0)
+	for _, group := range controller.userGroups(user) {
+		if group.ConnectionLimit > best {
+			best = group.ConnectionLimit
 		}
+	}
+	if best > 0 {
+		return best
 	}
 
 	// Fall back to user-level connection limit
@@ -3471,8 +4027,7 @@ func (controller *Controller) userEffectiveConnectionLimit(user *User) uint {
 }
 
 func (controller *Controller) fetchRadioReferenceAPIKey() {
-	// Hardcoded relay server URL
-	relayServerURL := "https://tlradioserver.thinlineds.com"
+	relayServerURL := getRelayServerURL()
 
 	// Get auth key using the same method as relay server
 	authKey := getRelayServerAuthKey()
@@ -3526,14 +4081,13 @@ func (controller *Controller) fetchRadioReferenceAPIKey() {
 // in memory on the Controller and included in config messages sent to web/mobile
 // clients so they can perform their own ECDH key exchange with the relay server.
 func (controller *Controller) fetchAudioClientToken() {
-	relayServerURL := controller.Options.RelayServerURL
 	apiKey := controller.Options.RelayServerAPIKey
-	if relayServerURL == "" || apiKey == "" {
-		controller.Logs.LogEvent(LogLevelWarn, "audio encryption: relay server URL or API key not set — cannot fetch client token")
+	if apiKey == "" {
+		controller.Logs.LogEvent(LogLevelWarn, "audio encryption: relay server API key not set — cannot fetch client token")
 		return
 	}
 
-	url := fmt.Sprintf("%s/api/audio/client-token", strings.TrimRight(relayServerURL, "/"))
+	url := fmt.Sprintf("%s/api/audio/client-token", getRelayServerURL())
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		controller.Logs.LogEvent(LogLevelWarn, fmt.Sprintf("audio encryption: failed to build client-token request: %v", err))
@@ -3577,6 +4131,12 @@ func (controller *Controller) fetchAudioClientToken() {
 // SyncConfigToFile syncs the current configuration to a file if config sync is enabled
 // This is used for Google Drive sync and other file-based sync solutions
 func (controller *Controller) SyncConfigToFile() {
+	// Central Management keeps its own versioned copy of the config. This runs
+	// after every config change, independent of the file sync settings below.
+	if controller.CentralManagement != nil {
+		controller.CentralManagement.NotifyConfigChanged()
+	}
+
 	if !controller.Options.ConfigSyncEnabled {
 		return
 	}
@@ -3601,8 +4161,8 @@ func (controller *Controller) SyncConfigToFile() {
 		return
 	}
 
-	// Write to temp file first (atomic write)
-	fileName := filepath.Join(syncPath, "ThinLineRadioV7-config.json")
+	baseName := sanitizeConfigSyncFileName(controller.Options.ConfigSyncFileName)
+	fileName := filepath.Join(syncPath, baseName)
 	tempFileName := fileName + ".tmp"
 
 	// Write to temp file
@@ -3652,6 +4212,9 @@ func (controller *Controller) Terminate() {
 	if controller.healthMonitorStop != nil {
 		close(controller.healthMonitorStop)
 	}
+	if controller.sdrtrunkHealthStop != nil {
+		close(controller.sdrtrunkHealthStop)
+	}
 
 	// Stop all per-system no-audio monitoring goroutines
 	controller.noAudioMonitorStopsMu.Lock()
@@ -3660,6 +4223,15 @@ func (controller *Controller) Terminate() {
 	}
 	controller.noAudioMonitorStops = nil
 	controller.noAudioMonitorStopsMu.Unlock()
+
+	// Stop all per-API-key no-audio monitoring goroutines
+	controller.apikeyNoAudioMonitorStopsMu.Lock()
+	for _, ch := range controller.apikeyNoAudioMonitorStops {
+		close(ch)
+	}
+	controller.apikeyNoAudioMonitorStops = nil
+	controller.apikeyNoAudioMonitorStarted = nil
+	controller.apikeyNoAudioMonitorStopsMu.Unlock()
 
 	// Stop auto-updater background goroutine
 	if controller.Updater != nil {

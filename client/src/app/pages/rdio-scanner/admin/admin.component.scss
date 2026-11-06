@@ -23,6 +23,7 @@
 }
 
 .admin-page-wrapper {
+    --admin-header-height: 50px;
     display: flex;
     flex-direction: column;
     min-height: 100vh;
@@ -30,8 +31,8 @@
 
 .admin-header {
     background: linear-gradient(135deg, #1a0000 0%, #2a0000 60%, #1a1a1a 100%);
-    border-bottom: 3px solid #cc0000;
-    padding: 14px 28px;
+    border-bottom: 2px solid #cc0000;
+    padding: 8px 16px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -46,12 +47,11 @@
         gap: 14px;
     }
 
-    .header-radio-icon {
-        color: #cc0000;
-        font-size: 40px;
-        width: 40px;
-        height: 40px;
-        text-shadow: 0 0 12px rgba(204, 0, 0, 0.5);
+    .header-logo {
+        display: block;
+        height: 32px;
+        width: auto;
+        object-fit: contain;
     }
 
     .header-brand {
@@ -63,9 +63,9 @@
     .brand-name {
         color: #fff;
         font-family: 'Audiowide', 'Rajdhani', sans-serif;
-        font-size: 22px;
+        font-size: 17px;
         font-weight: 700;
-        letter-spacing: 2px;
+        letter-spacing: 1.5px;
     }
 
     .brand-version {
@@ -183,17 +183,13 @@
 
 .admin-body {
     flex: 1;
-    padding: 28px;
-    max-width: 1500px;
-    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
     width: 100%;
     box-sizing: border-box;
 }
 
 @media (max-width: 719px) {
-    .admin-body {
-        padding: 12px;
-    }
 
     .admin-header {
         padding: 10px 14px;
@@ -204,10 +200,8 @@
 
         .header-action-btn mat-icon { margin-right: 0; }
 
-        .header-radio-icon {
-            font-size: 28px;
-            width: 28px;
-            height: 28px;
+        .header-logo {
+            height: 32px;
         }
 
         .brand-name {

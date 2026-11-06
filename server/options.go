@@ -21,25 +21,90 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
+// anyToFloat64 coerces JSON map values (float64 / int / json.Number / string) to float64.
+func anyToFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// anyToBool coerces JSON map values to bool (bool / 0|1 / "true"|"false").
+func anyToBool(v any) (bool, bool) {
+	switch n := v.(type) {
+	case bool:
+		return n, true
+	case float64:
+		return n != 0, true
+	case int:
+		return n != 0, true
+	case int64:
+		return n != 0, true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return false, false
+		}
+		return i != 0, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(n)) {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
 type Options struct {
 	AudioConversion             uint   `json:"audioConversion"`
 	AutoPopulate                bool   `json:"autoPopulate"`
 	Branding                    string `json:"branding"`
+	UIAccentColor               string `json:"uiAccentColor"`
 	DefaultSystemDelay          uint   `json:"defaultSystemDelay"`
 	DisableDuplicateDetection   bool   `json:"disableDuplicateDetection"`
-	DuplicateDetectionTimeFrame uint   `json:"duplicateDetectionTimeFrame"` // in-memory cache TTL (ms)
-	DuplicateTimestampWindow    uint   `json:"duplicateTimestampWindow"`    // ±ms window for timestamp fallback (default 800)
+	DuplicateDetectionTimeFrame   uint `json:"duplicateDetectionTimeFrame"`   // in-memory arrival-cache retention TTL (ms)
+	DuplicateTimestampWindow      uint `json:"duplicateTimestampWindow"`      // server-arrival match window (ms); JSON key kept for compatibility
+	DuplicateRadioTimestampWindow uint `json:"duplicateRadioTimestampWindow"` // radio/P25 timestamp match window (ms); last-pass dedup; 0 = disabled
 	Email                       string `json:"email"`
 	KeypadBeeps                 string `json:"keypadBeeps"`
 	MaxClients                  uint   `json:"maxClients"`
 	PlaybackGoesLive            bool   `json:"playbackGoesLive"`
 	PruneDays                   uint   `json:"pruneDays"`
+	PruneTime                   string `json:"pruneTime"` // "HH:MM" daily prune time in TimeZone; empty = legacy hourly check
+	TimeZone                    string `json:"timeZone"`  // IANA zone for this instance (call times, alerts, prune schedule); empty = server local
 	ShowListenersCount          bool   `json:"showListenersCount"`
 	SortTalkgroups              bool   `json:"sortTalkgroups"`
 	Time12hFormat               bool   `json:"time12hFormat"`
@@ -47,6 +112,11 @@ type Options struct {
 	RadioReferenceUsername      string `json:"radioReferenceUsername"`
 	RadioReferencePassword      string `json:"radioReferencePassword"`
 	UserRegistrationEnabled     bool   `json:"userRegistrationEnabled"`
+	// RequireListenerSignIn forces websocket clients to authenticate with a PIN.
+	// Independent of whether user accounts exist — creating users no longer
+	// implicitly locks the scanner. Defaults false; migration preserves prior
+	// HasPins / UserRegistrationEnabled behavior for existing installs.
+	RequireListenerSignIn       bool   `json:"requireListenerSignIn"`
 	PublicRegistrationEnabled   bool   `json:"publicRegistrationEnabled"`
 	PublicRegistrationMode      string `json:"publicRegistrationMode"` // "codes", "email", "both"
 	EmailVerificationRequired   bool   `json:"emailVerificationRequired"`
@@ -82,6 +152,10 @@ type Options struct {
 	StripePublishableKey          string              `json:"stripePublishableKey"`
 	StripeSecretKey               string              `json:"stripeSecretKey"`
 	StripeWebhookSecret           string              `json:"stripeWebhookSecret"`
+	// StripeBillingPortalConfigurationId is optional (bpc_…). When set, Manage
+	// billing opens that Customer Portal config so scanner products stay
+	// separate from operator plans on a shared Stripe account.
+	StripeBillingPortalConfigurationId string           `json:"stripeBillingPortalConfigurationId"`
 	StripeGracePeriodDays         uint                `json:"stripeGracePeriodDays"`
 	StripePriceId                 string              `json:"stripePriceId"`
 	BaseUrl                       string              `json:"baseUrl"`
@@ -89,6 +163,9 @@ type Options struct {
 	IOSAppStoreURL     string `json:"iosAppStoreUrl"`
 	AndroidPlayStoreURL string `json:"androidPlayStoreUrl"`
 	TranscriptionConfig           TranscriptionConfig `json:"transcriptionConfig"`
+	OpenAIIntegration             OpenAIIntegration   `json:"openAIIntegration"`
+	MappingIntegration            MappingIntegration  `json:"mappingIntegration"`
+	AutoLearnToneSetConfig        AutoLearnToneSetConfig `json:"autoLearnToneSetConfig"`
 	TranscriptionEnhancement      bool                `json:"transcriptionEnhancement"`
 	TranscriptionFailureThreshold uint                `json:"transcriptionFailureThreshold"`
 	TranscriptParserConfig        TranscriptConfig    `json:"transcriptParserConfig"`
@@ -111,7 +188,7 @@ type Options struct {
 	TranscriptionFailureRepeatMinutes uint   `json:"transcriptionFailureRepeatMinutes"`
 	ToneDetectionRepeatMinutes        uint   `json:"toneDetectionRepeatMinutes"`
 	NoAudioRepeatMinutes              uint   `json:"noAudioRepeatMinutes"`
-	RelayServerURL                    string `json:"relayServerURL"`
+	RelayServerURL                    string `json:"relayServerURL"` // always getRelayServerURL(); persisted for compatibility only
 	RelayServerAPIKey                 string `json:"relayServerAPIKey"`
 	// After a successful one-time POST of all listener emails to the relay, this stays true (persisted).
 	RelayListenerEmailsInitialSyncDone bool `json:"relayListenerEmailsInitialSyncDone"`
@@ -141,8 +218,9 @@ type Options struct {
 	// When non-empty this overrides AdminLocalhostOnly for IPs that are in the list.
 	// When empty, AdminLocalhostOnly governs access as before.  Default: "" (no extra IPs).
 	AdminAllowedIPs   string `json:"adminAllowedIPs"`
-	ConfigSyncEnabled bool   `json:"configSyncEnabled"`
-	ConfigSyncPath    string `json:"configSyncPath"`
+	ConfigSyncEnabled  bool   `json:"configSyncEnabled"`
+	ConfigSyncPath     string `json:"configSyncPath"`
+	ConfigSyncFileName string `json:"configSyncFileName"`
 	// Cloudflare Turnstile configuration (for user registration/login and group admin login)
 	TurnstileEnabled   bool   `json:"turnstileEnabled"`
 	TurnstileSiteKey   string `json:"turnstileSiteKey"`
@@ -160,6 +238,21 @@ type Options struct {
 	// Hydra transcription integration (provisioned from Central Management)
 	HydraAPIKey               string `json:"hydraAPIKey"`               // Hydra API key for transcription retrieval
 	HydraTranscriptionEnabled bool   `json:"hydraTranscriptionEnabled"` // Per-server toggle for Hydra transcription
+	// Relay account sign-in (see relay_account.go). Requires RelayServerURL +
+	// RelayServerAPIKey above to already be configured. Password is never
+	// persisted — only used once at login/migrate time to obtain this
+	// refresh token, which is what re-authenticates silently after restart.
+	RelayAccountUsername     string `json:"relayAccountUsername"`
+	RelayAccountRefreshToken string `json:"relayAccountRefreshToken"`
+	// NominatimGatewayURL caches the last-known-good gateway URL learned from
+	// the relay's /api/geocode/status poll. Persisted so a restart while the
+	// relay is briefly misconfigured/unreachable doesn't silently disable
+	// geocoding (a blank gateway URL is never written over a good one).
+	NominatimGatewayURL string `json:"nominatimGatewayURL"`
+	// NominatimSubscriptionStatus caches the last-known access-granting status
+	// (active/trialing) for the same restart-resilience reason. The live poll
+	// and the gateway's per-key allow-list still correct a lapsed subscription.
+	NominatimSubscriptionStatus string `json:"nominatimSubscriptionStatus"`
 	adminPassword             string
 	adminPasswordNeedChange   bool
 	mutex                     sync.Mutex
@@ -169,11 +262,16 @@ type Options struct {
 // TranscriptionConfig contains configuration for transcription
 type TranscriptionConfig struct {
 	Enabled                     bool     `json:"enabled"`
-	Provider                    string   `json:"provider"` // "whisper-api", "azure", "google", "assemblyai", "cloudflare"
+	// TranscribeAllCalls queues STT for every ingested call (all systems/talkgroups),
+	// bypassing the usual “someone has alerts / auto-learn” gate. Per-talkgroup
+	// TranscriptionExclude still skips a channel. Cloud providers will bill more.
+	TranscribeAllCalls          bool     `json:"transcribeAllCalls"`
+	Provider                    string   `json:"provider"`       // "whisper-api", "azure", "google", "assemblyai", "cloudflare", "gemini"
+	BackupProvider              string   `json:"backupProvider"` // same ids as Provider; empty = none. Used only after primary Transcribe fails.
 	Language                    string   `json:"language"` // "en", "auto"
 	Prompt                      string   `json:"prompt"`   // Custom prompt for Whisper to guide transcription (e.g., terminology, formatting)
 	WorkerPoolSize              int      `json:"workerPoolSize"`
-	MinCallDuration             float64  `json:"minCallDuration"`             // Minimum call duration in seconds to transcribe (default: 0 = transcribe all)
+	MinCallDuration             float64  `json:"minCallDuration"`             // Minimum call duration in seconds to transcribe (default: 0 = no duration floor)
 	WhisperAPIURL               string   `json:"whisperAPIURL"`               // Base URL for external Whisper API server (e.g., "http://localhost:8000") or OpenAI API URL
 	WhisperAPIKey               string   `json:"whisperAPIKey"`               // Optional API key for external Whisper API server or OpenAI API key
 	WhisperAPIModel             string   `json:"whisperAPIModel"`             // Model to use for transcription (e.g., "whisper-1", "gpt-4o-transcribe")
@@ -181,21 +279,43 @@ type TranscriptionConfig struct {
 	AzureRegion                 string   `json:"azureRegion"`                 // Azure Speech Services region (e.g., "eastus", "westus2")
 	GoogleAPIKey                string   `json:"googleAPIKey"`                // Google Cloud Speech-to-Text API key
 	GoogleCredentials           string   `json:"googleCredentials"`           // Google Cloud service account JSON credentials (alternative to API key)
+	GeminiAPIKey                string   `json:"geminiAPIKey"`                // Google AI Studio / Gemini API key
+	GeminiModel                 string   `json:"geminiModel"`                 // Gemini model id (default gemini-3.1-flash-lite)
 	AssemblyAIKey               string   `json:"assemblyAIKey"`               // AssemblyAI API key
-	AssemblyAISpeechModel       string   `json:"assemblyAISpeechModel"`       // Speech model for AssemblyAI: "universal-2" (default) or "universal-3-pro"
+	AssemblyAISpeechModel       string   `json:"assemblyAISpeechModel"`       // AssemblyAI speech_models id; blank = API default (currently universal-3-5-pro + universal-2 fallback)
 	AssemblyAIWordBoost         []string `json:"assemblyAIWordBoost"`         // Sent as AssemblyAI keyterms_prompt (max 100 terms, 50 chars each)
 	CloudflareAccountID         string   `json:"cloudflareAccountID"`         // Cloudflare account ID for Workers AI
 	CloudflareAPIToken          string   `json:"cloudflareAPIToken"`          // Cloudflare API token for Workers AI
 	CloudflareModel             string   `json:"cloudflareModel"`             // Cloudflare Workers AI model (default: @cf/openai/whisper-large-v3-turbo)
 	HallucinationPatterns       []string `json:"hallucinationPatterns"`       // Patterns to remove from transcripts (Whisper hallucinations)
-	HallucinationDetectionMode  string   `json:"hallucinationDetectionMode"`  // "off", "manual", "auto"
-	HallucinationMinOccurrences int      `json:"hallucinationMinOccurrences"` // Minimum times a phrase must appear in rejected calls before flagging (default: 5)
+	HallucinationDetectionMode         string   `json:"hallucinationDetectionMode"`         // "off", "learning", "auto-remove" (legacy: "manual", "auto")
+	HallucinationMinOccurrences        int      `json:"hallucinationMinOccurrences"`        // Minimum times a phrase must appear in rejected calls before flagging (default: 5)
+	HallucinationConfidenceThreshold   float64  `json:"hallucinationConfidenceThreshold"`   // 0.0-1.0; auto-removal requires score >= threshold*10 (default: 0.6)
 	// TimeoutSeconds controls the maximum time to wait for a transcription response.
 	// This sets both the overall HTTP client timeout and the per-transport response-header timeout,
 	// which is the one most likely to fire on slow local Whisper servers (they don't send headers
 	// until transcription is complete).  Default: 300 seconds (5 minutes).  Set higher for very
 	// slow CPUs.  0 = use default.
 	TimeoutSeconds int `json:"timeoutSeconds"`
+	// SendLocationContext appends talkgroup/system incident-mapping location
+	// context (LocationContext / GeoCity) to the STT prompt when available.
+	SendLocationContext bool `json:"sendLocationContext"`
+	// Whisper training export — reviewed transcripts sent to transcript-collector on approve.
+	CollectorURL    string `json:"collectorURL"`
+	CollectorAPIKey string `json:"collectorAPIKey"`
+	// ProfanityFilterEnabled masks foul language in saved transcripts and alert
+	// notifications. Nil (unset) means enabled so existing servers get the filter
+	// without an admin save.
+	ProfanityFilterEnabled    *bool    `json:"profanityFilterEnabled"`
+	ProfanityFilterExtraWords []string `json:"profanityFilterExtraWords"`
+}
+
+// OpenAIIntegration holds server-wide OpenAI API credentials for TLR features
+// (tone auto-learn naming, unit alias auto-learn, and future integrations). Separate from transcription.
+type OpenAIIntegration struct {
+	APIKey  string `json:"apiKey"`
+	BaseURL string `json:"baseUrl"`
+	Model   string `json:"model"` // chat model for naming (default gpt-5.4-mini)
 }
 
 const (
@@ -204,6 +324,15 @@ const (
 	AUDIO_CONVERSION_ENABLED_NORM      = 2 // loudnorm (auto target)
 	AUDIO_CONVERSION_ENABLED_LOUD_NORM = 3 // loudnorm I=-16 (louder target)
 )
+
+const relayServerBaseURL = "https://app.thinlineradio.com"
+
+// getRelayServerURL returns the fixed relay server base URL. All TLR instances
+// talk to app.thinlineradio.com; any relayServerURL value stored in options is
+// ignored at runtime and rewritten on load/save.
+func getRelayServerURL() string {
+	return relayServerBaseURL
+}
 
 // getRelayServerAuthKey returns the authorization key for relay server API requests
 // This is derived from a hash to avoid exposing the key directly in source code
@@ -220,6 +349,26 @@ func NewOptions() *Options {
 	return &Options{
 		mutex: sync.Mutex{},
 	}
+}
+
+// sanitizeConfigSyncFileName keeps only a base file name (no directories) and
+// falls back to the default export name when empty or path-like.
+func sanitizeConfigSyncFileName(name string) string {
+	const fallback = "ThinLineRadioV7-config.json"
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fallback
+	}
+	name = filepath.Base(name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return fallback
+	}
+	// Reject empty / weird Windows basenames.
+	if strings.ContainsAny(name, `/\`) {
+		return fallback
+	}
+	return name
 }
 
 func (options *Options) FromMap(m map[string]any) *Options {
@@ -256,6 +405,13 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.Branding = v
 	}
 
+	switch v := m["uiAccentColor"].(type) {
+	case string:
+		options.UIAccentColor = normalizeUIAccentColor(v)
+	default:
+		options.UIAccentColor = defaults.options.uiAccentColor
+	}
+
 	switch v := m["disableDuplicateDetection"].(type) {
 	case bool:
 		options.DisableDuplicateDetection = v
@@ -290,6 +446,22 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.DuplicateTimestampWindow = defaults.options.duplicateTimestampWindow
 	}
 
+	switch v := m["duplicateRadioTimestampWindow"].(type) {
+	case float64:
+		u := uint(v)
+		if u == 0 {
+			options.DuplicateRadioTimestampWindow = 0 // explicitly disabled
+		} else if u < 100 {
+			options.DuplicateRadioTimestampWindow = defaults.options.duplicateRadioTimestampWindow
+		} else if u > 30000 {
+			options.DuplicateRadioTimestampWindow = 30000
+		} else {
+			options.DuplicateRadioTimestampWindow = u
+		}
+	default:
+		options.DuplicateRadioTimestampWindow = defaults.options.duplicateRadioTimestampWindow
+	}
+
 	switch v := m["email"].(type) {
 	case string:
 		options.Email = v
@@ -319,6 +491,29 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.PruneDays = uint(v)
 	default:
 		options.PruneDays = defaults.options.pruneDays
+	}
+
+	switch v := m["pruneTime"].(type) {
+	case string:
+		if norm, ok := normalizePruneTime(v); ok {
+			options.PruneTime = norm
+		} else {
+			options.PruneTime = ""
+		}
+	default:
+		options.PruneTime = ""
+	}
+
+	switch v := m["timeZone"].(type) {
+	case string:
+		v = strings.TrimSpace(v)
+		if validTimeZone(v) {
+			options.TimeZone = v
+		} else {
+			options.TimeZone = ""
+		}
+	default:
+		options.TimeZone = ""
 	}
 
 	switch v := m["showListenersCount"].(type) {
@@ -368,6 +563,12 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.UserRegistrationEnabled = v
 	default:
 		options.UserRegistrationEnabled = defaults.options.userRegistrationEnabled
+	}
+
+	// A missing value (older backups or clients) keeps the current setting so a
+	// locked scanner is never opened by accident.
+	if v, ok := m["requireListenerSignIn"].(bool); ok {
+		options.RequireListenerSignIn = v
 	}
 
 	switch v := m["publicRegistrationEnabled"].(type) {
@@ -561,6 +762,13 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.StripeWebhookSecret = defaults.options.stripeWebhookSecret
 	}
 
+	switch v := m["stripeBillingPortalConfigurationId"].(type) {
+	case string:
+		options.StripeBillingPortalConfigurationId = v
+	default:
+		options.StripeBillingPortalConfigurationId = defaults.options.stripeBillingPortalConfigurationId
+	}
+
 	switch v := m["stripeGracePeriodDays"].(type) {
 	case float64:
 		options.StripeGracePeriodDays = uint(v)
@@ -661,18 +869,41 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.ToneDetectionIssueThreshold = defaults.options.toneDetectionIssueThreshold
 	}
 
-	switch v := m["relayServerURL"].(type) {
-	case string:
-		options.RelayServerURL = v
-	default:
-		options.RelayServerURL = ""
-	}
+	options.RelayServerURL = getRelayServerURL()
 
 	switch v := m["relayServerAPIKey"].(type) {
 	case string:
 		options.RelayServerAPIKey = v
 	default:
 		options.RelayServerAPIKey = ""
+	}
+
+	switch v := m["relayAccountUsername"].(type) {
+	case string:
+		options.RelayAccountUsername = v
+	default:
+		options.RelayAccountUsername = ""
+	}
+
+	switch v := m["relayAccountRefreshToken"].(type) {
+	case string:
+		options.RelayAccountRefreshToken = v
+	default:
+		options.RelayAccountRefreshToken = ""
+	}
+
+	switch v := m["nominatimGatewayURL"].(type) {
+	case string:
+		options.NominatimGatewayURL = v
+	default:
+		options.NominatimGatewayURL = ""
+	}
+
+	switch v := m["nominatimSubscriptionStatus"].(type) {
+	case string:
+		options.NominatimSubscriptionStatus = v
+	default:
+		options.NominatimSubscriptionStatus = ""
 	}
 
 	switch v := m["relayListenerEmailsInitialSyncDone"].(type) {
@@ -830,6 +1061,13 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.ConfigSyncPath = defaults.options.configSyncPath
 	}
 
+	switch v := m["configSyncFileName"].(type) {
+	case string:
+		options.ConfigSyncFileName = sanitizeConfigSyncFileName(v)
+	default:
+		options.ConfigSyncFileName = defaults.options.configSyncFileName
+	}
+
 	switch v := m["turnstileEnabled"].(type) {
 	case bool:
 		options.TurnstileEnabled = v
@@ -849,6 +1087,13 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.TurnstileSecretKey = v
 	default:
 		options.TurnstileSecretKey = ""
+	}
+
+	// Enabling Turnstile requires both keys (issue #259).
+	if options.TurnstileEnabled {
+		if strings.TrimSpace(options.TurnstileSiteKey) == "" || strings.TrimSpace(options.TurnstileSecretKey) == "" {
+			options.TurnstileEnabled = false
+		}
 	}
 
 	switch v := m["reconnectionEnabled"].(type) {
@@ -880,16 +1125,22 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		options.TranscriptionEnhancement = v
 	}
 
-	// Transcription: allow flat toggle and nested config from admin UI
-	if v, ok := m["transcriptionEnabled"].(bool); ok {
-		options.TranscriptionConfig.Enabled = v
-	}
+	// Transcription: allow flat toggle and nested config from admin UI.
+	// Apply nested first, then flat transcriptionEnabled so a PATCH that only
+	// sends the top-level toggle wins over the stale nested enabled flag that
+	// ApplyPartial copies from the current options marshal.
 	if tc, ok := m["transcriptionConfig"].(map[string]any); ok {
 		if v, ok := tc["enabled"].(bool); ok {
 			options.TranscriptionConfig.Enabled = v
 		}
+		if v, ok := anyToBool(tc["transcribeAllCalls"]); ok {
+			options.TranscriptionConfig.TranscribeAllCalls = v
+		}
 		if v, ok := tc["provider"].(string); ok && v != "" {
 			options.TranscriptionConfig.Provider = v
+		}
+		if v, ok := tc["backupProvider"].(string); ok {
+			options.TranscriptionConfig.BackupProvider = strings.TrimSpace(v)
 		}
 		if v, ok := tc["language"].(string); ok && v != "" {
 			options.TranscriptionConfig.Language = v
@@ -900,7 +1151,7 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		if v, ok := tc["workerPoolSize"].(float64); ok && v > 0 {
 			options.TranscriptionConfig.WorkerPoolSize = int(v)
 		}
-		if v, ok := tc["minCallDuration"].(float64); ok {
+		if v, ok := anyToFloat64(tc["minCallDuration"]); ok {
 			options.TranscriptionConfig.MinCallDuration = v
 		}
 		if v, ok := tc["whisperAPIURL"].(string); ok {
@@ -924,10 +1175,21 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		if v, ok := tc["googleCredentials"].(string); ok {
 			options.TranscriptionConfig.GoogleCredentials = v
 		}
+		if v, ok := tc["geminiAPIKey"].(string); ok {
+			options.TranscriptionConfig.GeminiAPIKey = v
+		}
+		if v, ok := tc["geminiModel"].(string); ok {
+			options.TranscriptionConfig.GeminiModel = v
+		}
 		if v, ok := tc["assemblyAIKey"].(string); ok {
 			options.TranscriptionConfig.AssemblyAIKey = v
 		}
 		if v, ok := tc["assemblyAISpeechModel"].(string); ok {
+			v = strings.TrimSpace(v)
+			// Drop deprecated pin so blank → AssemblyAI's current recommended default.
+			if v == "universal-3-pro" {
+				v = ""
+			}
 			options.TranscriptionConfig.AssemblyAISpeechModel = v
 		}
 		if v, ok := tc["cloudflareAccountID"].(string); ok {
@@ -963,12 +1225,155 @@ func (options *Options) FromMap(m map[string]any) *Options {
 		if v, ok := tc["hallucinationMinOccurrences"].(float64); ok {
 			options.TranscriptionConfig.HallucinationMinOccurrences = int(v)
 		}
+		if v, ok := tc["hallucinationConfidenceThreshold"].(float64); ok {
+			options.TranscriptionConfig.HallucinationConfidenceThreshold = v
+		}
 		if v, ok := tc["timeoutSeconds"].(float64); ok && v > 0 {
 			options.TranscriptionConfig.TimeoutSeconds = int(v)
 		}
+		if v, ok := anyToBool(tc["profanityFilterEnabled"]); ok {
+			options.TranscriptionConfig.ProfanityFilterEnabled = &v
+		}
+		if v, ok := tc["profanityFilterExtraWords"].([]interface{}); ok {
+			extra := make([]string, 0, len(v))
+			for _, p := range v {
+				if str, ok := p.(string); ok && str != "" {
+					extra = append(extra, str)
+				}
+			}
+			options.TranscriptionConfig.ProfanityFilterExtraWords = extra
+		}
+		// Legacy: sendLocationContext used to live under transcriptionConfig.
+		// Prefer mappingIntegration when present; otherwise migrate from here.
+		if v, ok := anyToBool(tc["sendLocationContext"]); ok {
+			options.TranscriptionConfig.SendLocationContext = v
+		}
+	}
+	if v, ok := anyToBool(m["transcriptionEnabled"]); ok {
+		options.TranscriptionConfig.Enabled = v
+	}
+
+	if oai, ok := m["openAIIntegration"].(map[string]any); ok {
+		applyOpenAIIntegrationFromMap(&options.OpenAIIntegration, oai)
+	}
+
+	mappingHadSendLocation := false
+	if mi, ok := m["mappingIntegration"].(map[string]any); ok {
+		_, mappingHadSendLocation = mi["sendLocationContext"]
+		applyMappingIntegrationFromMap(&options.MappingIntegration, mi)
+	}
+	if !mappingHadSendLocation && options.TranscriptionConfig.SendLocationContext {
+		options.MappingIntegration.SendLocationContext = true
+	}
+
+	if alc, ok := m["autoLearnToneSetConfig"].(map[string]any); ok {
+		applyAutoLearnToneSetConfigFromMap(&options.AutoLearnToneSetConfig, alc)
+		migrateLegacyOpenAIIntegration(options, alc)
 	}
 
 	return options
+}
+
+func applyOpenAIIntegrationFromMap(cfg *OpenAIIntegration, m map[string]any) {
+	if v, ok := m["apiKey"].(string); ok {
+		cfg.APIKey = v
+	}
+	if v, ok := m["baseUrl"].(string); ok {
+		cfg.BaseURL = v
+	}
+	if v, ok := m["model"].(string); ok {
+		cfg.Model = v
+	}
+}
+
+func applyMappingIntegrationFromMap(cfg *MappingIntegration, m map[string]any) {
+	if v, ok := m["geocodeCacheMaxAgeDays"].(float64); ok {
+		cfg.GeocodeCacheMaxAgeDays = uint(v)
+	}
+	if v, ok := m["autoLearnKnownPlaces"].(bool); ok {
+		cfg.AutoLearnKnownPlaces = v
+	}
+	if v, ok := m["maxGeocodeCandidatesPerCall"].(float64); ok {
+		cfg.MaxGeocodeCandidates = uint(v)
+	}
+	if v, ok := m["openAIModel"].(string); ok {
+		cfg.OpenAIModel = v
+	}
+	if v, ok := m["mappingEngine"].(string); ok {
+		cfg.MappingEngine = v
+	}
+	if v, ok := anyToBool(m["incidentMappingEnabled"]); ok {
+		cfg.IncidentMappingEnabled = v
+		cfg.IncidentMappingEnabledConfigured = true
+	}
+	if v, ok := m["callNatureOpenAIClassify"].(bool); ok {
+		cfg.CallNatureOpenAIClassify = v
+		cfg.CallNatureOpenAIClassifyConfigured = true
+	}
+	if v, ok := anyToBool(m["callNaturePhraseLearn"]); ok {
+		cfg.CallNaturePhraseLearn = v
+	}
+	if v, ok := m["callNaturePhraseLearnMinSightings"].(float64); ok {
+		cfg.CallNaturePhraseLearnMinSightings = uint(v)
+	}
+	if v, ok := anyToBool(m["suppressUnknownNaturePins"]); ok {
+		cfg.SuppressUnknownNaturePins = v
+	}
+	if v, ok := m["mapBoundariesEnabled"].(bool); ok {
+		cfg.MapBoundariesEnabled = v
+	}
+	if v, ok := m["mapBoundaryLayers"].([]any); ok {
+		var layers []string
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				layers = append(layers, strings.TrimSpace(s))
+			}
+		}
+		cfg.MapBoundaryLayers = layers
+	}
+	if v, ok := anyToBool(m["sendLocationContext"]); ok {
+		cfg.SendLocationContext = v
+	}
+}
+
+// migrateLegacyOpenAIIntegration copies OpenAI credentials stored under autoLearnToneSetConfig (older builds).
+func migrateLegacyOpenAIIntegration(options *Options, autoLearn map[string]any) {
+	if options == nil || strings.TrimSpace(options.OpenAIIntegration.APIKey) != "" {
+		return
+	}
+	if v, ok := autoLearn["openAIAPIKey"].(string); ok && strings.TrimSpace(v) != "" {
+		options.OpenAIIntegration.APIKey = v
+	}
+	if v, ok := autoLearn["openAIAPIURL"].(string); ok && strings.TrimSpace(v) != "" {
+		options.OpenAIIntegration.BaseURL = v
+	}
+}
+
+func applyAutoLearnToneSetConfigFromMap(cfg *AutoLearnToneSetConfig, m map[string]any) {
+	if v, ok := m["aToneMinDuration"].(float64); ok {
+		cfg.AToneMinDuration = v
+	}
+	if v, ok := m["aToneMaxDuration"].(float64); ok {
+		cfg.AToneMaxDuration = v
+	}
+	if v, ok := m["bToneMinDuration"].(float64); ok {
+		cfg.BToneMinDuration = v
+	}
+	if v, ok := m["bToneMaxDuration"].(float64); ok {
+		cfg.BToneMaxDuration = v
+	}
+	if v, ok := m["longToneMinDuration"].(float64); ok {
+		cfg.LongToneMinDuration = v
+	}
+	if v, ok := m["longToneMaxDuration"].(float64); ok {
+		cfg.LongToneMaxDuration = v
+	}
+	if v, ok := m["callsRequired"].(float64); ok {
+		cfg.CallsRequired = int(v)
+	}
+	if v, ok := m["frequencyToleranceHz"].(float64); ok {
+		cfg.FrequencyToleranceHz = v
+	}
 }
 
 func (options *Options) Read(db *Database) error {
@@ -993,15 +1398,19 @@ func (options *Options) Read(db *Database) error {
 	options.AudioConversion = defaults.options.audioConversion
 	options.AutoPopulate = defaults.options.autoPopulate
 	options.Branding = defaults.options.branding
+	options.UIAccentColor = defaults.options.uiAccentColor
 	options.DefaultSystemDelay = defaults.options.defaultSystemDelay
 	options.DisableDuplicateDetection = defaults.options.disableDuplicateDetection
 	options.DuplicateDetectionTimeFrame = defaults.options.duplicateDetectionTimeFrame
 	options.DuplicateTimestampWindow = defaults.options.duplicateTimestampWindow
+	options.DuplicateRadioTimestampWindow = defaults.options.duplicateRadioTimestampWindow
 	options.Email = defaults.options.email
 	options.KeypadBeeps = defaults.options.keypadBeeps
 	options.MaxClients = defaults.options.maxClients
 	options.PlaybackGoesLive = defaults.options.playbackGoesLive
 	options.PruneDays = defaults.options.pruneDays
+	options.PruneTime = ""
+	options.TimeZone = ""
 	options.ShowListenersCount = defaults.options.showListenersCount
 	options.SortTalkgroups = defaults.options.sortTalkgroups
 	options.Time12hFormat = defaults.options.time12hFormat
@@ -1024,9 +1433,11 @@ func (options *Options) Read(db *Database) error {
 	options.AdminLocalhostOnly = defaults.options.adminLocalhostOnly
 	options.ConfigSyncEnabled = defaults.options.configSyncEnabled
 	options.ConfigSyncPath = defaults.options.configSyncPath
+	options.ConfigSyncFileName = defaults.options.configSyncFileName
 	options.ReconnectionEnabled = defaults.options.reconnectionEnabled
 	options.ReconnectionGracePeriod = defaults.options.reconnectionGracePeriod
 	options.ReconnectionMaxBufferSize = defaults.options.reconnectionMaxBufferSize
+	options.AutoLearnToneSetConfig = DefaultAutoLearnToneSetConfig()
 
 	// Initialize Radio Reference credentials with defaults, but they will be overridden by database values
 	options.RadioReferenceEnabled = defaults.options.radioReferenceEnabled
@@ -1086,6 +1497,13 @@ func (options *Options) Read(db *Database) error {
 					options.Branding = v
 				}
 			}
+		case "uiAccentColor":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.UIAccentColor = normalizeUIAccentColor(v)
+				}
+			}
 		case "defaultSystemDelay":
 			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
 				switch v := f.(type) {
@@ -1127,6 +1545,23 @@ func (options *Options) Read(db *Database) error {
 					options.DuplicateTimestampWindow = u
 				}
 			}
+		case "duplicateRadioTimestampWindow":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case float64:
+					u := uint(v)
+					if u == 0 {
+						options.DuplicateRadioTimestampWindow = 0
+						break
+					}
+					if u < 100 {
+						u = defaults.options.duplicateRadioTimestampWindow
+					} else if u > 30000 {
+						u = 30000
+					}
+					options.DuplicateRadioTimestampWindow = u
+				}
+			}
 		case "email":
 			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
 				switch v := f.(type) {
@@ -1160,6 +1595,24 @@ func (options *Options) Read(db *Database) error {
 				switch v := f.(type) {
 				case float64:
 					options.PruneDays = uint(v)
+				}
+			}
+		case "pruneTime":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					if norm, ok := normalizePruneTime(v); ok {
+						options.PruneTime = norm
+					}
+				}
+			}
+		case "timeZone":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					if validTimeZone(v) {
+						options.TimeZone = v
+					}
 				}
 			}
 		case "showListenersCount":
@@ -1209,6 +1662,13 @@ func (options *Options) Read(db *Database) error {
 				switch v := f.(type) {
 				case bool:
 					options.UserRegistrationEnabled = v
+				}
+			}
+		case "requireListenerSignIn":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case bool:
+					options.RequireListenerSignIn = v
 				}
 			}
 		case "publicRegistrationEnabled":
@@ -1437,6 +1897,13 @@ func (options *Options) Read(db *Database) error {
 					options.StripeWebhookSecret = v
 				}
 			}
+		case "stripeBillingPortalConfigurationId":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.StripeBillingPortalConfigurationId = v
+				}
+			}
 		case "stripePriceId":
 			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
 				switch v := f.(type) {
@@ -1469,6 +1936,39 @@ func (options *Options) Read(db *Database) error {
 			var cfg TranscriptionConfig
 			if err := json.Unmarshal([]byte(value.String), &cfg); err == nil {
 				options.TranscriptionConfig = cfg
+			}
+		case "openAIIntegration":
+			var cfg OpenAIIntegration
+			if err := json.Unmarshal([]byte(value.String), &cfg); err == nil {
+				options.OpenAIIntegration = cfg
+			}
+		case "mappingIntegration":
+			var raw map[string]any
+			if err := json.Unmarshal([]byte(value.String), &raw); err == nil {
+				applyMappingIntegrationFromMap(&options.MappingIntegration, raw)
+			}
+		case "autoLearnToneSetConfig":
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(value.String), &raw); err == nil {
+				var cfg AutoLearnToneSetConfig
+				if err := json.Unmarshal([]byte(value.String), &cfg); err == nil {
+					options.AutoLearnToneSetConfig = cfg
+				}
+				legacy := map[string]any{}
+				var legacyKey, legacyURL string
+				if b, ok := raw["openAIAPIKey"]; ok {
+					_ = json.Unmarshal(b, &legacyKey)
+					if legacyKey != "" {
+						legacy["openAIAPIKey"] = legacyKey
+					}
+				}
+				if b, ok := raw["openAIAPIURL"]; ok {
+					_ = json.Unmarshal(b, &legacyURL)
+					if legacyURL != "" {
+						legacy["openAIAPIURL"] = legacyURL
+					}
+				}
+				migrateLegacyOpenAIIntegration(options, legacy)
 			}
 		case "transcriptParserConfig":
 			var cfg TranscriptConfig
@@ -1595,17 +2095,40 @@ func (options *Options) Read(db *Database) error {
 				}
 			}
 		case "relayServerURL":
-			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
-				switch v := f.(type) {
-				case string:
-					options.RelayServerURL = v
-				}
-			}
+			// Ignored — always app.thinlineradio.com (see getRelayServerURL).
 		case "relayServerAPIKey":
 			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
 				switch v := f.(type) {
 				case string:
 					options.RelayServerAPIKey = v
+				}
+			}
+		case "relayAccountUsername":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.RelayAccountUsername = v
+				}
+			}
+		case "relayAccountRefreshToken":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.RelayAccountRefreshToken = v
+				}
+			}
+		case "nominatimGatewayURL":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.NominatimGatewayURL = v
+				}
+			}
+		case "nominatimSubscriptionStatus":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.NominatimSubscriptionStatus = v
 				}
 			}
 		case "relayListenerEmailsInitialSyncDone":
@@ -1699,6 +2222,13 @@ func (options *Options) Read(db *Database) error {
 					options.ConfigSyncPath = v
 				}
 			}
+		case "configSyncFileName":
+			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
+				switch v := f.(type) {
+				case string:
+					options.ConfigSyncFileName = sanitizeConfigSyncFileName(v)
+				}
+			}
 		case "turnstileEnabled":
 			if err = json.Unmarshal([]byte(value.String), &f); err == nil {
 				switch v := f.(type) {
@@ -1739,6 +2269,36 @@ func (options *Options) Read(db *Database) error {
 				switch v := f.(type) {
 				case float64:
 					options.ReconnectionMaxBufferSize = uint(v)
+				}
+			}
+		}
+	}
+
+	options.RelayServerURL = getRelayServerURL()
+
+	options.AutoLearnToneSetConfig.normalize()
+	if migrateLegacyAutoLearnToneDurations(&options.AutoLearnToneSetConfig) {
+		cfg := options.AutoLearnToneSetConfig
+		if err := options.WriteKey(db, "autoLearnToneSetConfig", cfg, func() {
+			options.AutoLearnToneSetConfig = cfg
+		}); err != nil {
+			return formatError(err, "autoLearnToneSetConfig migration")
+		}
+	}
+
+	if !options.MappingIntegration.IncidentMappingEnabledConfigured {
+		options.MappingIntegration.IncidentMappingEnabled = detectIncidentMappingAlreadySetup(db)
+		options.MappingIntegration.IncidentMappingEnabledConfigured = true
+		// Persist while Options.Read still holds the mutex (WriteKey would deadlock).
+		if b, err := json.Marshal(options.MappingIntegration); err == nil {
+			valStr := string(b)
+			res, err := db.Sql.Exec(`UPDATE "options" SET "value" = $1 WHERE "key" = $2`, valStr, "mappingIntegration")
+			if err != nil {
+				return formatError(err, "incidentMappingEnabled migration")
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				if _, err = db.Sql.Exec(`INSERT INTO "options" ("key", "value") VALUES ($1, $2)`, "mappingIntegration", valStr); err != nil {
+					return formatError(err, "incidentMappingEnabled migration insert")
 				}
 			}
 		}
@@ -1791,15 +2351,19 @@ func (options *Options) Write(db *Database) error {
 	set("audioConversion", options.AudioConversion)
 	set("autoPopulate", options.AutoPopulate)
 	set("branding", options.Branding)
+	set("uiAccentColor", options.UIAccentColor)
 	set("defaultSystemDelay", options.DefaultSystemDelay)
 	set("disableDuplicateDetection", options.DisableDuplicateDetection)
 	set("duplicateDetectionTimeFrame", options.DuplicateDetectionTimeFrame)
 	set("duplicateTimestampWindow", options.DuplicateTimestampWindow)
+	set("duplicateRadioTimestampWindow", options.DuplicateRadioTimestampWindow)
 	set("email", options.Email)
 	set("keypadBeeps", options.KeypadBeeps)
 	set("maxClients", options.MaxClients)
 	set("playbackGoesLive", options.PlaybackGoesLive)
 	set("pruneDays", options.PruneDays)
+	set("pruneTime", options.PruneTime)
+	set("timeZone", options.TimeZone)
 	set("secret", options.secret)
 	set("showListenersCount", options.ShowListenersCount)
 	set("sortTalkgroups", options.SortTalkgroups)
@@ -1808,6 +2372,7 @@ func (options *Options) Write(db *Database) error {
 	set("radioReferenceUsername", options.RadioReferenceUsername)
 	set("radioReferencePassword", options.RadioReferencePassword)
 	set("userRegistrationEnabled", options.UserRegistrationEnabled)
+	set("requireListenerSignIn", options.RequireListenerSignIn)
 	set("publicRegistrationEnabled", options.PublicRegistrationEnabled)
 	set("publicRegistrationMode", options.PublicRegistrationMode)
 	set("emailVerificationRequired", options.EmailVerificationRequired)
@@ -1840,6 +2405,7 @@ func (options *Options) Write(db *Database) error {
 	set("stripePublishableKey", options.StripePublishableKey)
 	set("stripeSecretKey", options.StripeSecretKey)
 	set("stripeWebhookSecret", options.StripeWebhookSecret)
+	set("stripeBillingPortalConfigurationId", options.StripeBillingPortalConfigurationId)
 	set("stripeGracePeriodDays", options.StripeGracePeriodDays)
 	set("stripePriceId", options.StripePriceId)
 	set("baseUrl", options.BaseUrl)
@@ -1861,8 +2427,12 @@ func (options *Options) Write(db *Database) error {
 	set("transcriptionFailureRepeatMinutes", options.TranscriptionFailureRepeatMinutes)
 	set("toneDetectionRepeatMinutes", options.ToneDetectionRepeatMinutes)
 	set("noAudioRepeatMinutes", options.NoAudioRepeatMinutes)
-	set("relayServerURL", options.RelayServerURL)
+	set("relayServerURL", getRelayServerURL())
 	set("relayServerAPIKey", options.RelayServerAPIKey)
+	set("relayAccountUsername", options.RelayAccountUsername)
+	set("relayAccountRefreshToken", options.RelayAccountRefreshToken)
+	set("nominatimGatewayURL", options.NominatimGatewayURL)
+	set("nominatimSubscriptionStatus", options.NominatimSubscriptionStatus)
 	set("relayListenerEmailsInitialSyncDone", options.RelayListenerEmailsInitialSyncDone)
 	set("relayOwnerUnlockedPublicClient", options.RelayOwnerUnlockedPublicClient)
 	set("audioEncryptionEnabled", options.AudioEncryptionEnabled)
@@ -1876,6 +2446,7 @@ func (options *Options) Write(db *Database) error {
 	set("adminAllowedIPs", options.AdminAllowedIPs)
 	set("configSyncEnabled", options.ConfigSyncEnabled)
 	set("configSyncPath", options.ConfigSyncPath)
+	set("configSyncFileName", options.ConfigSyncFileName)
 	set("turnstileEnabled", options.TurnstileEnabled)
 	set("turnstileSiteKey", options.TurnstileSiteKey)
 	set("turnstileSecretKey", options.TurnstileSecretKey)
@@ -1884,6 +2455,9 @@ func (options *Options) Write(db *Database) error {
 	set("reconnectionMaxBufferSize", options.ReconnectionMaxBufferSize)
 	// Persist entire transcription config as a single JSON blob
 	set("transcriptionConfig", options.TranscriptionConfig)
+	set("openAIIntegration", options.OpenAIIntegration)
+	set("mappingIntegration", options.MappingIntegration)
+	set("autoLearnToneSetConfig", options.AutoLearnToneSetConfig)
 	set("transcriptionEnhancement", options.TranscriptionEnhancement)
 	set("transcriptParserConfig", options.TranscriptParserConfig)
 
@@ -1900,6 +2474,121 @@ func (options *Options) Write(db *Database) error {
 	return nil
 }
 
+// ApplyPartial merges the provided keys over the current options and persists.
+// Only keys present in `partial` change; every other option keeps its current
+// value (unlike FromMap, which resets missing keys to defaults). Nested objects
+// (transcriptionConfig, openAIIntegration, autoLearnToneSetConfig) are deep-merged
+// so a partial nested update does not drop sibling fields.
+//
+// This is the single entry point used by the API-driven admin UI to save one or
+// more option fields at a time. Callers should trigger EmitConfig() afterwards so
+// live clients pick up the change.
+func (options *Options) ApplyPartial(db *Database, partial map[string]any) error {
+	options.mutex.Lock()
+	currentJSON, err := json.Marshal(options)
+	options.mutex.Unlock()
+	if err != nil {
+		return fmt.Errorf("options ApplyPartial marshal: %w", err)
+	}
+
+	merged := map[string]any{}
+	if err := json.Unmarshal(currentJSON, &merged); err != nil {
+		return fmt.Errorf("options ApplyPartial unmarshal: %w", err)
+	}
+
+	for k, v := range partial {
+		if existing, ok := merged[k].(map[string]any); ok {
+			if incoming, ok := v.(map[string]any); ok {
+				for ik, iv := range incoming {
+					existing[ik] = iv
+				}
+				merged[k] = existing
+				continue
+			}
+		}
+		merged[k] = v
+	}
+
+	// Keep nested transcriptionConfig.enabled aligned with the flat admin toggle
+	// so marshal→merge→FromMap never leaves a stale nested enabled value.
+	if v, ok := partial["transcriptionEnabled"]; ok {
+		if tc, ok := merged["transcriptionConfig"].(map[string]any); ok {
+			tc["enabled"] = v
+			merged["transcriptionConfig"] = tc
+		}
+	}
+
+	// FromMap mutates the same Options in place, only overwriting fields it knows
+	// about; unhandled fields (e.g. transcriptParserConfig) keep their values.
+	options.FromMap(merged)
+
+	return options.Write(db)
+}
+
+// OptionsPatchTouchesTranscription reports whether a partial options update requires
+// restarting the transcription worker queue. The active provider and its credentials
+// are fixed when the queue is created; changing them via PATCH must restart the queue
+// without clearing stored settings for other providers.
+//
+// A geminiAPIKey/geminiModel-only nested update does not restart the queue unless
+// Gemini is currently the active STT provider — the key is also used for non-STT
+// features (e.g. location suggest) and may be saved from External Integrations
+// without enabling transcription.
+func OptionsPatchTouchesTranscription(partial map[string]any) bool {
+	return OptionsPatchTouchesTranscriptionWithCurrent(partial, nil)
+}
+
+// OptionsPatchTouchesTranscriptionWithCurrent is like OptionsPatchTouchesTranscription
+// but uses current options to decide whether Gemini credential-only patches need a
+// queue restart.
+func OptionsPatchTouchesTranscriptionWithCurrent(partial map[string]any, current *Options) bool {
+	if partial == nil {
+		return false
+	}
+	if _, ok := partial["transcriptionEnabled"]; ok {
+		return true
+	}
+	tc, ok := partial["transcriptionConfig"].(map[string]any)
+	if !ok {
+		if _, present := partial["transcriptionConfig"]; present {
+			return true
+		}
+		return false
+	}
+	onlyGeminiCreds := len(tc) > 0
+	for k := range tc {
+		if k != "geminiAPIKey" && k != "geminiModel" {
+			onlyGeminiCreds = false
+			break
+		}
+	}
+	if onlyGeminiCreds {
+		if current == nil {
+			return false
+		}
+		if !current.TranscriptionConfig.Enabled {
+			return false
+		}
+		return strings.EqualFold(strings.TrimSpace(current.TranscriptionConfig.Provider), "gemini") ||
+			strings.EqualFold(strings.TrimSpace(current.TranscriptionConfig.BackupProvider), "gemini")
+	}
+	return true
+}
+
+// OptionsPatchTouchesNoAudioMonitoring reports whether a partial options update
+// requires restarting per-system and per-API-key no-audio monitor goroutines.
+func OptionsPatchTouchesNoAudioMonitoring(partial map[string]any) bool {
+	if partial == nil {
+		return false
+	}
+	for _, key := range []string{"systemHealthAlertsEnabled", "noAudioAlertsEnabled", "noAudioRepeatMinutes"} {
+		if _, ok := partial[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // WriteKey writes a single options key directly to the database and updates
 // the in-memory value via the provided setter function.  This avoids the
 // bulk Options.Write overwriting keys that are managed by dedicated endpoints.
@@ -1908,15 +2597,14 @@ func (options *Options) WriteKey(db *Database, key string, val any, setInMemory 
 	if err != nil {
 		return fmt.Errorf("options WriteKey marshal: %w", err)
 	}
+	valStr := string(valJSON)
 
-	query := fmt.Sprintf(`UPDATE "options" SET "value" = '%s' WHERE "key" = '%s'`, valJSON, key)
-	res, err := db.Sql.Exec(query)
+	res, err := db.Sql.Exec(`UPDATE "options" SET "value" = $1 WHERE "key" = $2`, valStr, key)
 	if err != nil {
 		return fmt.Errorf("options WriteKey update: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		query = fmt.Sprintf(`INSERT INTO "options" ("key", "value") VALUES ('%s', '%s')`, key, valJSON)
-		if _, err = db.Sql.Exec(query); err != nil {
+		if _, err = db.Sql.Exec(`INSERT INTO "options" ("key", "value") VALUES ($1, $2)`, key, valStr); err != nil {
 			return fmt.Errorf("options WriteKey insert: %w", err)
 		}
 	}

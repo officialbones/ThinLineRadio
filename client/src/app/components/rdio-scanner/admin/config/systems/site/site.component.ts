@@ -17,12 +17,14 @@
  * ****************************************************************************
  */
 
-import { Component, EventEmitter, Input, Output } from '@angular/core';
+import { Component, EventEmitter, Input, Output, ChangeDetectionStrategy } from '@angular/core';
 import { FormArray, FormControl, FormGroup, Validators } from '@angular/forms';
 
 @Component({
     selector: 'rdio-scanner-admin-site',
     templateUrl: './site.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminSiteComponent {
     @Input() form: FormGroup | undefined;
@@ -39,6 +41,11 @@ export class RdioScannerAdminSiteComponent {
     }
 
     removeFrequency(index: number): void {
+        const hz = this.frequencies.at(index)?.value;
+        const label = hz != null && hz !== '' ? `${hz} Hz` : 'this frequency';
+        if (!confirm(`Are you sure you want to delete ${label}?`)) {
+            return;
+        }
         this.frequencies.removeAt(index);
         this.form?.markAsDirty();
     }

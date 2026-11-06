@@ -18,86 +18,140 @@
  * ****************************************************************************
  */
 
-import { Component, EventEmitter, Input, Output, ChangeDetectionStrategy } from '@angular/core';
 import { CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
+import { ChangeDetectionStrategy, ChangeDetectorRef, Component, EventEmitter, Input, Output } from '@angular/core';
 import { FormArray, FormGroup } from '@angular/forms';
+import { MatSnackBar } from '@angular/material/snack-bar';
+import { RdioScannerAdminService } from '../../admin.service';
 
 @Component({
     selector: 'rdio-scanner-admin-systems',
     templateUrl: './systems.component.html',
     styleUrls: ['./systems.component.scss'],
-    changeDetection: ChangeDetectionStrategy.OnPush
+    changeDetection: ChangeDetectionStrategy.OnPush,
+    standalone: false
 })
 export class RdioScannerAdminSystemsComponent {
     @Input() form: FormArray | undefined;
+    @Input() rawSystems: any[] | undefined;
 
-    /** Emitted when the user clicks to open a specific system */
-    @Output() systemSelected = new EventEmitter<FormGroup>();
-
-    /** Emitted when the user clicks Add System */
     @Output() addSystem = new EventEmitter<void>();
+    @Output() selectSystem = new EventEmitter<FormGroup>();
 
-    displayedColumns: string[] = ['drag', 'systemRef', 'label', 'type', 'talkgroups', 'sites', 'alertsEnabled', 'actions'];
+    displayedColumns = ['drag', 'label', 'systemRef', 'type', 'talkgroups', 'sites', 'actions'];
+    searchQuery = '';
+    saving = false;
 
-    // Search
-    systemsSearchTerm: string = '';
+    constructor(
+        private adminService: RdioScannerAdminService,
+        private cdr: ChangeDetectorRef,
+        private snackBar: MatSnackBar,
+    ) { }
 
     get systems(): FormGroup[] {
-        if (!this.form) return [];
+        if (!this.form) {
+            return [];
+        }
         return (this.form.controls as FormGroup[])
             .slice()
-            .sort((a, b) => (a.value.order || 0) - (b.value.order || 0));
+            .sort((a, b) => (a.value.order || 0) - (b.value.order || 0)
+                || String(a.value.label || '').localeCompare(String(b.value.label || '')));
     }
 
     get filteredSystems(): FormGroup[] {
-        let filtered = this.systems;
-        if (this.systemsSearchTerm.trim()) {
-            const search = this.systemsSearchTerm.toLowerCase();
-            filtered = filtered.filter(sys => {
-                const label = (sys.value.label || '').toLowerCase();
-                const id = (sys.value.systemRef || '').toString();
-                return label.includes(search) || id.includes(search);
-            });
+        const q = this.searchQuery.trim().toLowerCase();
+        if (!q) {
+            return this.systems;
         }
-        return filtered;
+        return this.systems.filter((system) => {
+            const label = String(system.value.label || '').toLowerCase();
+            const ref = String(system.value.systemRef ?? '');
+            const type = String(system.value.type || '').toLowerCase();
+            return label.includes(q) || ref.includes(q) || type.includes(q);
+        });
     }
 
-    getTalkgroupCount(system: FormGroup): number {
-        const talkgroups = system.get('talkgroups');
-        return talkgroups ? (talkgroups as any).length : 0;
+    onSearch(query: string): void {
+        this.searchQuery = query;
+        this.cdr.markForCheck();
     }
 
-    getSiteCount(system: FormGroup): number {
-        const sites = system.get('sites');
-        return sites ? (sites as any).length : 0;
+    talkgroupCount(system: FormGroup): number {
+        const raw = this.rawFor(system);
+        return raw?.talkgroups?.length ?? system.value.talkgroups?.length ?? 0;
     }
 
-    removeAll(): void {
-        if (!this.form || this.form.length === 0) return;
+    siteCount(system: FormGroup): number {
+        const raw = this.rawFor(system);
+        return raw?.sites?.length ?? system.value.sites?.length ?? 0;
+    }
 
-        const count = this.form.length;
-        if (!confirm(`Are you sure you want to delete all ${count} system${count > 1 ? 's' : ''}? This cannot be undone.`)) {
+    drop(event: CdkDragDrop<FormGroup[]>): void {
+        if (this.searchQuery.trim() || event.previousIndex === event.currentIndex) {
+            return;
+        }
+        const all = this.systems;
+        if (event.previousIndex < 0 || event.previousIndex >= all.length) {
+            return;
+        }
+        moveItemInArray(all, event.previousIndex, Math.min(event.currentIndex, all.length - 1));
+        void this.persistOrder(all);
+    }
+
+    sortAlphabetical(): void {
+        const all = this.systems.slice().sort((a, b) =>
+            String(a.value.label || '').localeCompare(String(b.value.label || ''), undefined, { sensitivity: 'base' }));
+        void this.persistOrder(all);
+    }
+
+    private async persistOrder(ordered: FormGroup[]): Promise<void> {
+        const previousOrders = ordered.map((system) => ({
+            system,
+            order: system.get('order')?.value,
+        }));
+
+        ordered.forEach((system, idx) => system.get('order')?.setValue(idx + 1, { emitEvent: false }));
+
+        const orders = ordered
+            .map((system, idx) => ({ id: Number(system.get('id')?.value), order: idx + 1 }))
+            .filter((item) => item.id > 0);
+        if (!orders.length) {
+            this.cdr.markForCheck();
             return;
         }
 
-        while (this.form.length > 0) {
-            this.form.removeAt(0);
+        this.saving = true;
+        this.cdr.markForCheck();
+        const saved = await this.adminService.saveSystemsOrder(orders);
+        this.saving = false;
+
+        if (saved) {
+            // Order-only save: do not markAsPristine. Admin config rebuilds from
+            // EmitConfig when the form is pristine, which would wipe unsaved
+            // system field edits after a reorder.
+            if (this.rawSystems) {
+                for (const item of orders) {
+                    const raw = this.rawSystems.find((s) => s.id === item.id);
+                    if (raw) {
+                        raw.order = item.order;
+                    }
+                }
+            }
+            this.snackBar.open('System order saved', 'Close', { duration: 1500 });
+        } else {
+            for (const item of previousOrders) {
+                item.system.get('order')?.setValue(item.order, { emitEvent: false });
+            }
+            this.snackBar.open('Failed to save system order. Please try again.', 'Close', { duration: 4000 });
         }
-        this.form.markAsDirty();
+        this.cdr.markForCheck();
     }
 
-    onSystemsSearchChange(searchTerm: string): void {
-        this.systemsSearchTerm = searchTerm;
-    }
-
-    dropSystem(event: CdkDragDrop<FormGroup[]>): void {
-        if (event.previousIndex === event.currentIndex) return;
-        if (!this.form) return;
-        // Move within the displayed (sorted) array and update each system's order field
-        moveItemInArray(event.container.data, event.previousIndex, event.currentIndex);
-        event.container.data.forEach((sys, idx) =>
-            sys.get('order')?.setValue(idx + 1, { emitEvent: false })
-        );
-        this.form.markAsDirty();
+    private rawFor(system: FormGroup): any | undefined {
+        const id = system.value.id;
+        if (!id || !this.rawSystems) {
+            return undefined;
+        }
+        return this.rawSystems.find((s) => s.id === id);
     }
 }

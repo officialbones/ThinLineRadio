@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>
 
+//go:build !remapcall && !reviewmapped && !diagnoselost && !reviewunmapped && !setup_incident_mapping && !remapallnatures
+
 package main
 
 import (
@@ -28,7 +30,6 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -82,7 +83,7 @@ func loadDotEnv(candidates ...string) {
 // default <base href="./"> then mis-resolves scripts and assets on public URLs while localhost
 // often still works when users only open "/".
 func writeInjectedWebappIndexHTML(w http.ResponseWriter, r *http.Request, controller *Controller) bool {
-	b, err := webapp.ReadFile("webapp/index.html")
+	b, err := readWebappFile("index.html")
 	if err != nil {
 		return false
 	}
@@ -97,6 +98,7 @@ func writeInjectedWebappIndexHTML(w http.ResponseWriter, r *http.Request, contro
 		branding = "Thinline Radio"
 	}
 	email := controller.Options.Email
+	uiAccentColor := normalizeUIAccentColor(controller.Options.UIAccentColor)
 
 	configScript := fmt.Sprintf(`
 <script>
@@ -114,10 +116,11 @@ window.initialConfig = {
 		"emailLogoFilename": %q,
 		"emailLogoBorderRadius": %q,
 		"turnstileEnabled": %t,
-		"turnstileSiteKey": %q
+		"turnstileSiteKey": %q,
+		"uiAccentColor": %q
 	}
 };
-</script>`, branding, email, controller.Options.UserRegistrationEnabled, controller.Options.StripePaywallEnabled, controller.Options.StripePublishableKey, controller.Options.StripePriceId, controller.Options.BaseUrl, controller.Options.EffectiveIOSAppStoreURL(), controller.Options.EffectiveAndroidPlayStoreURL(), controller.Options.EmailLogoFilename, controller.Options.EmailLogoBorderRadius, controller.Options.TurnstileEnabled, controller.Options.TurnstileSiteKey)
+</script>`, branding, email, controller.Options.UserRegistrationEnabled, controller.Options.StripePaywallEnabled, controller.Options.StripePublishableKey, controller.Options.StripePriceId, controller.Options.BaseUrl, controller.Options.EffectiveIOSAppStoreURL(), controller.Options.EffectiveAndroidPlayStoreURL(), controller.Options.EmailLogoFilename, controller.Options.EmailLogoBorderRadius, controller.Options.TurnstileEnabled, controller.Options.TurnstileSiteKey, uiAccentColor)
 
 	injected := false
 	if strings.Contains(html, "</head>") {
@@ -148,6 +151,38 @@ window.initialConfig = {
 	w.Header().Set("Pragma", "no-cache")
 	w.Write([]byte(html))
 	return true
+}
+
+// writeStaleBundleRecovery is executed in place of a missing hashed JS file so
+// a stale service worker can clear itself. See the webapp 404 branch in main.
+func writeStaleBundleRecovery(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	// Version the one-shot so a Chromebox that already recovered onto an
+	// older build will recover again after this deploy. A boolean flag left
+	// those clients executing a no-op "chunk" forever (black screen).
+	script := fmt.Sprintf(`(function(){
+var v = %q;
+try {
+  if (sessionStorage.getItem('tlr-sw-recover-v') === v) { return; }
+  sessionStorage.setItem('tlr-sw-recover-v', v);
+} catch (e) {}
+function go() {
+  var u = new URL(location.href);
+  u.searchParams.set('ngsw-bypass', '1');
+  location.replace(u.toString());
+}
+if (!('serviceWorker' in navigator)) { go(); return; }
+navigator.serviceWorker.getRegistrations().then(function(rs) {
+  return Promise.all(rs.map(function(r) { return r.unregister(); }));
+}).then(function() {
+  if (!('caches' in window)) { return; }
+  return caches.keys().then(function(keys) {
+    return Promise.all(keys.map(function(k) { return caches.delete(k); }));
+  });
+}).then(go).catch(go);
+})();`, Version)
+	w.Write([]byte(script))
 }
 
 func main() {
@@ -221,12 +256,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	if err := controller.Start(); err != nil {
-		log.Printf("FATAL: Failed to start controller: %v", err)
-		log.Printf("Server cannot continue without a running controller. Exiting.")
-		os.Exit(1)
-	}
-
 	// Create a panic recovery middleware
 	recoveryMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -257,9 +286,35 @@ func main() {
 		return SecurityHeadersMiddleware(handler)
 	}
 
+	// After restart, browsers may reuse stale keep-alive sockets; force fresh TCP
+	// until config is loaded and briefly afterward so the first reload succeeds.
+	startupConnectionMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !controller.IsStartupReady() {
+				w.Header().Set("Connection", "close")
+			} else if at := controller.StartupReadyAt(); !at.IsZero() && time.Since(at) < 30*time.Second {
+				w.Header().Set("Connection", "close")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	// Helper to wrap handlers with recovery, rate limiting, and security headers
 	wrapHandler := func(handler http.Handler) http.Handler {
-		return securityHeadersWrapper(rateLimitWrapper(recoveryMiddleware(handler)))
+		return startupConnectionMiddleware(securityHeadersWrapper(rateLimitWrapper(recoveryMiddleware(handler))))
+	}
+
+	// Tile-specific rate limiting: a single map viewport load or radar
+	// animation cycle can legitimately fire hundreds of tile requests in a
+	// few seconds, which would otherwise exhaust the general per-IP budget
+	// (shared with static assets and every API call) and surface a false
+	// "too many requests" error on a normal page reload. The tile handler
+	// already guards the upstream providers with disk caching + singleflight.
+	tileRateLimitWrapper := func(handler http.Handler) http.Handler {
+		return RateLimitMiddleware(controller.TileRateLimiter)(handler)
+	}
+	tileWrapHandler := func(handler http.Handler) http.Handler {
+		return startupConnectionMiddleware(securityHeadersWrapper(tileRateLimitWrapper(recoveryMiddleware(handler))))
 	}
 
 	// corsMiddleware adds CORS headers so the Central Management frontend (a different
@@ -308,15 +363,44 @@ func main() {
 
 	http.HandleFunc("/api/admin/alerts", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.AlertsHandler)).ServeHTTP)
 
+	http.HandleFunc("/api/admin/listeners", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ListenersHandler)).ServeHTTP)
+
 	http.HandleFunc("/api/admin/systemhealth", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemHealthHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/sdrtrunk-health", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SdrtrunkHealthAdminHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/sdrtrunk-command", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SdrtrunkCommandHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/sdrtrunk-live", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SdrtrunkLiveHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/system-no-audio-settings", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemNoAudioSettingsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/system-retention-settings", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemRetentionSettingsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/system-duplicate-detection-settings", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemDuplicateDetectionSettingsHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/transcription-failures", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.TranscriptionFailuresHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/transcription-failure-threshold", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.TranscriptionFailureThresholdHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/transcript-parser", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.TranscriptParserHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/config", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingConfigHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/data", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingSystemDataHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/import-boundaries", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingImportBoundariesHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/import-boundaries/status", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingImportBoundariesStatusHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/boundaries/stats", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingBoundariesStatsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/boundaries", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingDeleteBoundariesHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/tone-set-locations", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingToneSetLocationsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/apply-tone-set-locations", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingApplyToneSetLocationsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/suggest-tone-set-locations", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingSuggestToneSetLocationsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/talkgroup-locations", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingTalkgroupLocationsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/apply-talkgroup-locations", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingApplyTalkgroupLocationsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/suggest-talkgroup-locations", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingSuggestTalkgroupLocationsHandler))).ServeHTTP)
+	http.HandleFunc("/api/admin/mapping/regeocode/", wrapHandler(controller.Admin.requireLocalhost(http.HandlerFunc(controller.Api.MappingRegeocodeCallHandler))).ServeHTTP)
 	http.HandleFunc("/api/admin/relay-suspension", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelaySuspensionStatusHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/relay-unlock-public-client", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayUnlockPublicClientHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-account/status", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayAccountStatusHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-account/login", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayAccountLoginHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-account/create", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayAccountCreateHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-account/migrate", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayAccountMigrateHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-account/request-migration", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayAccountRequestMigrationHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-account/logout", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayAccountLogoutHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/nominatim/subscribe", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.NominatimSubscribeHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-billing/catalog", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayBillingCatalogHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/relay-billing/subscribe", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.RelayPlanSubscribeHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/tone-detection-issue-threshold", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ToneDetectionIssueThresholdHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/alert-retention-days", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.AlertRetentionDaysHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/no-audio-threshold-minutes", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.NoAudioThresholdMinutesHandler)).ServeHTTP)
@@ -324,11 +408,32 @@ func main() {
 	http.HandleFunc("/api/admin/system-health-alerts-enabled", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemHealthAlertsEnabledHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/system-health-alert-settings", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemHealthAlertSettingsHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/call-audio/", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.CallAudioHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/transcript-review/collector/request-key", wrapHandler(http.HandlerFunc(controller.Admin.TranscriptReviewRequestCollectorKeyHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/transcript-review/collector/stats", wrapHandler(http.HandlerFunc(controller.Admin.TranscriptReviewCollectorStatsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/transcript-review/collector", wrapHandler(http.HandlerFunc(controller.Admin.TranscriptReviewCollectorHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/transcript-review", wrapHandler(http.HandlerFunc(controller.Admin.TranscriptReviewHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/transcript-review/", wrapHandler(http.HandlerFunc(controller.Admin.TranscriptReviewCallHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/tone-import", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ToneImportHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/sync-tone-sets", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SyncToneSetsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/tone-history-analyze", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ToneHistoryAnalyzeHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/unit-alias-suggestions", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UnitAliasSuggestionsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/unit-alias-suggestions/", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UnitAliasSuggestionActionHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/unit-alias-history-scan", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UnitAliasHistoryScanHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/config", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ConfigHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/options", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.OptionsPatchHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/apikeys", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ApikeysHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/tags", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.TagsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/talkgroup-groups", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.GroupsConfigHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/downstreams", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.DownstreamsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/dirwatch", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.DirwatchConfigHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/systems/save", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemSaveHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/systems/order", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemsOrderHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/systems/delete/", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SystemDeleteHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/server-management", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ServerManagementCatalogHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/user-groups/", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UserGroupMergePatchHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/systems/", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.ServerManagementSystemHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/email-logo", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.EmailLogoUploadHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/email-logo/delete", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.EmailLogoDeleteHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/favicon", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.FaviconUploadHandler)).ServeHTTP)
@@ -336,6 +441,7 @@ func main() {
 	http.HandleFunc("/api/admin/email-test", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.EmailTestHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/stripe-sync", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.StripeSyncHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/fs/browse", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.FsBrowseHandler)).ServeHTTP)
 
 	// Serve email logo file - register before root handler to ensure it's handled
 	http.HandleFunc("/email-logo", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -375,11 +481,14 @@ func main() {
 	http.HandleFunc("/api/admin/login-config", wrapHandler(http.HandlerFunc(controller.Admin.LoginConfigHandler)).ServeHTTP)
 
 	// SSO: system admin users exchange their TLR user PIN for an admin JWT (no separate password needed)
-	http.HandleFunc("/api/admin/sso", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.SSOLoginHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/sso", wrapHandler(http.HandlerFunc(controller.Admin.SSOLoginHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/logout", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.LogoutHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/logs", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.LogsHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/logs/categories", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.LogsCategoriesHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/copilot/chat", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.CopilotChatHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/copilot/chat/stream", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.CopilotChatStreamHandler)).ServeHTTP)
 
 	http.HandleFunc("/api/admin/calls", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.CallsHandler)).ServeHTTP)
 
@@ -389,6 +498,9 @@ func main() {
 
 	http.HandleFunc("/api/admin/users", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UsersListHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/users/create", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UserCreateHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/users/bulk-delete", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.UsersBulkDeleteHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/public-api/keys", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.PublicApiKeysListHandler)).ServeHTTP)
+	http.HandleFunc("/api/admin/public-api/keys/", wrapHandler(controller.Admin.requireLocalhost(controller.Admin.PublicApiKeyActionHandler)).ServeHTTP)
 	http.HandleFunc("/api/admin/users/", wrapHandler(controller.Admin.requireLocalhost(func(w http.ResponseWriter, r *http.Request) {
 		// Check if it's a device-tokens endpoint: /api/admin/users/{userId}/device-tokens/{tokenId}
 		pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
@@ -400,6 +512,10 @@ func main() {
 			// Check if it's a reset-password endpoint
 		} else if strings.HasSuffix(r.URL.Path, "/reset-password") && r.Method == http.MethodPost {
 			controller.Admin.UserResetPasswordHandler(w, r)
+		} else if strings.HasSuffix(r.URL.Path, "/suspend") && r.Method == http.MethodPost {
+			controller.Admin.UserSuspendHandler(w, r)
+		} else if r.Method == http.MethodPatch {
+			controller.Admin.UserMergePatchHandler(w, r)
 		} else if r.Method == http.MethodDelete {
 			controller.Admin.UserDeleteHandler(w, r)
 		} else if r.Method == http.MethodPut {
@@ -446,6 +562,15 @@ func main() {
 	http.HandleFunc("/api/public-registration-info", corsMiddleware(wrapHandler(http.HandlerFunc(controller.Api.PublicRegistrationInfoHandler))).ServeHTTP)
 	http.HandleFunc("/api/public-registration-channels", corsMiddleware(wrapHandler(http.HandlerFunc(controller.Api.PublicRegistrationChannelsHandler))).ServeHTTP)
 	http.HandleFunc("/api/registration-settings", wrapHandler(http.HandlerFunc(controller.Api.RegistrationSettingsHandler)).ServeHTTP)
+
+	// Central Management auth proxy (scanner-origin AlertPage login/signup → PIN)
+	http.HandleFunc("/api/cm-auth/status", wrapHandler(http.HandlerFunc(controller.Api.CMAuthStatusHandler)).ServeHTTP)
+	http.HandleFunc("/api/cm-auth/login", wrapHandler(http.HandlerFunc(controller.Api.CMAuthLoginHandler)).ServeHTTP)
+	http.HandleFunc("/api/cm-auth/register", wrapHandler(http.HandlerFunc(controller.Api.CMAuthRegisterHandler)).ServeHTTP)
+	http.HandleFunc("/api/cm-auth/forgot-password", wrapHandler(http.HandlerFunc(controller.Api.CMAuthForgotPasswordHandler)).ServeHTTP)
+	http.HandleFunc("/api/cm-auth/reset-password", wrapHandler(http.HandlerFunc(controller.Api.CMAuthResetPasswordHandler)).ServeHTTP)
+	http.HandleFunc("/api/cm-auth/session", wrapHandler(http.HandlerFunc(controller.Api.CMAuthSessionHandler)).ServeHTTP)
+	http.HandleFunc("/api/cm-auth/manage-account", wrapHandler(http.HandlerFunc(controller.Api.CMAuthManageAccountHandler)).ServeHTTP)
 	http.HandleFunc("/api/user/validate-access-code", wrapHandler(http.HandlerFunc(controller.Api.ValidateAccessCodeHandler)).ServeHTTP)
 	http.HandleFunc("/api/user/verify", wrapHandler(http.HandlerFunc(controller.Api.UserVerifyHandler)).ServeHTTP)
 	http.HandleFunc("/api/user/post-verify-plan-context", wrapHandler(http.HandlerFunc(controller.Api.PostVerifyPlanContextHandler)).ServeHTTP)
@@ -517,14 +642,26 @@ func main() {
 	// Alert routes
 	http.HandleFunc("/api/alerts", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.AlertsHandler))).ServeHTTP)
 	http.HandleFunc("/api/alerts/preferences", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.AlertPreferencesHandler))).ServeHTTP)
+	http.HandleFunc("/api/incidents", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.IncidentsHandler))).ServeHTTP)
+	http.HandleFunc("/api/incidents/pin/", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.IncidentPinHandler))).ServeHTTP)
+	http.HandleFunc("/api/map/boundaries", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.MapBoundariesHandler))).ServeHTTP)
+	http.HandleFunc("/api/map/tiles/", tileWrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.MapTilesHandler))).ServeHTTP)
 	http.HandleFunc("/api/stats", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.StatsHandler))).ServeHTTP)
 	http.HandleFunc("/api/transcripts", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.TranscriptsHandler))).ServeHTTP)
+	http.HandleFunc("/api/transcripts/training-progress", wrapHandler(corsMiddleware(http.HandlerFunc(controller.Api.TranscriptsTrainingProgressHandler))).ServeHTTP)
 	http.HandleFunc("/api/keyword-lists", wrapHandler(http.HandlerFunc(controller.Api.KeywordListsHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-natures", wrapHandler(http.HandlerFunc(controller.Api.CallNaturesHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-natures/sync", wrapHandler(http.HandlerFunc(controller.Api.CallNaturesSyncHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-natures/clear", wrapHandler(http.HandlerFunc(controller.Api.CallNaturesClearHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-nature-phrase-suggestions", wrapHandler(http.HandlerFunc(controller.Api.CallNaturePhraseSuggestionsHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-nature-phrase-suggestions/", wrapHandler(http.HandlerFunc(controller.Api.CallNaturePhraseSuggestionActionHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-nature-phrase-scan", wrapHandler(http.HandlerFunc(controller.Api.CallNaturePhraseScanHandler)).ServeHTTP)
 
 	// System alert routes (system admins only)
 	http.HandleFunc("/api/system-alerts", wrapHandler(http.HandlerFunc(controller.Api.SystemAlertsHandler)).ServeHTTP)
 	http.HandleFunc("/api/system-alerts/", wrapHandler(http.HandlerFunc(controller.Api.SystemAlertDismissHandler)).ServeHTTP)
 	http.HandleFunc("/api/keyword-lists/", wrapHandler(http.HandlerFunc(controller.Api.KeywordListHandler)).ServeHTTP)
+	http.HandleFunc("/api/call-natures/", wrapHandler(http.HandlerFunc(controller.Api.CallNatureHandler)).ServeHTTP)
 
 	// User settings routes — wrapped with CORS so Central Management can call across origins
 	http.HandleFunc("/api/settings", wrapHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -550,6 +687,8 @@ func main() {
 	http.HandleFunc("/api/webhook/central-set-relay-key", securityHeadersWrapper(recoveryMiddleware(http.HandlerFunc(controller.Api.CentralWebhookSetRelayAPIKeyHandler))).ServeHTTP)
 	http.HandleFunc("/api/webhook/central-set-hydra-config", securityHeadersWrapper(recoveryMiddleware(http.HandlerFunc(controller.Api.CentralWebhookSetHydraConfigHandler))).ServeHTTP)
 	http.HandleFunc("/api/webhook/relay-suspension", securityHeadersWrapper(recoveryMiddleware(http.HandlerFunc(controller.Api.RelaySuspensionWebhookHandler))).ServeHTTP)
+	http.HandleFunc("/api/webhook/relay-billing", securityHeadersWrapper(recoveryMiddleware(http.HandlerFunc(controller.Api.RelayBillingWebhookHandler))).ServeHTTP)
+	http.HandleFunc("/api/relay/billing-roster", securityHeadersWrapper(recoveryMiddleware(http.HandlerFunc(controller.Api.RelayBillingRosterHandler))).ServeHTTP)
 	http.HandleFunc("/api/webhook/relay-listener-pin", securityHeadersWrapper(recoveryMiddleware(http.HandlerFunc(controller.Api.RelayListenerPinWebhookHandler))).ServeHTTP)
 
 	// Central Management pairing endpoint — called by the CM backend to push the API key and
@@ -586,6 +725,8 @@ func main() {
 	http.HandleFunc("/api/account/password/verify-code", wrapHandler(http.HandlerFunc(controller.Api.AccountVerifyPasswordChangeCodeHandler)).ServeHTTP)
 	http.HandleFunc("/api/account/password", wrapHandler(http.HandlerFunc(controller.Api.AccountUpdatePasswordHandler)).ServeHTTP)
 	http.HandleFunc("/api/billing/portal", wrapHandler(http.HandlerFunc(controller.Api.BillingPortalSessionHandler)).ServeHTTP)
+	http.HandleFunc("/api/subscription/groups/add", wrapHandler(http.HandlerFunc(controller.Api.SubscriptionGroupAddHandler)).ServeHTTP)
+	http.HandleFunc("/api/subscription/groups/remove", wrapHandler(http.HandlerFunc(controller.Api.SubscriptionGroupRemoveHandler)).ServeHTTP)
 
 	// Log that routes have been registered
 	log.Printf("All HTTP routes registered successfully")
@@ -594,10 +735,19 @@ func main() {
 	// Used by the tlr-time-sync client on SDR-Trunk machines to align their clocks with the server.
 	http.HandleFunc("/api/time", controller.Api.TimeHandler)
 
+	// Startup readiness — no auth, no DB; web client polls before opening websocket after restart.
+	http.HandleFunc("/api/ready", controller.Api.ReadyHandler)
+
+	// User-scoped public REST API (separate from uploader apikeys). Auth: Bearer tlr_… or X-API-Key.
+	http.HandleFunc("/api/public/v1/", wrapHandler(http.HandlerFunc(controller.PublicApi.Router)).ServeHTTP)
+	http.HandleFunc("/api/public/v1", wrapHandler(http.HandlerFunc(controller.PublicApi.Router)).ServeHTTP)
+
 	// Call upload endpoints - exclude from security headers and rate limiting (machine-to-machine APIs)
 	// These endpoints handle their own validation and need to accept frequent uploads
 	// Match v6 registration pattern exactly - pass handler directly without wrapping
 	http.HandleFunc("/api/call-upload", controller.Api.CallUploadHandler)
+	http.HandleFunc("/api/sdrtrunk-health", controller.Api.SdrtrunkHealthHandler)
+	http.HandleFunc("/api/sdrtrunk", controller.Api.SdrtrunkSocketHandler)
 
 	http.HandleFunc("/api/trunk-recorder-call-upload", controller.Api.TrunkRecorderCallUploadHandler)
 
@@ -860,7 +1010,6 @@ func main() {
 		}
 
 		// Relay full suspension: block public listener web UI and root WebSocket; keep /admin and static assets.
-		// Evaluated before central-management redirect so listeners see the lock page instead of being redirected away.
 		if controller.IsPublicWebListenerBlocked() {
 			if !strings.HasPrefix(requestPath, "/admin") && !isStaticAsset(requestPath) {
 				if strings.EqualFold(r.Header.Get("upgrade"), "websocket") {
@@ -878,26 +1027,16 @@ func main() {
 			}
 		}
 
-		if controller.Options.CentralManagementEnabled &&
-			strings.TrimSpace(controller.Options.CentralManagementURL) != "" &&
-			!strings.HasPrefix(requestPath, "/admin") &&
-			!isStaticAsset(requestPath) &&
-			!strings.EqualFold(r.Header.Get("upgrade"), "websocket") &&
-			(r.Method == http.MethodGet || r.Method == http.MethodHead) {
-			baseCentralURL := strings.TrimRight(strings.TrimSpace(controller.Options.CentralManagementURL), "/")
-			if baseCentralURL != "" {
-				target := baseCentralURL + requestPath
-				if rawQuery := strings.TrimSpace(r.URL.RawQuery); rawQuery != "" {
-					target += "?" + rawQuery
-				}
-				http.Redirect(w, r, target, http.StatusFound)
-				return
-			}
-		}
-
 		url := r.URL.Path[1:]
 
 		if strings.EqualFold(r.Header.Get("upgrade"), "websocket") {
+			if !controller.IsStartupReady() {
+				w.Header().Set("Retry-After", "2")
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("Server starting up — retry shortly"))
+				return
+			}
 			upgrader := websocket.Upgrader{
 				CheckOrigin: func(r *http.Request) bool {
 					return true
@@ -924,7 +1063,7 @@ func main() {
 				url = "index.html"
 			}
 
-			if b, err := webapp.ReadFile(path.Join("webapp", url)); err == nil {
+			if b, err := readWebappFile(url); err == nil {
 				var t string
 				ext := path.Ext(url)
 				switch ext {
@@ -947,6 +1086,15 @@ func main() {
 				w.Write(b)
 
 			} else if ext := path.Ext(url); ext != "" {
+				// After a deploy the embedded hashed bundles change. Chrome OS
+				// PWAs / Chromebox kiosks often still have a service worker
+				// holding the previous index.html, which then 404s main-*.js
+				// and paints a white screen. Serve a one-shot recovery script
+				// so those clients unregister the worker and reload.
+				if ext == ".js" && url != "ngsw-worker.js" && url != "safety-worker.js" {
+					writeStaleBundleRecovery(w)
+					return
+				}
 				w.WriteHeader(http.StatusNotFound)
 
 			} else if len(url) > 0 && !strings.HasSuffix(url, "/") {
@@ -1039,13 +1187,27 @@ func main() {
 		log.Printf("admin interface at http://%s:%s/admin", hostname, port)
 	}
 
-	// Start HTTP server in a goroutine
+	// Accept HTTP immediately so static assets load while controller.Start() reads the DB.
 	httpServer = newServer(fmt.Sprintf("%s:%s", addr, port), nil)
 	go func() {
+		if overlay := liveWebappDir(); overlay != "" {
+			log.Printf("webapp overlay: %s", overlay)
+		} else {
+			log.Printf("webapp: embedded")
+		}
+		log.Printf("startup: HTTP listening on %s:%s (loading configuration...)", addr, port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server error: %v", err)
 		}
 	}()
+
+	if err := controller.Start(); err != nil {
+		log.Printf("FATAL: Failed to start controller: %v", err)
+		log.Printf("Server cannot continue without a running controller. Exiting.")
+		os.Exit(1)
+	}
+
+	deferPostStartupMaintenance(controller.Database)
 
 	// Wait for interrupt signal
 	<-sigChan
@@ -1078,20 +1240,4 @@ func main() {
 	// Terminate controller (shuts down workers, closes database, etc.)
 	log.Println("Terminating controller...")
 	controller.Terminate()
-}
-
-func GetRemoteAddr(r *http.Request) string {
-	re := regexp.MustCompile(`(.+):.*$`)
-
-	for _, addr := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
-		if ip := re.ReplaceAllString(addr, "$1"); len(ip) > 0 {
-			return ip
-		}
-	}
-
-	if ip := re.ReplaceAllString(r.RemoteAddr, "$1"); len(ip) > 0 {
-		return ip
-	}
-
-	return r.RemoteAddr
 }

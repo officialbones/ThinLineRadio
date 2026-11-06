@@ -17,7 +17,7 @@
  * ****************************************************************************
  */
 
-import { HttpClientModule } from '@angular/common/http';
+import { provideHttpClient, withInterceptorsFromDi, withXhr } from '@angular/common/http';
 import { NgModule } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ErrorStateMatcher, ShowOnDirtyErrorStateMatcher } from '@angular/material/core';
@@ -47,10 +47,14 @@ import { RdioScannerAdminUserRegistrationComponent } from './config/user-registr
 import { RdioScannerAdminUsersComponent } from './config/users/users.component';
 import { InviteUserDialogComponent, InvitationResultsDialogComponent, CreateUserDialogComponent, ResetPasswordDialogComponent } from './config/users/invite-user-dialog.component';
 import { TransferUserDialogComponent } from './config/users/transfer-user-dialog.component';
+import { DeleteSystemDialogComponent } from './config/systems/delete-system-dialog.component';
 import { RequestAPIKeyDialogComponent } from './config/options/request-api-key-dialog.component';
 import { RecoverAPIKeyDialogComponent } from './config/options/recover-api-key-dialog.component';
+import { RelayAccountDialogComponent } from './config/options/relay-account-dialog.component';
+import { ServerPathBrowseDialogComponent } from './config/options/server-path-browse-dialog.component';
 import { RdioScannerAdminUserGroupsComponent } from './config/user-groups/user-groups.component';
 import { RdioScannerAdminKeywordListsComponent } from './config/keyword-lists/keyword-lists.component';
+import { RdioScannerAdminCallNaturesComponent } from './config/call-natures/call-natures.component';
 import { RdioScannerAdminTranscriptParserComponent } from './config/transcript-parser/transcript-parser.component';
 import { RdioScannerAdminLoginComponent } from './login/login.component';
 import { AlertsService } from '../alerts/alerts.service';
@@ -58,17 +62,24 @@ import { RdioScannerAdminLogsComponent } from './logs/logs.component';
 import { RdioScannerAdminTodosComponent } from './todos/todos.component';
 import { RdioScannerAdminToolsComponent } from './tools/tools.component';
 import { RdioScannerAdminImportExportConfigComponent } from './tools/import-export-config/import-export-config.component';
+import { ImportConfigResultDialogComponent } from './tools/import-export-config/import-config-result-dialog.component';
+import { ImportConfigReviewDialogComponent } from './tools/import-export-config/import-config-review-dialog.component';
 import { RdioScannerAdminImportTalkgroupsComponent } from './tools/import-talkgroups/import-talkgroups.component';
 import { RdioScannerAdminImportUnitsComponent } from './tools/import-units/import-units.component';
 import { RdioScannerAdminPasswordComponent } from './tools/password/password.component';
 import { RdioScannerAdminRadioReferenceImportComponent } from './tools/radio-reference-import/radio-reference-import.component';
-import { RdioScannerAdminConfigSyncComponent } from './tools/config-sync/config-sync.component';
 import { RdioScannerAdminStripeSyncComponent } from './tools/stripe-sync/stripe-sync.component';
 import { RdioScannerAdminPurgeDataComponent } from './tools/purge-data/purge-data.component';
 import { RdioScannerAdminSystemHealthComponent } from './system-health/system-health.component';
+import { RdioScannerAdminSdrHealthComponent } from './sdr-health/sdr-health.component';
+import { RdioScannerAdminListenersComponent } from './listeners/listeners.component';
+import { RdioScannerAdminCentralManagementComponent } from './central-management/central-management.component';
+import { RdioScannerAdminAssistantComponent } from './assistant/assistant.component';
+import { RdioScannerAdminMappingDataComponent } from './config/mapping-data/mapping-data.component';
+import { ToneSetLocationDialogComponent } from './config/systems/system/tone-set-location-dialog.component';
+import { TalkgroupLocationDialogComponent } from './config/systems/system/talkgroup-location-dialog.component';
 
-@NgModule({
-    declarations: [
+@NgModule({ declarations: [
         RdioScannerAdminComponent,
         RdioScannerAdminConfigComponent,
         RdioScannerAdminApikeysComponent,
@@ -76,6 +87,8 @@ import { RdioScannerAdminSystemHealthComponent } from './system-health/system-he
         RdioScannerAdminDownstreamsComponent,
         RdioScannerAdminGroupsComponent,
         RdioScannerAdminImportExportConfigComponent,
+        ImportConfigResultDialogComponent,
+        ImportConfigReviewDialogComponent,
         RdioScannerAdminImportTalkgroupsComponent,
         RdioScannerAdminImportUnitsComponent,
         RdioScannerAdminLoginComponent,
@@ -95,24 +108,31 @@ import { RdioScannerAdminSystemHealthComponent } from './system-health/system-he
         CreateUserDialogComponent,
         ResetPasswordDialogComponent,
         TransferUserDialogComponent,
+        DeleteSystemDialogComponent,
         RequestAPIKeyDialogComponent,
         RecoverAPIKeyDialogComponent,
+        RelayAccountDialogComponent,
+        ServerPathBrowseDialogComponent,
         RdioScannerAdminUserGroupsComponent,
         RdioScannerAdminTodosComponent,
         RdioScannerAdminToolsComponent,
         RdioScannerAdminUnitComponent,
         RdioScannerAdminRadioReferenceImportComponent,
         RdioScannerAdminKeywordListsComponent,
+        RdioScannerAdminCallNaturesComponent,
         RdioScannerAdminTranscriptParserComponent,
-        RdioScannerAdminConfigSyncComponent,
         RdioScannerAdminStripeSyncComponent,
         RdioScannerAdminPurgeDataComponent,
         RdioScannerAdminSystemHealthComponent,
+        RdioScannerAdminSdrHealthComponent,
+        RdioScannerAdminListenersComponent,
+        RdioScannerAdminCentralManagementComponent,
+        RdioScannerAdminAssistantComponent,
+        RdioScannerAdminMappingDataComponent,
+        ToneSetLocationDialogComponent,
+        TalkgroupLocationDialogComponent,
     ],
-    entryComponents: [RdioScannerAdminSystemsSelectComponent],
-    exports: [RdioScannerAdminComponent],
-    imports: [AppSharedModule, HttpClientModule, FormsModule, MatProgressSpinnerModule, MatProgressBarModule, MatChipsModule, MatPaginatorModule, MatSnackBarModule],
-    providers: [
+    exports: [RdioScannerAdminComponent], imports: [AppSharedModule, FormsModule, MatProgressSpinnerModule, MatProgressBarModule, MatChipsModule, MatPaginatorModule, MatSnackBarModule], providers: [
         RdioScannerAdminService,
         AlertsService,
         // Only show mat-form-field error styling after the user changes a control,
@@ -122,6 +142,6 @@ import { RdioScannerAdminSystemHealthComponent } from './system-health/system-he
         // The CDK overlay is rendered outside .admin-dark-theme, so panel colours
         // must be driven by a global panelClass rather than the scoped theme.
         { provide: MAT_SELECT_CONFIG, useValue: { panelClass: 'admin-select-panel' } },
-    ],
-})
+        provideHttpClient(withXhr(), withInterceptorsFromDi()),
+    ] })
 export class RdioScannerAdminModule { }

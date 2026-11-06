@@ -66,6 +66,8 @@ export interface RdioScannerCall {
         siteRef: number;
         systemId: number;
     };
+    /** Audio length in seconds from playback search; 0/missing means unknown. */
+    duration?: number;
     hasTones?: boolean;
     toneSequence?: RdioScannerToneSequence;
     transcript?: string;
@@ -93,6 +95,11 @@ export interface RdioScannerToneSet {
     longTone?: RdioScannerToneSpec;
     tolerance?: number;
     minDuration?: number;
+    geoCity?: string;
+    geoLat?: number;
+    geoLon?: number;
+    geoRadiusMiles?: number;
+    locationContext?: string;
 }
 
 export interface RdioScannerToneSpec {
@@ -106,7 +113,7 @@ export interface RdioScannerAlert {
     callId: number;
     systemId: number;
     talkgroupId: number;
-    alertType: 'tone' | 'keyword' | 'tone+keyword';
+    alertType: 'tone' | 'keyword' | 'tone+keyword' | 'transcript';
     toneDetected: boolean;
     keywordsMatched?: string; // JSON array
     transcriptSnippet?: string;
@@ -120,6 +127,23 @@ export interface RdioScannerAlert {
     talkgroupName?: string;
     matchedToneSetName?: string; // Backward compatibility - first tone set
     matchedToneSetNames?: string[]; // All matched tone sets for stacked tones
+    incidentLat?: number;
+    incidentLon?: number;
+    incidentAddress?: string;
+    incidentNature?: string;
+    incidentGeocodeStatus?: string;
+}
+
+/** Pushed when server-side incident mapping finishes for a call. */
+export interface RdioScannerIncidentUpdate {
+    callId: number;
+    systemId: number;
+    talkgroupId: number;
+    incidentAddress?: string;
+    incidentNature?: string;
+    incidentLat?: number;
+    incidentLon?: number;
+    incidentGeocodeStatus?: string;
 }
 
 export interface RdioScannerTranscript {
@@ -127,6 +151,8 @@ export interface RdioScannerTranscript {
     systemId: number;
     talkgroupId: number;
     transcript: string;
+    reviewedTranscript?: string;
+    trainingReviewStatus?: string;
     transcriptionStatus?: string;
     timestamp?: number;
     alertSummary?: string;
@@ -152,6 +178,8 @@ export interface RdioScannerAlertPreference {
     notificationSound?: string;
     /** Per-tone-set notification sound overrides. Key = toneSetId, value = filename e.g. "chirp_long.wav". */
     toneSetSounds?: { [toneSetId: string]: string };
+    pagerAlert?: boolean;
+    toneSetPagerAlerts?: { [toneSetId: string]: boolean };
 }
 
 export interface RdioScannerKeywordList {
@@ -226,9 +254,15 @@ export interface RdioScannerConfig {
             trialDays?: number;
         }>;
         baseUrl?: string;
+        /** Site-wide public scanner accent (#rrggbb). Users may override in Settings. */
+        uiAccentColor?: string;
         turnstileEnabled?: boolean;
         turnstileSiteKey?: string;
         transcriptionEnabled?: boolean;
+        /** When false, the console Map tab is hidden. */
+        incidentMappingEnabled?: boolean;
+        /** From the user's usergroup(s): default-on for newly scoped channels. */
+        autoEnableNewTalkgroups?: boolean;
     };
     playbackGoesLive: boolean;
     showListenersCount: boolean;
@@ -236,11 +270,20 @@ export interface RdioScannerConfig {
     tags: { [key: string]: { [key: number]: number[] } };
     tagsData: RdioScannerTagData[];
     time12hFormat: boolean;
+    timeZone?: string; // IANA zone of this instance; empty = browser zone
     userSettings?: { [key: string]: any }; // User-specific settings (tag colors, etc.)
+    /** Server owner granted user-scoped public REST API access. */
+    publicApiEnabled?: boolean;
+    publicApiCapabilities?: {
+        health?: boolean;
+        transcripts?: boolean;
+        alertWebhooks?: boolean;
+    };
 }
 
 export interface RdioScannerEvent {
     alert?: any;
+    incident?: RdioScannerIncidentUpdate;
     auth?: boolean;
     categories?: RdioScannerCategory[];
     call?: RdioScannerCall;
@@ -318,11 +361,15 @@ export interface RdioScannerSearchOptions {
     system?: number;
     tag?: string;
     talkgroup?: number;
+    /** Multiple talkgroup refs (same system). Preferred when 2+ are selected. */
+    talkgroups?: number[];
     unit?: number;
 }
 
 export interface RdioScannerSystem {
     id: number;
+    /** Database primary key (server JSON field `systemId`). */
+    systemId?: number;
     systemRef?: number;
     alert?: string;
     label: string;

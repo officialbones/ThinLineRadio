@@ -21,12 +21,18 @@ import { FullscreenOverlayContainer, OverlayContainer } from '@angular/cdk/overl
 import { NgModule } from '@angular/core';
 import { AppSharedModule } from '../../shared/shared.module';
 import { RdioScannerComponent } from './rdio-scanner.component';
+import { InstanceDatePipe } from './instance-time';
 import { RdioScannerService } from './rdio-scanner.service';
 import { RdioScannerConsoleComponent } from './console/console.component';
-import { RdioScannerMainLegacyComponent } from './main/main-legacy.component';
+import { RdioScannerPublicApiDialogComponent } from './console/public-api-dialog.component';
+import { RdioScannerIncidentMapComponent } from './incident-map/incident-map.component';
+import { RdioScannerIncidentMapSidebarComponent } from './incident-map/incident-map-sidebar.component';
+import { IncidentsService } from './incident-map/incidents.service';
+import { IncidentMapBridgeService } from './incident-map/incident-map-bridge.service';
 import { RdioScannerSupportComponent } from './main/support/support.component';
 import { RdioScannerNativeModule } from './native/native.module';
 import { RdioScannerSearchComponent } from './search/search.component';
+import { SearchFilterPickerDialogComponent } from './search/search-filter-picker-dialog.component';
 import { RdioScannerSelectComponent } from './select/select.component';
 import { SystemsVisibilityDialogComponent } from './select/systems-visibility-dialog.component';
 import { ScanListEditDialogComponent } from './select/scan-list-edit-dialog.component';
@@ -39,6 +45,8 @@ import { RdioScannerAuthScreenComponent } from './auth-screen/auth-screen.compon
 import { RdioScannerStripeCheckoutComponent } from './stripe-checkout/stripe-checkout.component';
 import { RdioScannerSettingsComponent } from './settings/settings.component';
 import { RdioScannerAlertsComponent } from './alerts/alerts.component';
+import { RdioScannerAlertMapThumbComponent } from './alerts/alert-map-thumb.component';
+import { RdioScannerAlertMapPopupComponent } from './alerts/alert-map-popup.component';
 import { RdioScannerAlertPreferencesComponent } from './alerts/preferences/preferences.component';
 import { KeywordListInfoDialogComponent } from './alerts/preferences/keyword-list-info-dialog.component';
 import { SettingsService } from './settings/settings.service';
@@ -46,21 +54,32 @@ import { AlertsService } from './alerts/alerts.service';
 import { TagColorService } from './tag-color.service';
 import { FavoritesService } from './favorites.service';
 import { ScanListsService } from './scan-lists.service';
-import { RdioScannerSelectLegacyComponent } from './select/select-legacy.component';
 import { AlertSoundService } from './alert-sound.service';
+import { RdioScannerAdminService } from './admin/admin.service';
+import { TranscriptReviewService } from './transcript-review/transcript-review.service';
+import { RdioScannerTranscriptTrainingTipsComponent } from './transcript-review/transcript-training-tips.component';
 import { RdioScannerMobileWebHubComponent } from './mobile-web-hub/mobile-web-hub.component';
 import { RdioScannerChassisComponent } from './skin/chassis.component';
 import { RdioScannerLcdFrameComponent } from './skin/lcd-frame.component';
 import { RdioScannerLcdBottomNavComponent } from './skin/lcd-bottom-nav.component';
+import { RdioScannerWeatherWidgetComponent } from './weather/weather-widget.component';
+import { RdioScannerWeatherAlertTickerComponent } from './weather/weather-alert-ticker.component';
+import { WeatherAlertTickerBridgeService } from './weather/weather-alert-ticker-bridge.service';
+import { NwsService } from './weather/nws.service';
+import { WeatherAlertTtsService } from './weather/weather-alert-tts.service';
+import { RdioScannerTurnstileComponent } from './turnstile/turnstile.component';
 
 @NgModule({
     declarations: [
+        InstanceDatePipe,
         RdioScannerComponent,
         RdioScannerConsoleComponent,
-        RdioScannerMainLegacyComponent,
+        RdioScannerPublicApiDialogComponent,
+        RdioScannerIncidentMapComponent,
+        RdioScannerIncidentMapSidebarComponent,
         RdioScannerSearchComponent,
+        SearchFilterPickerDialogComponent,
         RdioScannerSelectComponent,
-        RdioScannerSelectLegacyComponent,
         SystemsVisibilityDialogComponent,
         ScanListEditDialogComponent,
         RdioScannerSupportComponent,
@@ -73,12 +92,17 @@ import { RdioScannerLcdBottomNavComponent } from './skin/lcd-bottom-nav.componen
         RdioScannerStripeCheckoutComponent,
         RdioScannerSettingsComponent,
         RdioScannerAlertsComponent,
+        RdioScannerAlertMapThumbComponent,
+        RdioScannerAlertMapPopupComponent,
+        RdioScannerTranscriptTrainingTipsComponent,
         RdioScannerAlertPreferencesComponent,
         KeywordListInfoDialogComponent,
         RdioScannerMobileWebHubComponent,
         RdioScannerChassisComponent,
         RdioScannerLcdFrameComponent,
         RdioScannerLcdBottomNavComponent,
+        RdioScannerWeatherWidgetComponent,
+        RdioScannerWeatherAlertTickerComponent,
     ],
     exports: [
         RdioScannerComponent,
@@ -89,15 +113,23 @@ import { RdioScannerLcdBottomNavComponent } from './skin/lcd-bottom-nav.componen
     imports: [
         AppSharedModule,
         RdioScannerNativeModule,
+        RdioScannerTurnstileComponent,
     ],
     providers: [
         RdioScannerService,
         SettingsService,
         AlertsService,
+        IncidentsService,
+        IncidentMapBridgeService,
+        WeatherAlertTickerBridgeService,
         TagColorService,
         FavoritesService,
         ScanListsService,
         AlertSoundService,
+        RdioScannerAdminService,
+        TranscriptReviewService,
+        NwsService,
+        WeatherAlertTtsService,
         { provide: OverlayContainer, useClass: FullscreenOverlayContainer },
     ],
 })

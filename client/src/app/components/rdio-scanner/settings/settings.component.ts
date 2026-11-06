@@ -17,7 +17,7 @@
  * ****************************************************************************
  */
 
-import { Component, OnDestroy, OnInit } from '@angular/core';
+import { Component, OnDestroy, OnInit, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { Subscription } from 'rxjs';
@@ -26,15 +26,29 @@ import { RdioScannerService } from '../rdio-scanner.service';
 import { SettingsService } from './settings.service';
 import { TagColorService, TagColorConfig } from '../tag-color.service';
 import { AlertSoundService, AlertSound } from '../alert-sound.service';
+import { WeatherAlertTickerBridgeService } from '../weather/weather-alert-ticker-bridge.service';
+import { WeatherAlertTtsService } from '../weather/weather-alert-tts.service';
 import { AlertsService } from '../alerts/alerts.service';
 import { RdioScannerAlertPreference } from '../rdio-scanner';
+import { APP_FONTS } from '../app-font.util';
+import { AppFontService } from '../app-font.service';
+import { AppAccentService } from '../app-accent.service';
+import { DEFAULT_UI_ACCENT, UI_ACCENT_PRESETS, normalizeUIAccentColor } from '../app-accent.util';
+
+export type SettingsTab = 'audio' | 'appearance' | 'account';
+export type AudioSection = 'livefeed' | 'alerts';
 
 @Component({
     selector: 'rdio-scanner-settings',
     styleUrls: ['./settings.component.scss'],
     templateUrl: './settings.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
+    settingsTab: SettingsTab = 'audio';
+    audioSection: AudioSection = 'livefeed';
+
     settings: any = {};
     availableTags: string[] = [];
     tagColors: TagColorConfig = {};
@@ -45,16 +59,19 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
     autoLivefeed: boolean = false;
     isPWA: boolean = false;
     alertSound: string = 'alert';
+    weatherAlertSoundEnabled = false;
+    weatherAlertSound: string = 'alert';
+    weatherAlertTtsEnabled = false;
+    ttsSupported = true;
     availableAlertSounds: AlertSound[] = [];
     
     // Font selection
     appFont: string = 'Roboto';
-    availableFonts: Array<{name: string, value: string, displayName: string}> = [
-        { name: 'Roboto', value: 'Roboto, sans-serif', displayName: 'Roboto (Default)' },
-        { name: 'Rajdhani', value: 'Rajdhani, sans-serif', displayName: 'Rajdhani (Modern Technical)' },
-        { name: 'ShareTechMono', value: '"Share Tech Mono", monospace', displayName: 'Share Tech Mono (Terminal)' },
-        { name: 'Audiowide', value: 'Audiowide, cursive', displayName: 'Audiowide (Digital Display)' },
-    ];
+    availableFonts = APP_FONTS;
+
+    accentUsesSiteDefault = true;
+    uiAccentColor = DEFAULT_UI_ACCENT;
+    readonly accentPresets = UI_ACCENT_PRESETS;
 
     // Per-channel sounds
     channelPreferences: RdioScannerAlertPreference[] = [];
@@ -66,6 +83,11 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
     // Account info
     accountInfo: any = null;
     loadingAccount: boolean = false;
+
+    /** Paired to Central Management / AlertPage — hide local account mutation UI. */
+    cmMode = false;
+    cmPortalUrl = '';
+    openingCMAccount = false;
     
     // Subscription management
     config: any = null;
@@ -102,10 +124,16 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
         private tagColorService: TagColorService,
         private alertSoundService: AlertSoundService,
         private alertsService: AlertsService,
+        private appFontService: AppFontService,
+        private appAccentService: AppAccentService,
         private http: HttpClient,
         private fb: FormBuilder,
         private snackBar: MatSnackBar,
+        private weatherAlertTickerBridge: WeatherAlertTickerBridgeService,
+        private weatherAlertTtsService: WeatherAlertTtsService,
+        private cdr: ChangeDetectorRef,
     ) {
+        this.ttsSupported = this.weatherAlertTtsService.isSupported();
         this.emailForm = this.fb.group({
             newEmail: ['', [Validators.required, Validators.email]],
             password: ['', [Validators.required]],
@@ -132,10 +160,75 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
         this.checkIfPWA();
         this.loadSettings();
         this.loadTagColors();
+        this.loadCMMode();
         this.loadAccountInfo();
         this.loadConfig();
         this.loadAlertSounds();
         this.loadChannelPreferences();
+    }
+
+    private loadCMMode(): void {
+        this.http.get<any>('/api/registration-settings').subscribe({
+            next: (settings) => {
+                this.cmMode = !!settings?.centralManagementEnabled;
+                this.cmPortalUrl = settings?.centralManagementPortalUrl || '';
+                this.cdr.markForCheck();
+            },
+            error: () => {
+                this.cmMode = false;
+                this.cmPortalUrl = '';
+            },
+        });
+    }
+
+    openCMManageAccount(): void {
+        const pin = this.getPin();
+        if (!pin) {
+            this.snackBar.open('Sign in to manage your AlertPage account.', 'OK', { duration: 4000 });
+            return;
+        }
+        this.openingCMAccount = true;
+        this.http.post<{ url?: string; portalUrl?: string }>(
+            '/api/cm-auth/manage-account',
+            {},
+            { headers: this.getAuthHeaders() },
+        ).subscribe({
+            next: (res) => {
+                this.openingCMAccount = false;
+                const url = (res?.url || res?.portalUrl || this.cmPortalUrl || '').trim();
+                if (!url) {
+                    this.snackBar.open('Unable to open AlertPage account.', 'OK', { duration: 4000 });
+                    this.cdr.markForCheck();
+                    return;
+                }
+                window.open(url, '_blank', 'noopener,noreferrer');
+                this.cdr.markForCheck();
+            },
+            error: (err) => {
+                this.openingCMAccount = false;
+                // Older AlertPage builds may not have /api/tlr/user-sso yet — open the portal account page.
+                const fallback = (this.cmPortalUrl || '').replace(/\/+$/, '');
+                if (fallback) {
+                    window.open(`${fallback}/account-settings`, '_blank', 'noopener,noreferrer');
+                    this.cdr.markForCheck();
+                    return;
+                }
+                const body = err?.error;
+                const msg = (typeof body === 'string' ? body : (body?.error || body?.message || ''))
+                    .toString()
+                    .trim() || 'Unable to open AlertPage account.';
+                this.snackBar.open(msg, 'OK', { duration: 5000 });
+                this.cdr.markForCheck();
+            },
+        });
+    }
+
+    setSettingsTab(tab: SettingsTab): void {
+        this.settingsTab = tab;
+    }
+
+    setAudioSection(section: AudioSection): void {
+        this.audioSection = section;
     }
 
     loadAlertSounds(): void {
@@ -393,7 +486,12 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
     }
     
     loadConfig(): void {
-        // Subscribe to config updates from the service
+        // Prefer the already-loaded scanner config so checkout isn't gated on a
+        // future websocket event (empty modal looks like Add does nothing).
+        const existing = this.rdioScannerService.getConfig?.();
+        if (existing) {
+            this.config = existing;
+        }
         this.rdioScannerService.event.subscribe((event: any) => {
             if (event.config) {
                 this.config = event.config;
@@ -417,10 +515,13 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
                 this.autoLivefeed = this.settings.autoLivefeed || false;
                 // Load alert sound setting
                 this.alertSound = this.settings.alertSound || 'alert';
+                this.weatherAlertSoundEnabled = !!this.settings.weatherAlertSoundEnabled;
+                this.weatherAlertSound = this.settings.weatherAlertSound || 'alert';
+                this.weatherAlertTtsEnabled = !!this.settings.weatherAlertTtsEnabled;
                 // Load font setting
                 this.appFont = this.settings.appFont || 'Roboto';
-                // Apply font
-                this.applyFont(this.appFont);
+                this.appFontService.apply(this.appFont);
+                this.loadAccentFromSettings();
             },
             error: (error) => {
                 console.error('Error loading settings:', error);
@@ -428,6 +529,9 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
                 this.livefeedBacklogMinutes = 0;
                 this.autoLivefeed = false;
                 this.alertSound = 'alert';
+                this.weatherAlertSoundEnabled = false;
+                this.weatherAlertSound = 'alert';
+                this.weatherAlertTtsEnabled = false;
                 this.appFont = 'Roboto';
             },
         });
@@ -495,7 +599,11 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
         this.settings.livefeedBacklogMinutes = this.livefeedBacklogMinutes;
         this.settings.autoLivefeed = this.autoLivefeed;
         this.settings.alertSound = this.alertSound;
+        this.settings.weatherAlertSoundEnabled = this.weatherAlertSoundEnabled;
+        this.settings.weatherAlertSound = this.weatherAlertSound;
+        this.settings.weatherAlertTtsEnabled = this.weatherAlertTtsEnabled;
         this.settings.appFont = this.appFont;
+        this.settings.uiAccentColor = this.accentUsesSiteDefault ? '' : this.uiAccentColor;
         this.settingsService.saveSettings(this.settings).subscribe({
             next: () => {
                 console.log('Settings saved successfully');
@@ -527,33 +635,87 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
         this.saveSettings();
     }
 
+    onWeatherAlertSoundChange(): void {
+        this.saveSettings();
+    }
+
+    onWeatherAlertTtsChange(): void {
+        this.saveSettings();
+    }
+
     previewAlertSound(soundName: string): void {
         this.alertSoundService.previewSound(soundName);
     }
+
+    previewWeatherAlertTts(): void {
+        this.weatherAlertTtsService.speak(
+            'Severe Thunderstorm Warning for your area. This is a sample of the weather alert reader.',
+        );
+    }
+
+    testWeatherAlertTicker(): void {
+        const played = this.weatherAlertTickerBridge.triggerTest(
+            this.weatherAlertSoundEnabled,
+            this.weatherAlertSound,
+            this.weatherAlertTtsEnabled,
+        );
+        if (!played) {
+            this.snackBar.open('Could not reach the header ticker. Try refreshing the page.', 'Close', {
+                duration: 4000,
+            });
+            return;
+        }
+        this.snackBar.open('Test alert scrolling in the header ticker.', 'Close', {
+            duration: 3000,
+        });
+    }
     
     onFontChange(): void {
-        // Apply font and auto-save
-        this.applyFont(this.appFont);
+        this.appFontService.apply(this.appFont);
         this.saveSettings();
     }
 
     getFontDisplayName(fontName: string): string {
         return this.availableFonts.find(f => f.name === fontName)?.displayName ?? fontName;
     }
-    
-    applyFont(fontName: string): void {
-        const font = this.availableFonts.find(f => f.name === fontName);
-        if (font) {
-            // Apply font to body element
-            document.body.style.fontFamily = font.value;
-            
-            // Adjust font size for Audiowide (15% smaller)
-            if (fontName === 'Audiowide') {
-                document.documentElement.style.fontSize = '14.45px'; // 85% of 17px (default)
-            } else {
-                document.documentElement.style.fontSize = ''; // Reset to default
-            }
+
+    private loadAccentFromSettings(): void {
+        const saved = typeof this.settings.uiAccentColor === 'string' ? this.settings.uiAccentColor.trim() : '';
+        if (saved) {
+            this.accentUsesSiteDefault = false;
+            this.uiAccentColor = normalizeUIAccentColor(saved);
+            this.appAccentService.setUserColor(this.uiAccentColor);
+        } else {
+            this.accentUsesSiteDefault = true;
+            this.uiAccentColor = this.appAccentService.getSiteColor();
+            this.appAccentService.setUserColor('');
         }
+    }
+
+    useSiteAccent(): void {
+        this.accentUsesSiteDefault = true;
+        this.uiAccentColor = this.appAccentService.getSiteColor();
+        this.appAccentService.setUserColor('');
+        this.saveSettings();
+    }
+
+    setAccentColor(value: string): void {
+        this.accentUsesSiteDefault = false;
+        this.uiAccentColor = normalizeUIAccentColor(value);
+        this.appAccentService.setUserColor(this.uiAccentColor);
+        this.saveSettings();
+    }
+
+    onAccentPickerInput(event: Event): void {
+        const value = (event.target as HTMLInputElement | null)?.value;
+        if (value) {
+            this.setAccentColor(value);
+        }
+    }
+
+    onAccentHexBlur(event: Event): void {
+        const value = (event.target as HTMLInputElement | null)?.value;
+        this.setAccentColor(value || this.appAccentService.getSiteColor());
     }
 
     private getAuthHeaders(): HttpHeaders {
@@ -589,6 +751,7 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
                 this.userEmail = account.email || '';
                 // Store current subscription price ID if available
                 this.currentPriceId = account.currentPriceId || null;
+                this.seedTierPriceDefaults(account);
                 this.loadingAccount = false;
             },
             error: (error) => {
@@ -852,9 +1015,58 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
             this.snackBar.open('Unable to get your email address', 'Close', { duration: 3000 });
             return;
         }
+        if (!this.ensureCheckoutConfig()) {
+            return;
+        }
         this.userEmail = this.accountInfo.email;
+        this.checkoutItems = this.buildUnpaidCheckoutItems();
+        if (!this.checkoutItems?.length && !(this.accountInfo.pricingOptions?.length > 0)) {
+            this.snackBar.open('No unpaid plans available to subscribe. Contact support if this persists.', 'Close', { duration: 5000 });
+            return;
+        }
         this.showCheckout = true;
         this.showChangeSubscription = false;
+    }
+
+    /** Build multi-tier checkout items from unpaid self-billable memberships. */
+    private buildUnpaidCheckoutItems(): {
+        groupId: number;
+        priceId: string;
+        name?: string;
+        label?: string;
+        amount?: string;
+    }[] | null {
+        const unpaid = this.accountInfo?.unpaidCheckoutItems as any[] | undefined;
+        const memberships = this.accountInfo?.memberships as any[] | undefined;
+        const sources = (unpaid?.length ? unpaid : memberships?.filter((m: any) =>
+            m.billingEnabled && m.selfBillable && !m.paid && m.pricingOptions?.length
+        )) || [];
+        if (!sources.length) {
+            return null;
+        }
+        const items: {
+            groupId: number;
+            priceId: string;
+            name?: string;
+            label?: string;
+            amount?: string;
+        }[] = [];
+        for (const src of sources) {
+            const opts = src.pricingOptions || [];
+            const selectedId = this.selectedTierPrice?.[src.groupId];
+            const opt = opts.find((o: any) => o.priceId === selectedId) || opts[0];
+            if (!opt?.priceId) {
+                continue;
+            }
+            items.push({
+                groupId: src.groupId,
+                priceId: opt.priceId,
+                name: src.name,
+                label: opt.label,
+                amount: opt.amount,
+            });
+        }
+        return items.length ? items : null;
     }
     
     openChangeSubscription(): void {
@@ -866,25 +1078,185 @@ export class RdioScannerSettingsComponent implements OnDestroy, OnInit {
         this.showChangeSubscription = true;
         this.showCheckout = true; // Reuse the same checkout modal
     }
+
+    /** Combined-checkout items when adding a tier / completing unpaid multi-tier signup. */
+    checkoutItems: {
+        groupId: number;
+        priceId: string;
+        name?: string;
+        label?: string;
+        amount?: string;
+    }[] | null = null;
+    addingTier = false;
+    /** Price selection per available tier in the add picker (groupId -> priceId). */
+    selectedTierPrice: { [groupId: number]: string } = {};
+    /** Single available tier the user is adding (only one can be selected). */
+    selectedAvailableTierId: number | null = null;
+
+    /** Default each available/unpaid tier to its first plan so Add isn't stuck disabled. */
+    private seedTierPriceDefaults(account: any): void {
+        const available = account?.availableTiers || [];
+        for (const t of available) {
+            if (t.billingEnabled && t.pricingOptions?.length && !this.selectedTierPrice[t.groupId]) {
+                this.selectedTierPrice[t.groupId] = t.pricingOptions[0].priceId;
+            }
+        }
+        for (const u of account?.unpaidCheckoutItems || []) {
+            if (u.pricingOptions?.length && !this.selectedTierPrice[u.groupId]) {
+                this.selectedTierPrice[u.groupId] = u.pricingOptions[0].priceId;
+            }
+        }
+        // Pre-select the first available tier so Subscribe is one click away.
+        if (available.length && (this.selectedAvailableTierId == null
+            || !available.some((t: any) => t.groupId === this.selectedAvailableTierId))) {
+            this.selectedAvailableTierId = available[0].groupId;
+        }
+    }
+
+    selectAvailableTier(groupId: number): void {
+        this.selectedAvailableTierId = groupId;
+        const t = (this.accountInfo?.availableTiers || []).find((x: any) => x.groupId === groupId);
+        if (t?.billingEnabled && t.pricingOptions?.length && !this.selectedTierPrice[groupId]) {
+            this.selectedTierPrice[groupId] = t.pricingOptions[0].priceId;
+        }
+    }
+
+    setTierPrice(groupId: number, priceId: string): void {
+        this.selectedAvailableTierId = groupId;
+        this.selectedTierPrice[groupId] = priceId;
+    }
+
+    canAddSelectedTier(): boolean {
+        if (this.addingTier || this.selectedAvailableTierId == null) {
+            return false;
+        }
+        const t = (this.accountInfo?.availableTiers || []).find(
+            (x: any) => x.groupId === this.selectedAvailableTierId
+        );
+        if (!t) {
+            return false;
+        }
+        return !t.billingEnabled || !!this.selectedTierPrice[t.groupId];
+    }
+
+    addSelectedTier(): void {
+        if (!this.canAddSelectedTier() || this.selectedAvailableTierId == null) {
+            this.snackBar.open('Select one tier and a plan first', 'Close', { duration: 3000 });
+            return;
+        }
+        const groupId = this.selectedAvailableTierId;
+        this.addTier(groupId, this.selectedTierPrice[groupId]);
+    }
+
+    private ensureCheckoutConfig(): boolean {
+        if (!this.config) {
+            const existing = this.rdioScannerService.getConfig?.();
+            if (existing) {
+                this.config = existing;
+            }
+        }
+        if (!this.config?.options?.stripePublishableKey) {
+            this.snackBar.open(
+                'Billing is still loading. Wait a moment and try again, or refresh the page.',
+                'Close',
+                { duration: 5000 }
+            );
+            return false;
+        }
+        return true;
+    }
+
+    /** Add a public tier. Paid tiers with an active subscription are added
+     *  server-side with proration; otherwise a combined checkout is shown. */
+    addTier(groupId: number, priceId?: string): void {
+        const pin = this.getPin();
+        if (!pin) {
+            this.snackBar.open('Please log in to manage your subscription', 'Close', { duration: 3000 });
+            return;
+        }
+        this.addingTier = true;
+        const headers = this.getAuthHeaders();
+        this.http.post<any>('/api/subscription/groups/add', { groupId, priceId: priceId || '' }, {
+            headers,
+            params: { pin: encodeURIComponent(pin) },
+        }).subscribe({
+            next: (res) => {
+                this.addingTier = false;
+                if (res.added) {
+                    this.snackBar.open('Tier added to your subscription', 'Close', { duration: 3000 });
+                    this.loadAccountInfo();
+                } else if (res.needsCheckout && priceId) {
+                    if (!this.ensureCheckoutConfig()) {
+                        return;
+                    }
+                    // No active subscription yet — complete Stripe Checkout for this one tier.
+                    this.userEmail = this.accountInfo?.email || res.email || '';
+                    const tier = (this.accountInfo?.availableTiers || []).find((t: any) => t.groupId === groupId);
+                    const opt = (tier?.pricingOptions || []).find((o: any) => o.priceId === priceId);
+                    this.checkoutItems = [{
+                        groupId,
+                        priceId,
+                        name: tier?.name,
+                        label: opt?.label,
+                        amount: opt?.amount,
+                    }];
+                    this.showChangeSubscription = false;
+                    this.showCheckout = true;
+                } else {
+                    this.snackBar.open('Could not start checkout for that tier', 'Close', { duration: 5000 });
+                }
+            },
+            error: (error) => {
+                this.addingTier = false;
+                this.snackBar.open(error.error?.error || 'Failed to add tier', 'Close', { duration: 5000 });
+            },
+        });
+    }
+
+    /** Remove a tier from the user's subscription (or membership for a free tier). */
+    removeTier(groupId: number): void {
+        if (!confirm('Remove this tier? You will lose access to its channels.')) {
+            return;
+        }
+        const pin = this.getPin();
+        if (!pin) {
+            return;
+        }
+        const headers = this.getAuthHeaders();
+        this.http.post<any>('/api/subscription/groups/remove', { groupId }, {
+            headers,
+            params: { pin: encodeURIComponent(pin) },
+        }).subscribe({
+            next: () => {
+                this.snackBar.open('Tier removed', 'Close', { duration: 3000 });
+                this.loadAccountInfo();
+            },
+            error: (error) => {
+                this.snackBar.open(error.error?.error || 'Failed to remove tier', 'Close', { duration: 5000 });
+            },
+        });
+    }
     
     onCheckoutSuccess(event: any): void {
         console.log('Checkout successful:', event);
         this.showCheckout = false;
         this.showChangeSubscription = false;
+        this.checkoutItems = null;
         // Reload account info to get updated subscription status
         this.loadAccountInfo();
         // Reload page to get updated subscription status
         window.location.reload();
     }
-    
+
     onCheckoutError(event: any): void {
         console.error('Checkout error:', event);
         // Keep checkout open on error
     }
-    
+
     onCheckoutCancel(): void {
         this.showCheckout = false;
         this.showChangeSubscription = false;
+        this.checkoutItems = null;
     }
     
     getSubscriptionStatusDisplay(): string {

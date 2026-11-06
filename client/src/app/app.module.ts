@@ -17,8 +17,10 @@
  * ****************************************************************************
  */
 
-import { NgModule } from '@angular/core';
-import { HttpClientModule } from '@angular/common/http';
+import { APP_INITIALIZER, NgModule } from '@angular/core';
+import { AppFontService } from './components/rdio-scanner/app-font.service';
+import { AppAccentService } from './components/rdio-scanner/app-accent.service';
+import { provideHttpClient, withInterceptorsFromDi, withXhr } from '@angular/common/http';
 import { BrowserModule } from '@angular/platform-browser';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { ServiceWorkerModule } from '@angular/service-worker';
@@ -28,22 +30,27 @@ import { RdioScannerModule } from './components/rdio-scanner/rdio-scanner.module
 import { AppSharedModule } from './shared/shared.module';
 import { routes } from './app.routes';
 
-@NgModule({
-    bootstrap: [AppComponent],
-    declarations: [AppComponent],
-    imports: [
-        RdioScannerModule,
+@NgModule({ bootstrap: [AppComponent],
+    declarations: [AppComponent], imports: [RdioScannerModule,
         AppSharedModule.forRoot({
             routerExtraOptions: { enableTracing: false },
             routerRoutes: routes,
         }),
         BrowserAnimationsModule,
         BrowserModule,
-        HttpClientModule,
         ServiceWorkerModule.register('ngsw-worker.js', {
             enabled: environment.production,
-            registrationStrategy: 'registerWhenStable:30000',
-        }),
-    ],
-})
+            registrationStrategy: 'registerWhenStable:5000',
+        })], providers: [
+        {
+            provide: APP_INITIALIZER,
+            useFactory: (appFontService: AppFontService, appAccentService: AppAccentService) => () => {
+                appFontService.init();
+                appAccentService.init();
+            },
+            deps: [AppFontService, AppAccentService],
+            multi: true,
+        },
+        provideHttpClient(withXhr(), withInterceptorsFromDi()),
+    ] })
 export class AppModule { }

@@ -91,20 +91,93 @@ func (livefeed *Livefeed) IsEnabledForRef(systemRef, talkgroupRef uint) bool {
 }
 
 func (livefeed *Livefeed) IsEnabled(call *Call) bool {
+	return len(livefeed.EnabledMatchingTalkgroupRefs(call)) > 0
+}
+
+// EnabledMatchingTalkgroupRefs returns the client's enabled talkgroup refs that
+// match this call — primary first (if on), then any patch members that are on.
+// Used so a patched call is streamed once as a single talkgroup, not via PATCH
+// fan-in when multiple members are selected.
+func (livefeed *Livefeed) EnabledMatchingTalkgroupRefs(call *Call) []uint {
+	if livefeed == nil || call == nil || call.System == nil || call.Talkgroup == nil {
+		return nil
+	}
+
 	livefeed.mutex.Lock()
 	defer livefeed.mutex.Unlock()
 
-	if call != nil {
-		if livefeed.Matrix[call.System.SystemRef][call.Talkgroup.TalkgroupRef] {
-			return true
-		} else {
-			for _, p := range call.Patches {
-				if livefeed.Matrix[call.System.SystemRef][p] {
-					return true
+	sys := call.System.SystemRef
+	primary := call.Talkgroup.TalkgroupRef
+	out := make([]uint, 0, 1+len(call.Patches))
+
+	if livefeed.Matrix[sys][primary] {
+		out = append(out, primary)
+	}
+	for _, p := range call.Patches {
+		if p == 0 || p == primary {
+			continue
+		}
+		if livefeed.Matrix[sys][p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ScrubToScopedSystems turns off any livefeed entries that are outside the
+// client's currently scoped systems map (group/user ACL). Prevents hearing
+// traffic for talkgroups that are no longer (or never were) in the plan.
+func (livefeed *Livefeed) ScrubToScopedSystems(systemsMap SystemsMap) {
+	livefeed.mutex.Lock()
+	defer livefeed.mutex.Unlock()
+
+	allowed := make(map[uint]map[uint]struct{}, len(systemsMap))
+	for _, sys := range systemsMap {
+		var sysId uint
+		switch v := sys["id"].(type) {
+		case uint:
+			sysId = v
+		case uint64:
+			sysId = uint(v)
+		case int:
+			sysId = uint(v)
+		case float64:
+			sysId = uint(v)
+		default:
+			continue
+		}
+		tgSet := make(map[uint]struct{})
+		switch tgs := sys["talkgroups"].(type) {
+		case TalkgroupsMap:
+			for _, tg := range tgs {
+				switch id := tg["id"].(type) {
+				case uint:
+					tgSet[id] = struct{}{}
+				case uint64:
+					tgSet[uint(id)] = struct{}{}
+				case int:
+					tgSet[uint(id)] = struct{}{}
+				case float64:
+					tgSet[uint(id)] = struct{}{}
 				}
 			}
 		}
+		allowed[sysId] = tgSet
 	}
 
-	return false
+	for sysId, tgs := range livefeed.Matrix {
+		allowedTgs, sysOk := allowed[sysId]
+		for tgId, on := range tgs {
+			if !on {
+				continue
+			}
+			if !sysOk {
+				livefeed.Matrix[sysId][tgId] = false
+				continue
+			}
+			if _, ok := allowedTgs[tgId]; !ok {
+				livefeed.Matrix[sysId][tgId] = false
+			}
+		}
+	}
 }

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -49,11 +50,17 @@ type Client struct {
 	SystemsMap  SystemsMap
 	request     *http.Request
 	FCMToken    string // Set via the "FCM" WS command; links this session to a push token.
+	// ConnectedAt is set when the client is registered in Clients.Map.
+	ConnectedAt time.Time
 
 	// DownloadTimestamps tracks when each audio download was requested by this
 	// client, used for sliding-window rate limiting.
 	DownloadTimestamps []time.Time
 	downloadMu         sync.Mutex
+
+	// EmitDedupe suppresses repeat livefeed streams when the same PTT lands as
+	// separate calls on different talkgroups (universal; any system).
+	EmitDedupe EmitDedupe
 }
 
 // IsDownloadRateLimited returns true if the client has exceeded the configured
@@ -306,18 +313,20 @@ func (client *Client) SendConfig(groups *Groups, options *Options, systems *Syst
 	client.GroupsMap = groups.GetGroupsMap(&client.SystemsMap)
 	client.TagsData = tags.GetTagsData(&client.SystemsMap)
 	client.TagsMap = tags.GetTagsMap(&client.SystemsMap)
+	client.Livefeed.ScrubToScopedSystems(client.SystemsMap)
 
 	// Get the user's group pricing options if user is authenticated and has a group
 	var pricingOptions []PricingOption
-	if client.User != nil {
+	autoEnableNewTalkgroups := false
+	if client.User != nil && client.Controller != nil {
+		for _, userGroup := range client.Controller.userGroups(client.User) {
+			if userGroup != nil && userGroup.AutoEnableNewTalkgroups {
+				autoEnableNewTalkgroups = true
+			}
+		}
 		if client.User.UserGroupId > 0 {
-			if client.Controller != nil {
-				userGroup := client.Controller.UserGroups.Get(client.User.UserGroupId)
-				if userGroup != nil {
-					if userGroup.BillingEnabled {
-						pricingOptions = userGroup.GetPricingOptions()
-					}
-				}
+			if userGroup := client.Controller.UserGroups.Get(client.User.UserGroupId); userGroup != nil && userGroup.BillingEnabled {
+				pricingOptions = userGroup.GetPricingOptions()
 			}
 		}
 	}
@@ -339,13 +348,16 @@ func (client *Client) SendConfig(groups *Groups, options *Options, systems *Syst
 			"stripePublishableKey":    options.StripePublishableKey,
 			"pricingOptions":          pricingOptions,
 			"baseUrl":                 options.BaseUrl,
+			"uiAccentColor":           options.UIAccentColor,
 			"transcriptionEnabled":    options.TranscriptionConfig.Enabled,
+			"incidentMappingEnabled":  options.MappingIntegration.IncidentMappingEnabled,
 			// Audio encryption: clients need the relay URL and client token to
 			// perform their own ECDH key exchange. The raw AES key is never sent here.
 			// The client token is auto-fetched from the relay using the server's API key.
-			"audioEncryptionEnabled": options.AudioEncryptionEnabled,
-			"relayServerURL":         options.RelayServerURL,
-			"audioClientToken":       client.Controller.AudioClientToken,
+			"audioEncryptionEnabled":    options.AudioEncryptionEnabled,
+			"relayServerURL":            getRelayServerURL(),
+			"audioClientToken":          client.Controller.AudioClientToken,
+			"autoEnableNewTalkgroups":   autoEnableNewTalkgroups,
 		},
 		"playbackGoesLive":   options.PlaybackGoesLive,
 		"showListenersCount": options.ShowListenersCount,
@@ -353,36 +365,56 @@ func (client *Client) SendConfig(groups *Groups, options *Options, systems *Syst
 		"tags":               client.TagsMap,
 		"tagsData":           client.TagsData,
 		"time12hFormat":      options.Time12hFormat,
+		"timeZone":           options.TimeZone,
 	}
 
 	// Include user settings if user is authenticated
-	if client.User != nil && client.User.Settings != "" {
-		var userSettings map[string]interface{}
-		if err := json.Unmarshal([]byte(client.User.Settings), &userSettings); err == nil {
-			payload["userSettings"] = userSettings
+	if client.User != nil {
+		payload["publicApiEnabled"] = client.User.PublicApiEnabled
+		payload["publicApiCapabilities"] = client.User.PublicApiCaps()
+		if client.User.Settings != "" {
+			var userSettings map[string]interface{}
+			if err := json.Unmarshal([]byte(client.User.Settings), &userSettings); err == nil {
+				payload["userSettings"] = userSettings
+			}
 		}
 	}
 
-	// Non-blocking send to prevent deadlock
+	// Non-blocking send to prevent deadlock; config is critical so retry briefly.
+	client.sendMessage(&Message{Command: MessageCommandConfig, Payload: payload}, 3*time.Second)
+}
+
+// sendMessage enqueues a websocket message. Most traffic is best-effort; critical
+// messages (config) wait up to maxWait rather than being dropped silently.
+func (client *Client) sendMessage(msg *Message, maxWait time.Duration) {
+	if client.Send == nil || msg == nil {
+		return
+	}
 	select {
-	case client.Send <- &Message{Command: MessageCommandConfig, Payload: payload}:
-		// Message sent successfully
+	case client.Send <- msg:
+		return
 	default:
-		// Channel full, skip to avoid blocking
+	}
+	if maxWait <= 0 {
+		return
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case client.Send <- msg:
+	case <-timer.C:
+		if client.Controller != nil {
+			client.Controller.Logs.LogEvent(LogLevelWarn,
+				fmt.Sprintf("dropped websocket %s message to ip %s (send channel full)", msg.Command, client.GetRemoteAddr()))
+		}
 	}
 }
 
 func (client *Client) SendListenersCount(count int) {
-	// Non-blocking send to prevent deadlock
-	select {
-	case client.Send <- &Message{
+	client.sendMessage(&Message{
 		Command: MessagecommandListenersCount,
 		Payload: count,
-	}:
-		// Message sent successfully
-	default:
-		// Channel full, skip to avoid blocking
-	}
+	}, 0)
 }
 
 type Clients struct {
@@ -453,6 +485,9 @@ func (clients *Clients) Add(client *Client) {
 	clients.mutex.Lock()
 	defer clients.mutex.Unlock()
 
+	if client != nil && client.ConnectedAt.IsZero() {
+		client.ConnectedAt = time.Now().UTC()
+	}
 	clients.Map[client] = true
 }
 
@@ -460,29 +495,49 @@ func (clients *Clients) Count() int {
 	return len(clients.Map)
 }
 
-func (clients *Clients) EmitCall(controller *Controller, call *Call) {
+// EmitIncidentUpdate notifies connected clients that incident mapping finished
+// for a call (map pin / alert location icon refresh). Does not require livefeed.
+func (clients *Clients) EmitIncidentUpdate(controller *Controller, call *Call, payload map[string]any) {
+	if controller == nil || call == nil || call.System == nil || call.Talkgroup == nil || payload == nil {
+		return
+	}
 	clients.mutex.Lock()
-	defer clients.mutex.Unlock()
-
+	var targets []*Client
 	restricted := controller.requiresUserAuth()
-	msg := &Message{Command: MessageCommandCall, Payload: call}
-
 	for c := range clients.Map {
-		if !c.Livefeed.IsEnabled(call) {
-			continue
-		}
-
 		if restricted {
-			// Check user access
 			if c.User == nil || !controller.userHasAccess(c.User, call) {
 				continue
 			}
 		}
+		targets = append(targets, c)
+	}
+	clients.mutex.Unlock()
 
-		if controller.Delayer.CanDelayForClient(call, c) {
-			controller.Delayer.DelayForClient(call, c)
+	msg := &Message{Command: MessageCommandIncident, Payload: payload}
+	for _, c := range targets {
+		select {
+		case c.Send <- msg:
+		default:
+		}
+	}
+}
+
+func (clients *Clients) EmitCall(controller *Controller, call *Call) {
+	clients.mutex.Lock()
+	defer clients.mutex.Unlock()
+
+	for c := range clients.Map {
+		presented := controller.prepareCallEmit(call, c)
+		if presented == nil {
+			continue
+		}
+
+		if controller.Delayer.CanDelayForClient(presented, c) {
+			controller.Delayer.DelayForClient(presented, c)
 		} else {
 			// Non-blocking send to prevent deadlock
+			msg := &Message{Command: MessageCommandCall, Payload: presented}
 			select {
 			case c.Send <- msg:
 				// Message sent successfully
@@ -508,21 +563,12 @@ func (clients *Clients) EmitConfig(controller *Controller) {
 	showListenersCount := controller.Options.ShowListenersCount
 
 	for c := range clients.Map {
-		if restricted {
-			if c.User == nil {
-				msg := &Message{Command: MessageCommandPin}
-				// Non-blocking send to prevent deadlock
-				select {
-				case c.Send <- msg:
-				default:
-					// Skip if channel full
-				}
-			} else {
-				c.SendConfig(controller.Groups, controller.Options, controller.Systems, controller.Tags)
-			}
-		} else {
-			c.SendConfig(controller.Groups, controller.Options, controller.Systems, controller.Tags)
+		if restricted && c.User == nil {
+			// Don't PIN-poke unauthenticated clients on every config broadcast
+			// (incoming calls). They already get a PIN challenge from CFG.
+			continue
 		}
+		c.SendConfig(controller.Groups, controller.Options, controller.Systems, controller.Tags)
 
 		if showListenersCount {
 			c.SendListenersCount(count)
@@ -538,6 +584,141 @@ func (clients *Clients) EmitListenersCount() {
 
 	for c := range clients.Map {
 		c.SendListenersCount(count)
+	}
+}
+
+// ListenerDeviceSnapshot is one live WebSocket session for the admin roster.
+type ListenerDeviceSnapshot struct {
+	IP             string    `json:"ip"`
+	ClientKind     string    `json:"clientKind"` // "web" | "mobile"
+	LivefeedActive bool      `json:"livefeedActive"`
+	ConnectedAt    time.Time `json:"connectedAt"`
+	PinExpired     bool      `json:"pinExpired"`
+}
+
+// ListenerUserSnapshot groups one user's live sessions (or anonymous sockets).
+type ListenerUserSnapshot struct {
+	UserId      uint64                   `json:"userId"`
+	Email       string                   `json:"email"`
+	FirstName   string                   `json:"firstName"`
+	LastName    string                   `json:"lastName"`
+	Anonymous   bool                     `json:"anonymous,omitempty"`
+	DeviceCount int                      `json:"deviceCount"`
+	Devices     []ListenerDeviceSnapshot `json:"devices"`
+}
+
+// ListenersSnapshot is the admin-facing live listeners roster.
+type ListenersSnapshot struct {
+	TotalConnections     int                    `json:"totalConnections"`
+	UniqueUsers          int                    `json:"uniqueUsers"`
+	AnonymousConnections int                    `json:"anonymousConnections"`
+	Listeners            []ListenerUserSnapshot `json:"listeners"`
+}
+
+// SnapshotListeners builds a grouped roster of live WebSocket clients.
+// PIN and FCM tokens are never included.
+func (clients *Clients) SnapshotListeners() ListenersSnapshot {
+	clients.mutex.Lock()
+	defer clients.mutex.Unlock()
+
+	type group struct {
+		user    *User
+		anon    bool
+		devices []ListenerDeviceSnapshot
+	}
+
+	byUser := map[uint64]*group{}
+	var anonGroup *group
+	total := 0
+	anonCount := 0
+
+	for c := range clients.Map {
+		if c == nil {
+			continue
+		}
+		total++
+
+		ip := ""
+		if c.request != nil {
+			ip = GetRemoteAddr(c.request)
+		}
+		kind := "web"
+		if c.FCMToken != "" {
+			kind = "mobile"
+		}
+		live := c.Livefeed != nil && !c.Livefeed.IsAllOff()
+		connectedAt := c.ConnectedAt
+		if connectedAt.IsZero() {
+			connectedAt = time.Now().UTC()
+		}
+		dev := ListenerDeviceSnapshot{
+			IP:             ip,
+			ClientKind:     kind,
+			LivefeedActive: live,
+			ConnectedAt:    connectedAt.UTC(),
+			PinExpired:     c.PinExpired,
+		}
+
+		if c.User != nil && c.User.Id > 0 {
+			g := byUser[c.User.Id]
+			if g == nil {
+				g = &group{user: c.User}
+				byUser[c.User.Id] = g
+			}
+			g.devices = append(g.devices, dev)
+			continue
+		}
+
+		anonCount++
+		if anonGroup == nil {
+			anonGroup = &group{anon: true}
+		}
+		anonGroup.devices = append(anonGroup.devices, dev)
+	}
+
+	sortDevices := func(devs []ListenerDeviceSnapshot) {
+		sort.Slice(devs, func(i, j int) bool {
+			return devs[i].ConnectedAt.After(devs[j].ConnectedAt)
+		})
+	}
+
+	listeners := make([]ListenerUserSnapshot, 0, len(byUser)+1)
+	for _, g := range byUser {
+		sortDevices(g.devices)
+		u := g.user
+		listeners = append(listeners, ListenerUserSnapshot{
+			UserId:      u.Id,
+			Email:       u.Email,
+			FirstName:   u.FirstName,
+			LastName:    u.LastName,
+			DeviceCount: len(g.devices),
+			Devices:     g.devices,
+		})
+	}
+
+	sort.Slice(listeners, func(i, j int) bool {
+		ai := strings.ToLower(strings.TrimSpace(listeners[i].LastName + " " + listeners[i].FirstName + " " + listeners[i].Email))
+		aj := strings.ToLower(strings.TrimSpace(listeners[j].LastName + " " + listeners[j].FirstName + " " + listeners[j].Email))
+		if ai == aj {
+			return listeners[i].UserId < listeners[j].UserId
+		}
+		return ai < aj
+	})
+
+	if anonGroup != nil && len(anonGroup.devices) > 0 {
+		sortDevices(anonGroup.devices)
+		listeners = append(listeners, ListenerUserSnapshot{
+			Anonymous:   true,
+			DeviceCount: len(anonGroup.devices),
+			Devices:     anonGroup.devices,
+		})
+	}
+
+	return ListenersSnapshot{
+		TotalConnections:     total,
+		UniqueUsers:          len(byUser),
+		AnonymousConnections: anonCount,
+		Listeners:            listeners,
 	}
 }
 
@@ -604,7 +785,7 @@ func (clients *Clients) RefreshConfigForGroup(controller *Controller, groupId ui
 	count := len(clients.Map)
 
 	for c := range clients.Map {
-		if c.User != nil && c.User.UserGroupId == groupId {
+		if c.User != nil && c.User.IsMemberOf(groupId) {
 			if restricted {
 				if c.User == nil {
 					// Non-blocking send to prevent deadlock

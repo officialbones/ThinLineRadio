@@ -40,12 +40,31 @@ type System struct {
 	Units                   *Units
 	NoAudioAlertsEnabled    bool    // Enable no-audio alerts for this system
 	NoAudioThresholdMinutes uint    // Minutes without audio before alerting
+	RetentionDays           uint    // Days to retain calls; 0 = use global pruneDays
+	DuplicateDetectionEnabled bool  // Per-system duplicate suppression; default true when global is on
 	AlertsEnabled           bool    // Admin toggle: false suppresses all alerts & transcription for this system
 	// When true (default), talkgroups created by auto-populate get alertsEnabled true; when false, they are created with alerts off.
 	AutoPopulateAlertsEnabled bool `json:"autoPopulateAlertsEnabled"`
 	// When true, heard unit refs + labels from calls are merged into this system's unit list (independent of AutoPopulate).
 	AutoPopulateUnits bool `json:"autoPopulateUnits"`
 	TranscriptionPrompt string // Custom Whisper/AssemblyAI prompt; overrides the global prompt when non-empty
+	// When true, talkgroups with autoLearnToneSets may observe paging patterns for admin review emails.
+	AutoLearnToneSets              bool     `json:"autoLearnToneSets"`
+	AutoLearnToneSetsTagIds        []uint64 `json:"autoLearnToneSetsTagIds"`
+	AutoLearnToneSetsAutoOffDays   uint     `json:"autoLearnToneSetsAutoOffDays"`
+	AutoLearnToneSetsExpiresAt     int64    `json:"autoLearnToneSetsExpiresAt"`
+	// Bulk tone detection rollout: enable tone detection on talkgroups with selected tags.
+	BulkToneDetectionEnabled     bool     `json:"bulkToneDetectionEnabled"`
+	BulkToneDetectionTagIds      []uint64 `json:"bulkToneDetectionTagIds"`
+	// Deprecated: bulk tone detection no longer auto-expires; kept for DB compat.
+	BulkToneDetectionAutoOffDays uint  `json:"bulkToneDetectionAutoOffDays"`
+	BulkToneDetectionExpiresAt   int64 `json:"bulkToneDetectionExpiresAt"`
+	// When true, talkgroups with autoLearnUnitAliases may learn radio unitRef → label mappings.
+	AutoLearnUnitAliases            bool     `json:"autoLearnUnitAliases"`
+	AutoLearnUnitAliasesTagIds      []uint64 `json:"autoLearnUnitAliasesTagIds"`
+	AutoLearnUnitAliasesAutoOffDays uint     `json:"autoLearnUnitAliasesAutoOffDays"` // 0 = no auto-off
+	AutoLearnUnitAliasesExpiresAt   int64    `json:"autoLearnUnitAliasesExpiresAt"`   // unix ms
+	IncidentMapping                 IncidentMappingConfig `json:"incidentMapping"`
 }
 
 func NewSystem() *System {
@@ -130,6 +149,18 @@ func (system *System) FromMap(m map[string]any) *System {
 		system.NoAudioThresholdMinutes = 30 // Default to 30 minutes
 	}
 
+	switch v := m["retentionDays"].(type) {
+	case float64:
+		system.RetentionDays = uint(v)
+	}
+
+	switch v := m["duplicateDetectionEnabled"].(type) {
+	case bool:
+		system.DuplicateDetectionEnabled = v
+	default:
+		system.DuplicateDetectionEnabled = true
+	}
+
 	// Parse alertsEnabled (defaults to true — no change in behaviour for existing data)
 	switch v := m["alertsEnabled"].(type) {
 	case bool:
@@ -158,6 +189,79 @@ func (system *System) FromMap(m map[string]any) *System {
 	switch v := m["transcriptionPrompt"].(type) {
 	case string:
 		system.TranscriptionPrompt = v
+	}
+
+	switch v := m["autoLearnToneSets"].(type) {
+	case bool:
+		system.AutoLearnToneSets = v
+	}
+	switch v := m["autoLearnToneSetsAutoOffDays"].(type) {
+	case float64:
+		system.AutoLearnToneSetsAutoOffDays = uint(v)
+	}
+	switch v := m["autoLearnToneSetsExpiresAt"].(type) {
+	case float64:
+		system.AutoLearnToneSetsExpiresAt = int64(v)
+	}
+	switch v := m["autoLearnToneSetsTagIds"].(type) {
+	case []any:
+		for _, item := range v {
+			if f, ok := item.(float64); ok && f > 0 {
+				system.AutoLearnToneSetsTagIds = append(system.AutoLearnToneSetsTagIds, uint64(f))
+			}
+		}
+	case string:
+		system.AutoLearnToneSetsTagIds = parseBulkToneTagIds(v)
+	}
+
+	switch v := m["bulkToneDetectionEnabled"].(type) {
+	case bool:
+		system.BulkToneDetectionEnabled = v
+	}
+	switch v := m["bulkToneDetectionAutoOffDays"].(type) {
+	case float64:
+		system.BulkToneDetectionAutoOffDays = uint(v)
+	}
+	switch v := m["bulkToneDetectionExpiresAt"].(type) {
+	case float64:
+		system.BulkToneDetectionExpiresAt = int64(v)
+	}
+	switch v := m["bulkToneDetectionTagIds"].(type) {
+	case []any:
+		for _, item := range v {
+			if f, ok := item.(float64); ok && f > 0 {
+				system.BulkToneDetectionTagIds = append(system.BulkToneDetectionTagIds, uint64(f))
+			}
+		}
+	case string:
+		system.BulkToneDetectionTagIds = parseBulkToneTagIds(v)
+	}
+
+	switch v := m["autoLearnUnitAliases"].(type) {
+	case bool:
+		system.AutoLearnUnitAliases = v
+	}
+	switch v := m["autoLearnUnitAliasesAutoOffDays"].(type) {
+	case float64:
+		system.AutoLearnUnitAliasesAutoOffDays = uint(v)
+	}
+	switch v := m["autoLearnUnitAliasesExpiresAt"].(type) {
+	case float64:
+		system.AutoLearnUnitAliasesExpiresAt = int64(v)
+	}
+	switch v := m["autoLearnUnitAliasesTagIds"].(type) {
+	case []any:
+		for _, item := range v {
+			if f, ok := item.(float64); ok && f > 0 {
+				system.AutoLearnUnitAliasesTagIds = append(system.AutoLearnUnitAliasesTagIds, uint64(f))
+			}
+		}
+	case string:
+		system.AutoLearnUnitAliasesTagIds = parseBulkToneTagIds(v)
+	}
+
+	if v, ok := m["incidentMapping"].(map[string]any); ok {
+		applyIncidentMappingFromMap(&system.IncidentMapping, v)
 	}
 
 	return system
@@ -196,6 +300,12 @@ func (system *System) MarshalJSON() ([]byte, error) {
 	// Always include noAudioThresholdMinutes
 	m["noAudioThresholdMinutes"] = system.NoAudioThresholdMinutes
 
+	if system.RetentionDays > 0 {
+		m["retentionDays"] = system.RetentionDays
+	}
+
+	m["duplicateDetectionEnabled"] = system.DuplicateDetectionEnabled
+
 	// Always include alertsEnabled
 	m["alertsEnabled"] = system.AlertsEnabled
 
@@ -207,6 +317,28 @@ func (system *System) MarshalJSON() ([]byte, error) {
 
 	// Always include transcriptionPrompt (empty string is valid — means "use global")
 	m["transcriptionPrompt"] = system.TranscriptionPrompt
+
+	m["autoLearnToneSets"] = system.AutoLearnToneSets
+	m["autoLearnToneSetsTagIds"] = system.AutoLearnToneSetsTagIds
+	m["autoLearnToneSetsAutoOffDays"] = system.AutoLearnToneSetsAutoOffDays
+	if system.AutoLearnToneSetsExpiresAt > 0 {
+		m["autoLearnToneSetsExpiresAt"] = system.AutoLearnToneSetsExpiresAt
+	}
+	m["bulkToneDetectionEnabled"] = system.BulkToneDetectionEnabled
+	m["bulkToneDetectionTagIds"] = system.BulkToneDetectionTagIds
+	m["bulkToneDetectionAutoOffDays"] = system.BulkToneDetectionAutoOffDays
+	if system.BulkToneDetectionExpiresAt > 0 {
+		m["bulkToneDetectionExpiresAt"] = system.BulkToneDetectionExpiresAt
+	}
+
+	m["autoLearnUnitAliases"] = system.AutoLearnUnitAliases
+	m["autoLearnUnitAliasesTagIds"] = system.AutoLearnUnitAliasesTagIds
+	m["autoLearnUnitAliasesAutoOffDays"] = system.AutoLearnUnitAliasesAutoOffDays
+	if system.AutoLearnUnitAliasesExpiresAt > 0 {
+		m["autoLearnUnitAliasesExpiresAt"] = system.AutoLearnUnitAliasesExpiresAt
+	}
+
+	m["incidentMapping"] = incidentMappingToMap(system.IncidentMapping)
 
 	return json.Marshal(m)
 }
@@ -317,35 +449,49 @@ func (systems *Systems) GetScopedSystems(client *Client, groups *Groups, tags *T
 
 	user := client.User
 
-	// Get user's group if they belong to one
-	var userGroup *UserGroup
-	if user != nil && user.UserGroupId > 0 && client.Controller != nil {
-		userGroup = client.Controller.UserGroups.Get(user.UserGroupId)
+	// Resolve all of the user's group memberships; visible scope is the UNION.
+	var memberGroups []*UserGroup
+	if user != nil && client.Controller != nil {
+		memberGroups = client.Controller.userGroups(user)
 	}
 
-	// Helper function to check if a system is allowed
+	// Helper: a system is allowed when the user has no groups, or ANY group grants it.
 	isSystemAllowed := func(systemRef uint) bool {
-		// If user belongs to a group, check group access first
-		if userGroup != nil {
-			return userGroup.HasSystemAccess(uint64(systemRef))
+		if len(memberGroups) == 0 {
+			return true
 		}
-		// No group restrictions
-		return true
+		for _, g := range memberGroups {
+			if g.HasSystemAccess(uint64(systemRef)) {
+				return true
+			}
+		}
+		return false
 	}
 
-	// Helper function to filter talkgroups based on group restrictions
+	// Helper: a talkgroup is allowed when the user has no groups, or ANY group grants it.
+	groupAllowsTalkgroup := func(systemRef uint, talkgroupRef uint) bool {
+		if len(memberGroups) == 0 {
+			return true
+		}
+		for _, g := range memberGroups {
+			if g.HasTalkgroupAccess(uint64(systemRef), talkgroupRef) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Helper function to filter talkgroups based on group restrictions (union)
 	filterTalkgroupsByGroup := func(system *System) *System {
-		// If no group restrictions, return system as-is
-		if userGroup == nil {
+		if len(memberGroups) == 0 {
 			return system
 		}
 
-		// Filter talkgroups based on group access
 		filteredSystem := *system
 		filteredSystem.Talkgroups = NewTalkgroups()
 
 		for _, tg := range system.Talkgroups.List {
-			if userGroup.HasTalkgroupAccess(uint64(system.SystemRef), tg.TalkgroupRef) {
+			if groupAllowsTalkgroup(system.SystemRef, tg.TalkgroupRef) {
 				filteredSystem.Talkgroups.List = append(filteredSystem.Talkgroups.List, tg)
 			}
 		}
@@ -430,8 +576,8 @@ func (systems *Systems) GetScopedSystems(client *Client, groups *Groups, tags *T
 							if !ok {
 								continue
 							}
-							// Check group access for this talkgroup
-							if userGroup != nil && !userGroup.HasTalkgroupAccess(uint64(system.SystemRef), rawTalkgroup.TalkgroupRef) {
+							// Check group access for this talkgroup (union across groups)
+							if !groupAllowsTalkgroup(system.SystemRef, rawTalkgroup.TalkgroupRef) {
 								continue
 							}
 							rawSystem.Talkgroups.List = append(rawSystem.Talkgroups.List, rawTalkgroup)
@@ -463,6 +609,12 @@ func (systems *Systems) GetScopedSystems(client *Client, groups *Groups, tags *T
 
 			if len(groupLabels) > 0 {
 				groupLabel = groupLabels[0]
+			}
+
+			// Hidden talkgroups are removed from the channel list shown to users.
+			// The row (and its calls, transcripts and alerts) stays in the database.
+			if rawTalkgroup.Hidden {
+				continue
 			}
 
 			tag, ok := tags.GetTagById(rawTalkgroup.TagId)
@@ -578,7 +730,7 @@ func (systems *Systems) Read(db *Database) error {
 	formatError := errorFormatter("systems", "read")
 
 	// --- Query 1: systems ---
-	query := `SELECT "systemId", "autoPopulate", "blacklists", "delay", "label", "order", "systemRef", "type", "preferredApiKeyId", "noAudioAlertsEnabled", "noAudioThresholdMinutes", "alertsEnabled", "autoPopulateAlertsEnabled", "autoPopulateUnits", "transcriptionPrompt" FROM "systems"`
+	query := `SELECT "systemId", "autoPopulate", "blacklists", "delay", "label", "order", "systemRef", "type", "preferredApiKeyId", "noAudioAlertsEnabled", "noAudioThresholdMinutes", "retentionDays", "duplicateDetectionEnabled", "alertsEnabled", "autoPopulateAlertsEnabled", "autoPopulateUnits", "transcriptionPrompt", "autoLearnToneSets", "autoLearnToneSetsTagIds", "autoLearnToneSetsAutoOffDays", "autoLearnToneSetsExpiresAt", "bulkToneDetectionEnabled", "bulkToneDetectionTagIds", "bulkToneDetectionAutoOffDays", "bulkToneDetectionExpiresAt", "autoLearnUnitAliases", "autoLearnUnitAliasesTagIds", "autoLearnUnitAliasesAutoOffDays", "autoLearnUnitAliasesExpiresAt" FROM "systems"`
 	rows, err := db.Sql.Query(query)
 	if err != nil {
 		return formatError(err, query)
@@ -589,9 +741,15 @@ func (systems *Systems) Read(db *Database) error {
 	for rows.Next() {
 		system := NewSystem()
 		var preferredApiKeyUnused sql.NullInt64
-		if err = rows.Scan(&system.Id, &system.AutoPopulate, &system.Blacklists, &system.Delay, &system.Label, &system.Order, &system.SystemRef, &system.Kind, &preferredApiKeyUnused, &system.NoAudioAlertsEnabled, &system.NoAudioThresholdMinutes, &system.AlertsEnabled, &system.AutoPopulateAlertsEnabled, &system.AutoPopulateUnits, &system.TranscriptionPrompt); err != nil {
+		var bulkTagIdsJson string
+		var toneLearnTagIdsJson string
+		var unitLearnTagIdsJson string
+		if err = rows.Scan(&system.Id, &system.AutoPopulate, &system.Blacklists, &system.Delay, &system.Label, &system.Order, &system.SystemRef, &system.Kind, &preferredApiKeyUnused, &system.NoAudioAlertsEnabled, &system.NoAudioThresholdMinutes, &system.RetentionDays, &system.DuplicateDetectionEnabled, &system.AlertsEnabled, &system.AutoPopulateAlertsEnabled, &system.AutoPopulateUnits, &system.TranscriptionPrompt, &system.AutoLearnToneSets, &toneLearnTagIdsJson, &system.AutoLearnToneSetsAutoOffDays, &system.AutoLearnToneSetsExpiresAt, &system.BulkToneDetectionEnabled, &bulkTagIdsJson, &system.BulkToneDetectionAutoOffDays, &system.BulkToneDetectionExpiresAt, &system.AutoLearnUnitAliases, &unitLearnTagIdsJson, &system.AutoLearnUnitAliasesAutoOffDays, &system.AutoLearnUnitAliasesExpiresAt); err != nil {
 			return formatError(err, query)
 		}
+		system.AutoLearnToneSetsTagIds = parseBulkToneTagIds(toneLearnTagIdsJson)
+		system.BulkToneDetectionTagIds = parseBulkToneTagIds(bulkTagIdsJson)
+		system.AutoLearnUnitAliasesTagIds = parseBulkToneTagIds(unitLearnTagIdsJson)
 		systems.List = append(systems.List, system)
 		systemById[system.Id] = system
 	}
@@ -641,9 +799,9 @@ func (systems *Systems) Read(db *Database) error {
 	// --- Query 3: all talkgroups (bulk, no per-system loop) ---
 	var tgQuery string
 	if db.Config.DbType == DbTypePostgresql {
-		tgQuery = `SELECT t."talkgroupId", t."systemId", t."delay", t."frequency", t."label", t."name", t."order", t."tagId", t."talkgroupRef", t."type", t."toneDetectionEnabled", t."toneSets", t."preferredApiKeyId", t."excludeFromPreferredSite", t."toneDownstreamEnabled", t."toneDownstreamURL", t."toneDownstreamAPIKey", t."alertCooldownSeconds", t."linkedVoiceTalkgroupRef", t."linkedVoiceWindowSeconds", t."linkedVoiceMinDurationSeconds", t."alertsEnabled", t."transcriptionPrompt", STRING_AGG(CAST(COALESCE(tg."groupId", 0) AS text), ',') FROM "talkgroups" AS t LEFT JOIN "talkgroupGroups" AS tg ON tg."talkgroupId" = t."talkgroupId" GROUP BY t."talkgroupId", t."systemId", t."preferredApiKeyId", t."excludeFromPreferredSite", t."toneDownstreamEnabled", t."toneDownstreamURL", t."toneDownstreamAPIKey", t."alertCooldownSeconds", t."linkedVoiceTalkgroupRef", t."linkedVoiceWindowSeconds", t."linkedVoiceMinDurationSeconds", t."alertsEnabled", t."transcriptionPrompt" ORDER BY t."systemId", t."order", t."talkgroupId"`
+		tgQuery = `SELECT t."talkgroupId", t."systemId", t."delay", t."frequency", t."label", t."name", t."order", t."tagId", t."talkgroupRef", t."type", t."toneDetectionEnabled", t."toneSets", t."preferredApiKeyId", t."excludeFromPreferredSite", t."toneDownstreamEnabled", t."toneDownstreamURL", t."toneDownstreamAPIKey", t."alertCooldownSeconds", t."linkedVoiceTalkgroupRef", t."linkedVoiceWindowSeconds", t."linkedVoiceMinDurationSeconds", t."alertsEnabled", t."transcriptionPrompt", t."autoLearnToneSets", t."alertingTalkgroup", t."autoLearnUnitAliases", t."retentionDays", t."hidden", COALESCE(t."transcriptionExclude", false), STRING_AGG(CAST(COALESCE(tg."groupId", 0) AS text), ',') FROM "talkgroups" AS t LEFT JOIN "talkgroupGroups" AS tg ON tg."talkgroupId" = t."talkgroupId" GROUP BY t."talkgroupId", t."systemId", t."preferredApiKeyId", t."excludeFromPreferredSite", t."toneDownstreamEnabled", t."toneDownstreamURL", t."toneDownstreamAPIKey", t."alertCooldownSeconds", t."linkedVoiceTalkgroupRef", t."linkedVoiceWindowSeconds", t."linkedVoiceMinDurationSeconds", t."alertsEnabled", t."transcriptionPrompt", t."autoLearnToneSets", t."alertingTalkgroup", t."autoLearnUnitAliases", t."retentionDays", t."hidden", t."transcriptionExclude" ORDER BY t."systemId", t."order", t."talkgroupId"`
 	} else {
-		tgQuery = `SELECT t."talkgroupId", t."systemId", t."delay", t."frequency", t."label", t."name", t."order", t."tagId", t."talkgroupRef", t."type", t."toneDetectionEnabled", t."toneSets", t."preferredApiKeyId", t."excludeFromPreferredSite", t."toneDownstreamEnabled", t."toneDownstreamURL", t."toneDownstreamAPIKey", t."alertCooldownSeconds", t."linkedVoiceTalkgroupRef", t."linkedVoiceWindowSeconds", t."linkedVoiceMinDurationSeconds", t."alertsEnabled", t."transcriptionPrompt", GROUP_CONCAT(COALESCE(tg."groupId", 0)) FROM "talkgroups" AS t LEFT JOIN "talkgroupGroups" AS tg ON tg."talkgroupId" = t."talkgroupId" GROUP BY t."talkgroupId" ORDER BY t."systemId", t."order", t."talkgroupId"`
+		tgQuery = `SELECT t."talkgroupId", t."systemId", t."delay", t."frequency", t."label", t."name", t."order", t."tagId", t."talkgroupRef", t."type", t."toneDetectionEnabled", t."toneSets", t."preferredApiKeyId", t."excludeFromPreferredSite", t."toneDownstreamEnabled", t."toneDownstreamURL", t."toneDownstreamAPIKey", t."alertCooldownSeconds", t."linkedVoiceTalkgroupRef", t."linkedVoiceWindowSeconds", t."linkedVoiceMinDurationSeconds", t."alertsEnabled", t."transcriptionPrompt", t."autoLearnToneSets", t."alertingTalkgroup", t."autoLearnUnitAliases", t."retentionDays", t."hidden", COALESCE(t."transcriptionExclude", 0), GROUP_CONCAT(COALESCE(tg."groupId", 0)) FROM "talkgroups" AS t LEFT JOIN "talkgroupGroups" AS tg ON tg."talkgroupId" = t."talkgroupId" GROUP BY t."talkgroupId" ORDER BY t."systemId", t."order", t."talkgroupId"`
 	}
 
 	tgRows, err := db.Sql.Query(tgQuery)
@@ -660,7 +818,7 @@ func (systems *Systems) Read(db *Database) error {
 		var preferredApiKeyUnused sql.NullInt64
 		var excludePreferredUnused bool
 
-		if err = tgRows.Scan(&talkgroup.Id, &systemId, &talkgroup.Delay, &talkgroup.Frequency, &talkgroup.Label, &talkgroup.Name, &talkgroup.Order, &talkgroup.TagId, &talkgroup.TalkgroupRef, &talkgroup.Kind, &talkgroup.ToneDetectionEnabled, &toneSetsJson, &preferredApiKeyUnused, &excludePreferredUnused, &talkgroup.ToneDownstreamEnabled, &talkgroup.ToneDownstreamURL, &talkgroup.ToneDownstreamAPIKey, &talkgroup.AlertCooldownSeconds, &talkgroup.LinkedVoiceTalkgroupRef, &talkgroup.LinkedVoiceWindowSeconds, &talkgroup.LinkedVoiceMinDurationSeconds, &talkgroup.AlertsEnabled, &talkgroup.TranscriptionPrompt, &groupIds); err != nil {
+		if err = tgRows.Scan(&talkgroup.Id, &systemId, &talkgroup.Delay, &talkgroup.Frequency, &talkgroup.Label, &talkgroup.Name, &talkgroup.Order, &talkgroup.TagId, &talkgroup.TalkgroupRef, &talkgroup.Kind, &talkgroup.ToneDetectionEnabled, &toneSetsJson, &preferredApiKeyUnused, &excludePreferredUnused, &talkgroup.ToneDownstreamEnabled, &talkgroup.ToneDownstreamURL, &talkgroup.ToneDownstreamAPIKey, &talkgroup.AlertCooldownSeconds, &talkgroup.LinkedVoiceTalkgroupRef, &talkgroup.LinkedVoiceWindowSeconds, &talkgroup.LinkedVoiceMinDurationSeconds, &talkgroup.AlertsEnabled, &talkgroup.TranscriptionPrompt, &talkgroup.AutoLearnToneSets, &talkgroup.AlertingTalkgroup, &talkgroup.AutoLearnUnitAliases, &talkgroup.RetentionDays, &talkgroup.Hidden, &talkgroup.TranscriptionExclude, &groupIds); err != nil {
 			return formatError(err, tgQuery)
 		}
 		if toneSetsJson != "" && toneSetsJson != "[]" {
@@ -716,6 +874,13 @@ func (systems *Systems) Read(db *Database) error {
 	sort.Slice(systems.List, func(i, j int) bool {
 		return systems.List[i].Order < systems.List[j].Order
 	})
+
+	if err := systems.loadIncidentMappingConfigs(db); err != nil {
+		return formatError(err, "loadIncidentMappingConfigs")
+	}
+	if err := systems.loadTalkgroupIncidentMappingConfigs(db); err != nil {
+		return formatError(err, "loadTalkgroupIncidentMappingConfigs")
+	}
 
 	return nil
 }
@@ -841,10 +1006,10 @@ func (systems *Systems) Write(db *Database) error {
 		if count == 0 {
 			if system.Id > 0 {
 				// Preserve the explicit ID when inserting
-				query = fmt.Sprintf(`INSERT INTO "systems" ("systemId", "autoPopulate", "blacklists", "delay", "label", "order", "systemRef", "type", "preferredApiKeyId", "noAudioAlertsEnabled", "noAudioThresholdMinutes", "alertsEnabled", "autoPopulateAlertsEnabled", "autoPopulateUnits", "transcriptionPrompt") VALUES (%d, %t, '%s', %d, '%s', %d, %d, '%s', %s, %t, %d, %t, %t, %t, '%s')`, system.Id, system.AutoPopulate, system.Blacklists, system.Delay, escapeQuotes(system.Label), system.Order, system.SystemRef, system.Kind, preferredApiKeyIdSQL, system.NoAudioAlertsEnabled, system.NoAudioThresholdMinutes, system.AlertsEnabled, system.AutoPopulateAlertsEnabled, system.AutoPopulateUnits, escapeQuotes(system.TranscriptionPrompt))
+				query = fmt.Sprintf(`INSERT INTO "systems" ("systemId", "autoPopulate", "blacklists", "delay", "label", "order", "systemRef", "type", "preferredApiKeyId", "noAudioAlertsEnabled", "noAudioThresholdMinutes", "retentionDays", "duplicateDetectionEnabled", "alertsEnabled", "autoPopulateAlertsEnabled", "autoPopulateUnits", "transcriptionPrompt", "autoLearnToneSets", "autoLearnToneSetsTagIds", "autoLearnToneSetsAutoOffDays", "autoLearnToneSetsExpiresAt", "bulkToneDetectionEnabled", "bulkToneDetectionTagIds", "bulkToneDetectionAutoOffDays", "bulkToneDetectionExpiresAt", "autoLearnUnitAliases", "autoLearnUnitAliasesTagIds", "autoLearnUnitAliasesAutoOffDays", "autoLearnUnitAliasesExpiresAt") VALUES (%d, %t, '%s', %d, '%s', %d, %d, '%s', %s, %t, %d, %d, %t, %t, %t, %t, '%s', %t, '%s', %d, %d, %t, '%s', %d, %d, %t, '%s', %d, %d)`, system.Id, system.AutoPopulate, system.Blacklists, system.Delay, escapeQuotes(system.Label), system.Order, system.SystemRef, system.Kind, preferredApiKeyIdSQL, system.NoAudioAlertsEnabled, system.NoAudioThresholdMinutes, system.RetentionDays, system.DuplicateDetectionEnabled, system.AlertsEnabled, system.AutoPopulateAlertsEnabled, system.AutoPopulateUnits, escapeQuotes(system.TranscriptionPrompt), system.AutoLearnToneSets, escapeQuotes(serializeBulkToneTagIds(system.AutoLearnToneSetsTagIds)), system.AutoLearnToneSetsAutoOffDays, system.AutoLearnToneSetsExpiresAt, system.BulkToneDetectionEnabled, escapeQuotes(serializeBulkToneTagIds(system.BulkToneDetectionTagIds)), system.BulkToneDetectionAutoOffDays, system.BulkToneDetectionExpiresAt, system.AutoLearnUnitAliases, escapeQuotes(serializeBulkToneTagIds(system.AutoLearnUnitAliasesTagIds)), system.AutoLearnUnitAliasesAutoOffDays, system.AutoLearnUnitAliasesExpiresAt)
 			} else {
 				// Let database assign auto-increment ID
-				query = fmt.Sprintf(`INSERT INTO "systems" ("autoPopulate", "blacklists", "delay", "label", "order", "systemRef", "type", "preferredApiKeyId", "noAudioAlertsEnabled", "noAudioThresholdMinutes", "alertsEnabled", "autoPopulateAlertsEnabled", "autoPopulateUnits", "transcriptionPrompt") VALUES (%t, '%s', %d, '%s', %d, %d, '%s', %s, %t, %d, %t, %t, %t, '%s')`, system.AutoPopulate, system.Blacklists, system.Delay, escapeQuotes(system.Label), system.Order, system.SystemRef, system.Kind, preferredApiKeyIdSQL, system.NoAudioAlertsEnabled, system.NoAudioThresholdMinutes, system.AlertsEnabled, system.AutoPopulateAlertsEnabled, system.AutoPopulateUnits, escapeQuotes(system.TranscriptionPrompt))
+				query = fmt.Sprintf(`INSERT INTO "systems" ("autoPopulate", "blacklists", "delay", "label", "order", "systemRef", "type", "preferredApiKeyId", "noAudioAlertsEnabled", "noAudioThresholdMinutes", "retentionDays", "duplicateDetectionEnabled", "alertsEnabled", "autoPopulateAlertsEnabled", "autoPopulateUnits", "transcriptionPrompt", "autoLearnToneSets", "autoLearnToneSetsTagIds", "autoLearnToneSetsAutoOffDays", "autoLearnToneSetsExpiresAt", "bulkToneDetectionEnabled", "bulkToneDetectionTagIds", "bulkToneDetectionAutoOffDays", "bulkToneDetectionExpiresAt", "autoLearnUnitAliases", "autoLearnUnitAliasesTagIds", "autoLearnUnitAliasesAutoOffDays", "autoLearnUnitAliasesExpiresAt") VALUES (%t, '%s', %d, '%s', %d, %d, '%s', %s, %t, %d, %d, %t, %t, %t, %t, '%s', %t, '%s', %d, %d, %t, '%s', %d, %d, %t, '%s', %d, %d)`, system.AutoPopulate, system.Blacklists, system.Delay, escapeQuotes(system.Label), system.Order, system.SystemRef, system.Kind, preferredApiKeyIdSQL, system.NoAudioAlertsEnabled, system.NoAudioThresholdMinutes, system.RetentionDays, system.DuplicateDetectionEnabled, system.AlertsEnabled, system.AutoPopulateAlertsEnabled, system.AutoPopulateUnits, escapeQuotes(system.TranscriptionPrompt), system.AutoLearnToneSets, escapeQuotes(serializeBulkToneTagIds(system.AutoLearnToneSetsTagIds)), system.AutoLearnToneSetsAutoOffDays, system.AutoLearnToneSetsExpiresAt, system.BulkToneDetectionEnabled, escapeQuotes(serializeBulkToneTagIds(system.BulkToneDetectionTagIds)), system.BulkToneDetectionAutoOffDays, system.BulkToneDetectionExpiresAt, system.AutoLearnUnitAliases, escapeQuotes(serializeBulkToneTagIds(system.AutoLearnUnitAliasesTagIds)), system.AutoLearnUnitAliasesAutoOffDays, system.AutoLearnUnitAliasesExpiresAt)
 			}
 
 			if db.Config.DbType == DbTypePostgresql {
@@ -876,13 +1041,17 @@ func (systems *Systems) Write(db *Database) error {
 			}
 
 		} else {
-			query = fmt.Sprintf(`UPDATE "systems" SET "autoPopulate" = %t, "blacklists" = '%s', "delay" = %d, "label" = '%s', "order" = %d, "systemRef" = %d, "type" = '%s', "preferredApiKeyId" = %s, "noAudioAlertsEnabled" = %t, "noAudioThresholdMinutes" = %d, "alertsEnabled" = %t, "autoPopulateAlertsEnabled" = %t, "autoPopulateUnits" = %t, "transcriptionPrompt" = '%s' WHERE "systemId" = %d`, system.AutoPopulate, system.Blacklists, system.Delay, escapeQuotes(system.Label), system.Order, system.SystemRef, system.Kind, preferredApiKeyIdSQL, system.NoAudioAlertsEnabled, system.NoAudioThresholdMinutes, system.AlertsEnabled, system.AutoPopulateAlertsEnabled, system.AutoPopulateUnits, escapeQuotes(system.TranscriptionPrompt), system.Id)
+			query = fmt.Sprintf(`UPDATE "systems" SET "autoPopulate" = %t, "blacklists" = '%s', "delay" = %d, "label" = '%s', "order" = %d, "systemRef" = %d, "type" = '%s', "preferredApiKeyId" = %s, "noAudioAlertsEnabled" = %t, "noAudioThresholdMinutes" = %d, "retentionDays" = %d, "duplicateDetectionEnabled" = %t, "alertsEnabled" = %t, "autoPopulateAlertsEnabled" = %t, "autoPopulateUnits" = %t, "transcriptionPrompt" = '%s', "autoLearnToneSets" = %t, "autoLearnToneSetsTagIds" = '%s', "autoLearnToneSetsAutoOffDays" = %d, "autoLearnToneSetsExpiresAt" = %d, "bulkToneDetectionEnabled" = %t, "bulkToneDetectionTagIds" = '%s', "bulkToneDetectionAutoOffDays" = %d, "bulkToneDetectionExpiresAt" = %d, "autoLearnUnitAliases" = %t, "autoLearnUnitAliasesTagIds" = '%s', "autoLearnUnitAliasesAutoOffDays" = %d, "autoLearnUnitAliasesExpiresAt" = %d WHERE "systemId" = %d`, system.AutoPopulate, system.Blacklists, system.Delay, escapeQuotes(system.Label), system.Order, system.SystemRef, system.Kind, preferredApiKeyIdSQL, system.NoAudioAlertsEnabled, system.NoAudioThresholdMinutes, system.RetentionDays, system.DuplicateDetectionEnabled, system.AlertsEnabled, system.AutoPopulateAlertsEnabled, system.AutoPopulateUnits, escapeQuotes(system.TranscriptionPrompt), system.AutoLearnToneSets, escapeQuotes(serializeBulkToneTagIds(system.AutoLearnToneSetsTagIds)), system.AutoLearnToneSetsAutoOffDays, system.AutoLearnToneSetsExpiresAt, system.BulkToneDetectionEnabled, escapeQuotes(serializeBulkToneTagIds(system.BulkToneDetectionTagIds)), system.BulkToneDetectionAutoOffDays, system.BulkToneDetectionExpiresAt, system.AutoLearnUnitAliases, escapeQuotes(serializeBulkToneTagIds(system.AutoLearnUnitAliasesTagIds)), system.AutoLearnUnitAliasesAutoOffDays, system.AutoLearnUnitAliasesExpiresAt, system.Id)
 			if _, err = tx.Exec(query); err != nil {
 				break
 			}
 		}
 
 		query = ""
+
+		system.applyBulkToneDetection()
+		system.applyAutoLearnToneSetsRollout()
+		system.applyAutoLearnUnitAliasesRollout()
 
 		if err = system.Sites.WriteTx(tx, system.Id); err != nil {
 			break
@@ -920,6 +1089,10 @@ func (systems *Systems) Write(db *Database) error {
 		)`
 	if _, err := db.Sql.Exec(cleanupQuery); err != nil {
 		log.Printf("systems.write: cleanup userAlertPreferences failed: %v", err)
+	}
+
+	if err := systems.saveIncidentMappingConfigs(db); err != nil {
+		return formatError(err, "saveIncidentMappingConfigs")
 	}
 
 	return nil

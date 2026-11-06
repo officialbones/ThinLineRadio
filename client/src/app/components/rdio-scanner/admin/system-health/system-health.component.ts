@@ -17,7 +17,7 @@
  * ****************************************************************************
  */
 
-import { Component, OnInit, OnDestroy, ChangeDetectorRef } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectorRef, ChangeDetectionStrategy } from '@angular/core';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { RdioScannerAdminService } from '../admin.service';
 
@@ -48,12 +48,14 @@ export interface FailedCall {
     selector: 'rdio-scanner-admin-system-health',
     styleUrls: ['./system-health.component.scss'],
     templateUrl: './system-health.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
 export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy {
     alerts: SystemAlert[] = [];
     loading = false;
     error: string | null = null;
-    
+
     stats = {
         total: 0,
         critical: 0,
@@ -104,6 +106,23 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
     private saveFeedbackTimeouts: Map<string, any> = new Map();
     private saveFeedbackFields: Set<string> = new Set();
 
+    /** Category keys shown even when empty (Clear). */
+    readonly alertCategoryOrder = [
+        'no_audio',
+        'api_key_no_audio',
+        'sdrtrunk',
+        'tone_detection_issue',
+        'transcription_failure',
+        'other',
+    ] as const;
+
+    /** Expanded categories (collapsed by default). */
+    expandedCategories = new Set<string>();
+
+    /** Cached grouping for the current alerts list. */
+    private groupedAlertsCache: { [key: string]: SystemAlert[] } = {};
+    private groupedAlertKeysCache: string[] = [];
+
     constructor(
         private adminService: RdioScannerAdminService,
         private cdr: ChangeDetectorRef,
@@ -111,6 +130,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
     ) {}
 
     ngOnInit(): void {
+        this.rebuildGroupedAlerts();
         this.loadAlerts();
         this.loadSystemHealthAlertsEnabled();
         this.loadSystemHealthAlertSettings();
@@ -134,29 +154,35 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
     async loadAlerts(): Promise<void> {
         this.loading = true;
         this.error = null;
+        this.cdr.markForCheck();
 
         try {
             const response = await this.adminService.getSystemHealth(100, false);
             this.alerts = response.alerts || [];
             this.updateStats();
+            this.rebuildGroupedAlerts();
             
             // Check if there's a transcription_failure alert and load failed calls
             const transcriptionFailureAlert = this.alerts.find(a => a.alertType === 'transcription_failure' && !a.dismissed);
             if (transcriptionFailureAlert) {
-                this.loadFailedCalls();
+                void this.loadFailedCalls();
             } else {
                 this.failedCalls = [];
             }
         } catch (error: any) {
             this.error = error.message || 'Failed to load system health data';
             this.alerts = [];
+            this.updateStats();
+            this.rebuildGroupedAlerts();
         } finally {
             this.loading = false;
+            this.cdr.markForCheck();
         }
     }
 
     async loadFailedCalls(): Promise<void> {
         this.loadingFailedCalls = true;
+        this.cdr.markForCheck();
         try {
             const response = await this.adminService.getTranscriptionFailures();
             this.failedCalls = response.calls || [];
@@ -165,6 +191,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
             this.failedCalls = [];
         } finally {
             this.loadingFailedCalls = false;
+            this.cdr.markForCheck();
         }
     }
 
@@ -172,6 +199,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
     async loadSystemHealthAlertsEnabled(): Promise<void> {
         try {
             this.systemHealthAlertsEnabled = await this.adminService.getSystemHealthAlertsEnabled();
+            this.cdr.markForCheck();
         } catch (error: any) {
             console.error('Failed to load system health alerts enabled status:', error);
         }
@@ -186,6 +214,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
             console.error('Failed to toggle system health alerts:', error);
             // Revert the toggle on error
             this.systemHealthAlertsEnabled = !newValue;
+            this.cdr.markForCheck();
             alert('Failed to update setting: ' + (error.message || 'Unknown error'));
         }
     }
@@ -210,62 +239,11 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
                 noAudioRepeatMinutes: data.noAudioRepeatMinutes || 30,
                 alertRetentionDays: data.alertRetentionDays || 5
             };
+            this.cdr.markForCheck();
         } catch (error: any) {
             console.error('Failed to load system health alert settings:', error);
         }
     }
-
-    async saveSetting(field: string, value: any): Promise<void> {
-        try {
-            const update: any = {};
-            update[field] = value;
-            await this.adminService.updateSystemHealthAlertSettings(update);
-            (this.settings as any)[field] = value;
-            // Show brief success feedback
-            this.showSaveFeedback(field);
-            // Show success message
-            this.snackBar.open('Setting saved', '', {
-                duration: 2000,
-                horizontalPosition: 'center',
-                verticalPosition: 'bottom',
-                panelClass: ['success-snackbar']
-            });
-            // Trigger change detection to show the feedback icon
-            this.cdr.detectChanges();
-        } catch (error: any) {
-            console.error(`Failed to save ${field}:`, error);
-            this.snackBar.open(`Failed to save setting: ${error.message || 'Unknown error'}`, 'Close', {
-                duration: 4000,
-                horizontalPosition: 'center',
-                verticalPosition: 'bottom',
-                panelClass: ['error-snackbar']
-            });
-        }
-    }
-
-    showSaveFeedback(field: string): void {
-        // Add field to feedback set
-        this.saveFeedbackFields.add(field);
-        
-        // Clear existing timeout for this field
-        if (this.saveFeedbackTimeouts.has(field)) {
-            clearTimeout(this.saveFeedbackTimeouts.get(field));
-        }
-        
-        // Remove feedback after 2 seconds
-        const timeout = setTimeout(() => {
-            this.saveFeedbackFields.delete(field);
-            this.saveFeedbackTimeouts.delete(field);
-            this.cdr.detectChanges();
-        }, 2000);
-        
-        this.saveFeedbackTimeouts.set(field, timeout);
-    }
-
-    hasSaveFeedback(field: string): boolean {
-        return this.saveFeedbackFields.has(field);
-    }
-
 
     async resetFailures(callIds?: number[]): Promise<void> {
         if (!confirm(callIds ? 'Reset selected transcription failures?' : 'Reset all transcription failures from the last 24 hours?')) {
@@ -304,41 +282,118 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
         });
     }
 
-    getGroupedAlerts(): { [key: string]: SystemAlert[] } {
+    private rebuildGroupedAlerts(): void {
         const activeAlerts = this.alerts.filter(a => !a.dismissed);
         const grouped: { [key: string]: SystemAlert[] } = {
-            'no_audio_received': [],
-            'tone_detection_issue': [],
-            'transcription_failure': [],
-            'other': []
+            no_audio: [],
+            no_audio_received: [],
+            api_key_no_audio: [],
+            sdrtrunk: [],
+            tone_detection_issue: [],
+            transcription_failure: [],
+            other: [],
         };
 
         for (const alert of activeAlerts) {
-            if (alert.alertType in grouped) {
+            if (alert.alertType === 'no_audio_received') {
+                grouped['no_audio'].push(alert);
+            } else if (alert.alertType.startsWith('sdrtrunk_')) {
+                grouped['sdrtrunk'].push(alert);
+            } else if (alert.alertType in grouped) {
                 grouped[alert.alertType].push(alert);
             } else {
                 grouped['other'].push(alert);
             }
         }
 
-        // Remove empty groups
-        Object.keys(grouped).forEach(key => {
-            if (grouped[key].length === 0) {
-                delete grouped[key];
-            }
-        });
+        this.groupedAlertsCache = grouped;
+        // Always show known categories; only include "other" when it has alerts.
+        this.groupedAlertKeysCache = this.alertCategoryOrder.filter(
+            (key) => key !== 'other' || grouped['other'].length > 0,
+        );
+    }
 
-        return grouped;
+    getGroupedAlerts(): { [key: string]: SystemAlert[] } {
+        return this.groupedAlertsCache;
     }
 
     getGroupedAlertKeys(): string[] {
-        return Object.keys(this.getGroupedAlerts());
+        return this.groupedAlertKeysCache;
+    }
+
+    getGroupAlerts(groupType: string): SystemAlert[] {
+        return this.groupedAlertsCache[groupType] || [];
+    }
+
+    getGroupCount(groupType: string): number {
+        return this.getGroupAlerts(groupType).length;
+    }
+
+    isCategoryClear(groupType: string): boolean {
+        return this.getGroupCount(groupType) === 0;
+    }
+
+    isCategoryExpanded(groupType: string): boolean {
+        return this.expandedCategories.has(groupType);
+    }
+
+    toggleCategory(groupType: string): void {
+        if (this.isCategoryClear(groupType)) {
+            return;
+        }
+        if (this.expandedCategories.has(groupType)) {
+            this.expandedCategories.delete(groupType);
+        } else {
+            this.expandedCategories.add(groupType);
+        }
+        this.cdr.markForCheck();
+    }
+
+    getGroupHighestSeverity(groupType: string): 'critical' | 'error' | 'warning' | 'info' | 'clear' {
+        const alerts = this.getGroupAlerts(groupType);
+        if (!alerts.length) {
+            return 'clear';
+        }
+        const rank: Record<string, number> = { critical: 4, error: 3, warning: 2, info: 1 };
+        let best: 'critical' | 'error' | 'warning' | 'info' = 'info';
+        let bestRank = 0;
+        for (const alert of alerts) {
+            const r = rank[alert.severity] || 0;
+            if (r > bestRank) {
+                bestRank = r;
+                best = alert.severity as typeof best;
+            }
+        }
+        return best;
+    }
+
+    getGroupStatusLabel(groupType: string): string {
+        const severity = this.getGroupHighestSeverity(groupType);
+        const count = this.getGroupCount(groupType);
+        if (severity === 'clear') {
+            return 'Clear';
+        }
+        if (severity === 'critical') {
+            return count === 1 ? '1 critical' : `${count} critical`;
+        }
+        if (severity === 'error') {
+            return count === 1 ? '1 error' : `${count} errors`;
+        }
+        if (severity === 'warning') {
+            return count === 1 ? '1 warning' : `${count} warnings`;
+        }
+        return count === 1 ? '1 alert' : `${count} alerts`;
     }
 
     getAlertTypeLabel(type: string): string {
         switch (type) {
+            case 'no_audio':
             case 'no_audio_received':
                 return 'No Audio Received';
+            case 'api_key_no_audio':
+                return 'API Key No Uploads';
+            case 'sdrtrunk':
+                return 'SDRTrunk';
             case 'tone_detection_issue':
                 return 'Tone Detection Issues';
             case 'transcription_failure':
@@ -359,6 +414,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
                 verticalPosition: 'bottom',
                 panelClass: ['success-snackbar']
             });
+            this.cdr.markForCheck();
         } catch (error: any) {
             console.error('Failed to dismiss alert:', error);
             this.snackBar.open(`Failed to dismiss alert: ${error.message || 'Unknown error'}`, 'Close', {
@@ -370,9 +426,9 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
         }
     }
 
-    async dismissAllAlertsInGroup(groupType: string): Promise<void> {
-        const groupedAlerts = this.getGroupedAlerts();
-        const alertsInGroup = groupedAlerts[groupType] || [];
+    async dismissAllAlertsInGroup(groupType: string, event?: Event): Promise<void> {
+        event?.stopPropagation();
+        const alertsInGroup = this.getGroupAlerts(groupType);
         
         if (alertsInGroup.length === 0) {
             return;
@@ -399,6 +455,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
                 verticalPosition: 'bottom',
                 panelClass: ['success-snackbar']
             });
+            this.cdr.markForCheck();
         } catch (error: any) {
             console.error('Failed to dismiss alerts:', error);
             this.snackBar.open(`Failed to dismiss alerts: ${error.message || 'Unknown error'}`, 'Close', {
@@ -446,6 +503,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
             this.audioElement.pause();
             this.audioElement = null;
             this.playingCallId = null;
+            this.cdr.markForCheck();
             return;
         }
 
@@ -486,22 +544,26 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
                 URL.revokeObjectURL(blobUrl);
                 this.audioElement = null;
                 this.playingCallId = null;
+                this.cdr.markForCheck();
             };
             audio.onerror = () => {
                 URL.revokeObjectURL(blobUrl);
                 this.audioElement = null;
                 this.playingCallId = null;
+                this.cdr.markForCheck();
                 alert('Failed to play audio');
             };
 
             this.audioElement = audio;
             this.playingCallId = callId;
+            this.cdr.markForCheck();
             await audio.play();
         } catch (error: any) {
             console.error('Failed to play call audio:', error);
             alert('Failed to play audio: ' + (error.message || 'Unknown error'));
             this.audioElement = null;
             this.playingCallId = null;
+            this.cdr.markForCheck();
         }
     }
 
@@ -511,6 +573,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
 
     async loadSystems(): Promise<void> {
         this.loadingSystems = true;
+        this.cdr.markForCheck();
         try {
             const config = await this.adminService.getConfig();
             this.systems = config.systems || [];
@@ -523,6 +586,7 @@ export class RdioScannerAdminSystemHealthComponent implements OnInit, OnDestroy 
             });
         } finally {
             this.loadingSystems = false;
+            this.cdr.markForCheck();
         }
     }
 

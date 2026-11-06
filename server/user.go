@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,10 +53,18 @@ type User struct {
 	StripeCustomerId          string
 	StripeSubscriptionId      string
 	SubscriptionStatus        string
-	UserGroupId               uint64
+	UserGroupId               uint64 // Primary/home group (group-admin role, invitation default, back-compat)
+	UserGroupIds              string // JSON array of all group IDs the user belongs to; always contains UserGroupId
 	IsGroupAdmin              bool
 	SystemAdmin               bool // System administrator flag
+	PublicApiEnabled          bool   // Server owner granted public REST API access
+	PublicApiCapabilities     string // JSON: {"health":true,"transcripts":true,"alertWebhooks":true}
+	PushSystemNoAudioAlerts   bool   // Push for assigned system no-audio alerts (in addition to system admins)
+	PushApiKeyNoAudioAlerts   bool   // Push for assigned API key no-audio alerts (in addition to system admins)
+	SystemNoAudioAlertSystems string // JSON: "*" or [systemId,...] — which systems' no-audio alerts the user can view
+	ApiKeyNoAudioAlertApiKeys string // JSON: "*" or [apiKeyId,...] — which API keys' no-audio alerts the user can view
 	ForcePasswordReset        bool
+	Suspended                 bool   // Admin-suspended: cannot login, connect, or use the service
 	ResetCode                 string
 	ResetCodeExpires          uint64
 	EmailChangeCode           string
@@ -69,6 +78,12 @@ type User struct {
 	systemsData               any
 	systemDelaysMap           map[uint64]uint
 	talkgroupDelaysMap        map[string]uint
+	systemNoAudioAlertIds     map[uint64]bool
+	apiKeyNoAudioAlertIds     map[uint64]bool
+	systemNoAudioAlertAll     bool
+	apiKeyNoAudioAlertAll     bool
+	userGroupIdsList          []uint64 // union membership, primary first (parsed cache)
+	userGroupIdsSet           map[uint64]bool
 }
 
 type Users struct {
@@ -262,6 +277,270 @@ func (u *User) loadSystemScopes() {
 	u.systemsData = parsed
 }
 
+func (u *User) loadNoAudioAlertScopes() {
+	u.systemNoAudioAlertIds = map[uint64]bool{}
+	u.apiKeyNoAudioAlertIds = map[uint64]bool{}
+	u.systemNoAudioAlertAll = false
+	u.apiKeyNoAudioAlertAll = false
+
+	raw := strings.TrimSpace(u.SystemNoAudioAlertSystems)
+	if raw == "*" {
+		u.systemNoAudioAlertAll = true
+	} else if raw != "" && raw != "[]" {
+		u.systemNoAudioAlertIds = parseUserIdListJSON(raw)
+	}
+
+	raw = strings.TrimSpace(u.ApiKeyNoAudioAlertApiKeys)
+	if raw == "*" {
+		u.apiKeyNoAudioAlertAll = true
+	} else if raw != "" && raw != "[]" {
+		u.apiKeyNoAudioAlertIds = parseUserIdListJSON(raw)
+	}
+}
+
+// loadGroupMemberships (re)derives the membership caches from the current
+// UserGroupId + UserGroupIds and rewrites UserGroupIds to its canonical form so
+// the in-memory raw string always matches the caches. Call this on load and
+// before persisting.
+func (u *User) loadGroupMemberships() {
+	u.applyGroupIds(u.canonicalGroupIds())
+}
+
+// canonicalGroupIds derives the authoritative membership list (primary first,
+// remaining ids sorted for determinism) from UserGroupId + the parsed
+// UserGroupIds array:
+//   - 0 and duplicates are dropped;
+//   - if the primary group is set but ABSENT from a non-empty array, the array
+//     is treated as stale from a legacy single-group reassignment and membership
+//     collapses to just the primary (every multi-group mutation keeps the
+//     primary in the array, so absence means the scalar was changed directly);
+//   - otherwise membership = primary first, then the rest of the array.
+func (u *User) canonicalGroupIds() []uint64 {
+	seen := map[uint64]bool{}
+	raw := strings.TrimSpace(u.UserGroupIds)
+	if raw != "" && raw != "[]" {
+		for id := range parseUserIdListJSON(raw) {
+			if id != 0 {
+				seen[id] = true
+			}
+		}
+	}
+	primary := u.UserGroupId
+	if primary == 0 {
+		others := make([]uint64, 0, len(seen))
+		for id := range seen {
+			others = append(others, id)
+		}
+		sort.Slice(others, func(i, j int) bool { return others[i] < others[j] })
+		return others
+	}
+	if len(seen) > 0 && !seen[primary] {
+		return []uint64{primary} // stale array from a legacy scalar reassignment
+	}
+	others := make([]uint64, 0, len(seen))
+	for id := range seen {
+		if id != primary {
+			others = append(others, id)
+		}
+	}
+	sort.Slice(others, func(i, j int) bool { return others[i] < others[j] })
+	return append([]uint64{primary}, others...)
+}
+
+// applyGroupIds writes an already-canonical ordered list into the caches and the
+// raw JSON string.
+func (u *User) applyGroupIds(ordered []uint64) {
+	set := make(map[uint64]bool, len(ordered))
+	for _, id := range ordered {
+		set[id] = true
+	}
+	u.userGroupIdsSet = set
+	u.userGroupIdsList = ordered
+	if len(ordered) == 0 {
+		u.UserGroupIds = ""
+		return
+	}
+	if b, err := json.Marshal(ordered); err == nil {
+		u.UserGroupIds = string(b)
+	}
+}
+
+// GroupIds returns every group the user belongs to, primary first.
+func (u *User) GroupIds() []uint64 {
+	if u == nil {
+		return nil
+	}
+	if u.userGroupIdsSet == nil {
+		u.loadGroupMemberships()
+	}
+	out := make([]uint64, len(u.userGroupIdsList))
+	copy(out, u.userGroupIdsList)
+	return out
+}
+
+// IsMemberOf reports whether the user belongs to the given group.
+func (u *User) IsMemberOf(groupId uint64) bool {
+	if u == nil || groupId == 0 {
+		return false
+	}
+	if u.userGroupIdsSet == nil {
+		u.loadGroupMemberships()
+	}
+	return u.userGroupIdsSet[groupId]
+}
+
+// SetGroupIds replaces the full membership set. Duplicates and 0 are dropped.
+// The primary (UserGroupId) is preserved if still present, else reassigned to
+// the first id (or 0 when empty); the stored order is primary-first.
+func (u *User) SetGroupIds(ids []uint64) {
+	seen := map[uint64]bool{}
+	clean := []uint64{}
+	for _, id := range ids {
+		if id != 0 && !seen[id] {
+			seen[id] = true
+			clean = append(clean, id)
+		}
+	}
+	if u.UserGroupId == 0 || !seen[u.UserGroupId] {
+		if len(clean) > 0 {
+			u.UserGroupId = clean[0]
+		} else {
+			u.UserGroupId = 0
+		}
+	}
+	others := make([]uint64, 0, len(clean))
+	for _, id := range clean {
+		if id != u.UserGroupId {
+			others = append(others, id)
+		}
+	}
+	sort.Slice(others, func(i, j int) bool { return others[i] < others[j] })
+	ordered := []uint64{}
+	if u.UserGroupId != 0 {
+		ordered = append(ordered, u.UserGroupId)
+	}
+	ordered = append(ordered, others...)
+	u.applyGroupIds(ordered)
+}
+
+// AddGroup adds a group to the membership set (primary unchanged).
+func (u *User) AddGroup(groupId uint64) {
+	if groupId == 0 || u.IsMemberOf(groupId) {
+		return
+	}
+	u.SetGroupIds(append(u.GroupIds(), groupId))
+}
+
+// RemoveGroup removes a group; if it was the primary, a remaining group becomes
+// primary (or none when the set empties).
+func (u *User) RemoveGroup(groupId uint64) {
+	if groupId == 0 || !u.IsMemberOf(groupId) {
+		return
+	}
+	next := []uint64{}
+	for _, g := range u.GroupIds() {
+		if g != groupId {
+			next = append(next, g)
+		}
+	}
+	if u.UserGroupId == groupId {
+		u.UserGroupId = 0 // let SetGroupIds choose a new primary
+	}
+	u.SetGroupIds(next)
+}
+
+// SetPrimaryGroup makes groupId the primary/home group, adding it to membership.
+func (u *User) SetPrimaryGroup(groupId uint64) {
+	u.UserGroupId = groupId
+	u.SetGroupIds(append(u.GroupIds(), groupId))
+}
+
+func parseUserIdListJSON(raw string) map[uint64]bool {
+	ids := map[uint64]bool{}
+	var parsed []any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return ids
+	}
+	for _, entry := range parsed {
+		if id, ok := parseUint64FromAny(entry); ok && id > 0 {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+func parseUint64FromAny(v any) (uint64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return uint64(n), true
+	case int:
+		return uint64(n), true
+	case int64:
+		return uint64(n), true
+	case uint64:
+		return n, true
+	case uint:
+		return uint64(n), true
+	case string:
+		if parsed, err := strconv.ParseUint(strings.TrimSpace(n), 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func (u *User) HasSystemNoAudioAlertSystemId(systemId uint64) bool {
+	if u == nil || systemId == 0 {
+		return false
+	}
+	if u.systemNoAudioAlertAll {
+		return true
+	}
+	if u.systemNoAudioAlertIds == nil {
+		u.loadNoAudioAlertScopes()
+	}
+	return u.systemNoAudioAlertIds[systemId]
+}
+
+func (u *User) HasApiKeyNoAudioAlertApiKeyId(apiKeyId uint64) bool {
+	if u == nil || apiKeyId == 0 {
+		return false
+	}
+	if u.apiKeyNoAudioAlertAll {
+		return true
+	}
+	if u.apiKeyNoAudioAlertIds == nil {
+		u.loadNoAudioAlertScopes()
+	}
+	return u.apiKeyNoAudioAlertIds[apiKeyId]
+}
+
+func (u *User) HasAnySystemNoAudioAlertScope() bool {
+	if u == nil {
+		return false
+	}
+	if u.systemNoAudioAlertAll {
+		return true
+	}
+	if u.systemNoAudioAlertIds == nil {
+		u.loadNoAudioAlertScopes()
+	}
+	return len(u.systemNoAudioAlertIds) > 0
+}
+
+func (u *User) HasAnyApiKeyNoAudioAlertScope() bool {
+	if u == nil {
+		return false
+	}
+	if u.apiKeyNoAudioAlertAll {
+		return true
+	}
+	if u.apiKeyNoAudioAlertIds == nil {
+		u.loadNoAudioAlertScopes()
+	}
+	return len(u.apiKeyNoAudioAlertIds) > 0
+}
+
 func (u *User) loadDelayMaps() {
 	u.systemDelaysMap = map[uint64]uint{}
 	u.talkgroupDelaysMap = map[string]uint{}
@@ -404,11 +683,82 @@ func (u *User) HasAccess(call *Call) bool {
 	return false
 }
 
+// HasAnySystemAccess reports whether the user is allowed to access at least one system.
+func (u *User) HasAnySystemAccess() bool {
+	if u == nil {
+		return false
+	}
+	if u.systemsData == nil {
+		return true
+	}
+	switch v := u.systemsData.(type) {
+	case string:
+		return strings.TrimSpace(v) == "" || v == "*"
+	case []any:
+		return len(v) > 0
+	default:
+		return true
+	}
+}
+
+// HasSystemScopeAccess reports whether the user may access the given system (any talkgroup on that system).
+func (u *User) HasSystemScopeAccess(systemRef uint) bool {
+	if u == nil || systemRef == 0 {
+		return false
+	}
+	if u.systemsData == nil {
+		return true
+	}
+	switch v := u.systemsData.(type) {
+	case string:
+		return strings.TrimSpace(v) == "" || v == "*"
+	case []any:
+		for _, scope := range v {
+			scopeMap, ok := scope.(map[string]any)
+			if !ok {
+				continue
+			}
+			idVal, ok := scopeMap["id"]
+			if !ok {
+				continue
+			}
+			var ref uint
+			switch id := idVal.(type) {
+			case float64:
+				ref = uint(id)
+			case string:
+				if parsed, err := strconv.ParseUint(id, 10, 32); err == nil {
+					ref = uint(parsed)
+				}
+			}
+			if ref == systemRef {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
 func (u *User) PinExpired() bool {
 	if u == nil || u.PinExpiresAt == 0 {
 		return false
 	}
 	return uint64(time.Now().Unix()) > u.PinExpiresAt
+}
+
+// IsSuspended reports whether the account has been admin-suspended.
+func (u *User) IsSuspended() bool {
+	return u != nil && u.Suspended
+}
+
+// AccountExpired reports whether AccountExpiresAt is set and in the past.
+func (u *User) AccountExpired() bool {
+	if u == nil || u.AccountExpiresAt == 0 {
+		return false
+	}
+	return uint64(time.Now().Unix()) > u.AccountExpiresAt
 }
 
 func (u *User) EffectiveDelay(call *Call, defaultDelay uint) uint {
@@ -471,6 +821,39 @@ func (u *User) SetCreatedAt() {
 
 func (u *User) UpdateLastLogin() {
 	u.LastLogin = fmt.Sprintf("%d", time.Now().Unix())
+}
+
+// lastLoginPersistInterval avoids rewriting the database on every websocket reconnect.
+const lastLoginPersistInterval = time.Hour
+
+func (u *User) shouldPersistLastLogin() bool {
+	if u == nil {
+		return false
+	}
+	if u.LastLogin == "" || u.LastLogin == "0" {
+		return true
+	}
+	last, err := strconv.ParseInt(u.LastLogin, 10, 64)
+	if err != nil || last <= 0 {
+		return true
+	}
+	return time.Now().Unix()-last >= int64(lastLoginPersistInterval.Seconds())
+}
+
+// RecordLastLogin updates lastLogin in memory and persists a single row when enough
+// time has passed since the previous value (PIN reconnects happen frequently).
+func (users *Users) RecordLastLogin(user *User, db *Database) error {
+	if user == nil || !user.shouldPersistLastLogin() {
+		return nil
+	}
+
+	user.UpdateLastLogin()
+	if err := users.Update(user); err != nil {
+		return err
+	}
+
+	_, err := db.Sql.Exec(`UPDATE "users" SET "lastLogin" = $1 WHERE "userId" = $2`, user.LastLogin, user.Id)
+	return err
 }
 
 func (u *User) GenerateVerificationToken() error {
@@ -599,6 +982,7 @@ func (users *Users) Add(user *User) error {
 
 	user.ensurePinsLoaded()
 	user.loadSystemScopes()
+	user.loadNoAudioAlertScopes()
 	user.loadDelayMaps()
 
 	// For new users, don't store in memory until after database save
@@ -623,6 +1007,8 @@ func (users *Users) Update(user *User) error {
 
 	user.ensurePinsLoaded()
 	user.loadSystemScopes()
+	user.loadNoAudioAlertScopes()
+	user.loadGroupMemberships() // keep the membership cache in sync with UserGroupId/UserGroupIds
 	user.loadDelayMaps()
 
 	var oldEmailForRelay, newEmailForRelay string
@@ -698,7 +1084,7 @@ func (users *Users) Read(db *Database) error {
 	users.pins = make(map[string]*User)
 	users.groupAdmins = make(map[uint64]*User)
 
-	rows, err := db.Sql.Query(`SELECT "userId", "email", "password", "pin", "pinExpiresAt", "connectionLimit", "verified", "verificationToken", "createdAt", "lastLogin", "firstName", "lastName", "zipCode", "systems", "talkgroups", "delay", "systemDelays", "talkgroupDelays", "settings", "stripeCustomerId", "stripeSubscriptionId", "subscriptionStatus", "userGroupId", "isGroupAdmin", COALESCE("systemAdmin", false), COALESCE("forcePasswordReset", false), "resetCode", "resetCodeExpires", "accountExpiresAt", COALESCE("mobileSetupTokenHash", ''), COALESCE("mobileSetupTokenExpires", 0), COALESCE("mobileWelcomeEmailSent", false) FROM "users"`)
+	rows, err := db.Sql.Query(`SELECT "userId", "email", "password", "pin", "pinExpiresAt", "connectionLimit", "verified", "verificationToken", "createdAt", "lastLogin", "firstName", "lastName", "zipCode", "systems", "talkgroups", "delay", "systemDelays", "talkgroupDelays", "settings", "stripeCustomerId", "stripeSubscriptionId", "subscriptionStatus", "userGroupId", "isGroupAdmin", COALESCE("userGroupIds", ''), COALESCE("systemAdmin", false), COALESCE("publicApiEnabled", false), COALESCE("publicApiCapabilities", '{}'), COALESCE("pushSystemNoAudioAlerts", false), COALESCE("pushApiKeyNoAudioAlerts", false), COALESCE("systemNoAudioAlertSystems", ''), COALESCE("apiKeyNoAudioAlertApiKeys", ''), COALESCE("forcePasswordReset", false), COALESCE("suspended", false), "resetCode", "resetCodeExpires", "accountExpiresAt", COALESCE("mobileSetupTokenHash", ''), COALESCE("mobileSetupTokenExpires", 0), COALESCE("mobileWelcomeEmailSent", false) FROM "users"`)
 	if err != nil {
 		return formatError(err, "")
 	}
@@ -714,8 +1100,16 @@ func (users *Users) Read(db *Database) error {
 		var stripeCustomerId, stripeSubscriptionId, subscriptionStatus sql.NullString
 		var userGroupId sql.NullInt64
 		var isGroupAdmin sql.NullBool
+		var userGroupIds sql.NullString
 		var systemAdmin sql.NullBool
+		var publicApiEnabled sql.NullBool
+		var publicApiCapabilities sql.NullString
+		var pushSystemNoAudioAlerts sql.NullBool
+		var pushApiKeyNoAudioAlerts sql.NullBool
+		var systemNoAudioAlertSystems sql.NullString
+		var apiKeyNoAudioAlertApiKeys sql.NullString
 		var forcePasswordReset sql.NullBool
+		var suspended sql.NullBool
 		var resetCode sql.NullString
 		var resetCodeExpires sql.NullInt64
 		var accountExpiresAt sql.NullInt64
@@ -723,7 +1117,7 @@ func (users *Users) Read(db *Database) error {
 		var mobileSetupTokenExpires sql.NullInt64
 		var mobileWelcomeEmailSent sql.NullBool
 
-		err := rows.Scan(&user.Id, &user.Email, &user.Password, &pin, &pinExpiresAt, &connectionLimit, &user.Verified, &user.VerificationToken, &user.CreatedAt, &user.LastLogin, &user.FirstName, &user.LastName, &user.ZipCode, &systems, &talkgroups, &user.Delay, &systemDelays, &talkgroupDelays, &settings, &stripeCustomerId, &stripeSubscriptionId, &subscriptionStatus, &userGroupId, &isGroupAdmin, &systemAdmin, &forcePasswordReset, &resetCode, &resetCodeExpires, &accountExpiresAt, &mobileSetupTokenHash, &mobileSetupTokenExpires, &mobileWelcomeEmailSent)
+		err := rows.Scan(&user.Id, &user.Email, &user.Password, &pin, &pinExpiresAt, &connectionLimit, &user.Verified, &user.VerificationToken, &user.CreatedAt, &user.LastLogin, &user.FirstName, &user.LastName, &user.ZipCode, &systems, &talkgroups, &user.Delay, &systemDelays, &talkgroupDelays, &settings, &stripeCustomerId, &stripeSubscriptionId, &subscriptionStatus, &userGroupId, &isGroupAdmin, &userGroupIds, &systemAdmin, &publicApiEnabled, &publicApiCapabilities, &pushSystemNoAudioAlerts, &pushApiKeyNoAudioAlerts, &systemNoAudioAlertSystems, &apiKeyNoAudioAlertApiKeys, &forcePasswordReset, &suspended, &resetCode, &resetCodeExpires, &accountExpiresAt, &mobileSetupTokenHash, &mobileSetupTokenExpires, &mobileWelcomeEmailSent)
 		if err != nil {
 			return formatError(err, "")
 		}
@@ -768,11 +1162,37 @@ func (users *Users) Read(db *Database) error {
 		if isGroupAdmin.Valid {
 			user.IsGroupAdmin = isGroupAdmin.Bool
 		}
+		if userGroupIds.Valid {
+			user.UserGroupIds = userGroupIds.String
+		}
 		if systemAdmin.Valid {
 			user.SystemAdmin = systemAdmin.Bool
 		}
+		if publicApiEnabled.Valid {
+			user.PublicApiEnabled = publicApiEnabled.Bool
+		}
+		if publicApiCapabilities.Valid && publicApiCapabilities.String != "" {
+			user.PublicApiCapabilities = publicApiCapabilities.String
+		} else {
+			user.PublicApiCapabilities = "{}"
+		}
+		if pushSystemNoAudioAlerts.Valid {
+			user.PushSystemNoAudioAlerts = pushSystemNoAudioAlerts.Bool
+		}
+		if pushApiKeyNoAudioAlerts.Valid {
+			user.PushApiKeyNoAudioAlerts = pushApiKeyNoAudioAlerts.Bool
+		}
+		if systemNoAudioAlertSystems.Valid {
+			user.SystemNoAudioAlertSystems = systemNoAudioAlertSystems.String
+		}
+		if apiKeyNoAudioAlertApiKeys.Valid {
+			user.ApiKeyNoAudioAlertApiKeys = apiKeyNoAudioAlertApiKeys.String
+		}
 		if forcePasswordReset.Valid {
 			user.ForcePasswordReset = forcePasswordReset.Bool
+		}
+		if suspended.Valid {
+			user.Suspended = suspended.Bool
 		}
 		if resetCode.Valid {
 			user.ResetCode = resetCode.String
@@ -799,6 +1219,8 @@ func (users *Users) Read(db *Database) error {
 
 		user.ensurePinsLoaded()
 		user.loadSystemScopes()
+		user.loadNoAudioAlertScopes()
+		user.loadGroupMemberships()
 		user.loadDelayMaps()
 
 		users.users[user.Id] = user
@@ -837,6 +1259,8 @@ func (users *Users) Write(db *Database) error {
 		stripeSubscriptionId := user.StripeSubscriptionId
 		subscriptionStatus := user.SubscriptionStatus
 		user.ensurePinsLoaded()
+		user.loadGroupMemberships() // canonicalize UserGroupIds before persisting
+		userGroupIds := user.UserGroupIds
 		pin := user.Pin
 		pinExpiresAt := int64(user.PinExpiresAt)
 		connectionLimit := int64(user.ConnectionLimit)
@@ -891,8 +1315,8 @@ func (users *Users) Write(db *Database) error {
 				accountExpiresAtVal = int64(0)
 			}
 
-			result, err := db.Sql.Exec(`INSERT INTO "users" ("email", "password", "pin", "pinExpiresAt", "connectionLimit", "verified", "verificationToken", "createdAt", "lastLogin", "firstName", "lastName", "zipCode", "systems", "talkgroups", "delay", "systemDelays", "talkgroupDelays", "settings", "stripeCustomerId", "stripeSubscriptionId", "subscriptionStatus", "userGroupId", "isGroupAdmin", "systemAdmin", "forcePasswordReset", "resetCode", "resetCodeExpires", "accountExpiresAt", "mobileSetupTokenHash", "mobileSetupTokenExpires", "mobileWelcomeEmailSent") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)`,
-				user.Email, user.Password, pin, pinExpiresAt, connectionLimit, user.Verified, user.VerificationToken, createdAtStr, lastLoginStr, user.FirstName, user.LastName, user.ZipCode, systems, talkgroups, user.Delay, systemDelays, talkgroupDelays, settings, stripeCustomerId, stripeSubscriptionId, subscriptionStatus, user.UserGroupId, user.IsGroupAdmin, user.SystemAdmin, user.ForcePasswordReset, resetCodeVal, resetCodeExpiresVal, accountExpiresAtVal, user.MobileSetupTokenHash, int64(user.MobileSetupTokenExpires), user.MobileWelcomeEmailSent)
+			result, err := db.Sql.Exec(`INSERT INTO "users" ("email", "password", "pin", "pinExpiresAt", "connectionLimit", "verified", "verificationToken", "createdAt", "lastLogin", "firstName", "lastName", "zipCode", "systems", "talkgroups", "delay", "systemDelays", "talkgroupDelays", "settings", "stripeCustomerId", "stripeSubscriptionId", "subscriptionStatus", "userGroupId", "isGroupAdmin", "systemAdmin", "pushSystemNoAudioAlerts", "pushApiKeyNoAudioAlerts", "systemNoAudioAlertSystems", "apiKeyNoAudioAlertApiKeys", "forcePasswordReset", "suspended", "resetCode", "resetCodeExpires", "accountExpiresAt", "mobileSetupTokenHash", "mobileSetupTokenExpires", "mobileWelcomeEmailSent", "userGroupIds") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)`,
+				user.Email, user.Password, pin, pinExpiresAt, connectionLimit, user.Verified, user.VerificationToken, createdAtStr, lastLoginStr, user.FirstName, user.LastName, user.ZipCode, systems, talkgroups, user.Delay, systemDelays, talkgroupDelays, settings, stripeCustomerId, stripeSubscriptionId, subscriptionStatus, user.UserGroupId, user.IsGroupAdmin, user.SystemAdmin, user.PushSystemNoAudioAlerts, user.PushApiKeyNoAudioAlerts, user.SystemNoAudioAlertSystems, user.ApiKeyNoAudioAlertApiKeys, user.ForcePasswordReset, user.Suspended, resetCodeVal, resetCodeExpiresVal, accountExpiresAtVal, user.MobileSetupTokenHash, int64(user.MobileSetupTokenExpires), user.MobileWelcomeEmailSent, userGroupIds)
 			if err != nil {
 				return formatError(err, "")
 			}
@@ -951,8 +1375,8 @@ func (users *Users) Write(db *Database) error {
 				accountExpiresAtVal = int64(0)
 			}
 
-			_, err = db.Sql.Exec(`UPDATE "users" SET "email"=$1, "password"=$2, "pin"=$3, "pinExpiresAt"=$4, "connectionLimit"=$5, "verified"=$6, "verificationToken"=$7, "createdAt"=$8, "lastLogin"=$9, "firstName"=$10, "lastName"=$11, "zipCode"=$12, "systems"=$13, "talkgroups"=$14, "delay"=$15, "systemDelays"=$16, "talkgroupDelays"=$17, "settings"=$18, "stripeCustomerId"=$19, "stripeSubscriptionId"=$20, "subscriptionStatus"=$21, "userGroupId"=$22, "isGroupAdmin"=$23, "systemAdmin"=$24, "forcePasswordReset"=$25, "resetCode"=$26, "resetCodeExpires"=$27, "accountExpiresAt"=$28, "mobileSetupTokenHash"=$29, "mobileSetupTokenExpires"=$30, "mobileWelcomeEmailSent"=$31 WHERE "userId"=$32`,
-				user.Email, user.Password, pin, pinExpiresAt, connectionLimit, user.Verified, user.VerificationToken, createdAtStr, lastLoginStr, user.FirstName, user.LastName, user.ZipCode, systems, talkgroups, user.Delay, systemDelays, talkgroupDelays, settings, stripeCustomerId, stripeSubscriptionId, subscriptionStatus, user.UserGroupId, user.IsGroupAdmin, user.SystemAdmin, user.ForcePasswordReset, resetCodeVal, resetCodeExpiresVal, accountExpiresAtVal, user.MobileSetupTokenHash, int64(user.MobileSetupTokenExpires), user.MobileWelcomeEmailSent, user.Id)
+			_, err = db.Sql.Exec(`UPDATE "users" SET "email"=$1, "password"=$2, "pin"=$3, "pinExpiresAt"=$4, "connectionLimit"=$5, "verified"=$6, "verificationToken"=$7, "createdAt"=$8, "lastLogin"=$9, "firstName"=$10, "lastName"=$11, "zipCode"=$12, "systems"=$13, "talkgroups"=$14, "delay"=$15, "systemDelays"=$16, "talkgroupDelays"=$17, "settings"=$18, "stripeCustomerId"=$19, "stripeSubscriptionId"=$20, "subscriptionStatus"=$21, "userGroupId"=$22, "isGroupAdmin"=$23, "systemAdmin"=$24, "pushSystemNoAudioAlerts"=$25, "pushApiKeyNoAudioAlerts"=$26, "systemNoAudioAlertSystems"=$27, "apiKeyNoAudioAlertApiKeys"=$28, "forcePasswordReset"=$29, "suspended"=$30, "resetCode"=$31, "resetCodeExpires"=$32, "accountExpiresAt"=$33, "mobileSetupTokenHash"=$34, "mobileSetupTokenExpires"=$35, "mobileWelcomeEmailSent"=$36, "userGroupIds"=$37 WHERE "userId"=$38`,
+				user.Email, user.Password, pin, pinExpiresAt, connectionLimit, user.Verified, user.VerificationToken, createdAtStr, lastLoginStr, user.FirstName, user.LastName, user.ZipCode, systems, talkgroups, user.Delay, systemDelays, talkgroupDelays, settings, stripeCustomerId, stripeSubscriptionId, subscriptionStatus, user.UserGroupId, user.IsGroupAdmin, user.SystemAdmin, user.PushSystemNoAudioAlerts, user.PushApiKeyNoAudioAlerts, user.SystemNoAudioAlertSystems, user.ApiKeyNoAudioAlertApiKeys, user.ForcePasswordReset, user.Suspended, resetCodeVal, resetCodeExpiresVal, accountExpiresAtVal, user.MobileSetupTokenHash, int64(user.MobileSetupTokenExpires), user.MobileWelcomeEmailSent, userGroupIds, user.Id)
 			if err != nil {
 				return formatError(err, "")
 			}
@@ -960,6 +1384,37 @@ func (users *Users) Write(db *Database) error {
 	}
 
 	return nil
+}
+
+// WritePublicApiSettings persists public API enablement and capability flags for one user.
+func (users *Users) WritePublicApiSettings(user *User, db *Database) error {
+	if user == nil || db == nil || db.Sql == nil || user.Id == 0 {
+		return nil
+	}
+	caps := strings.TrimSpace(user.PublicApiCapabilities)
+	if caps == "" {
+		caps = "{}"
+	}
+	_, err := db.Sql.Exec(
+		`UPDATE "users" SET "publicApiEnabled"=$1, "publicApiCapabilities"=$2 WHERE "userId"=$3`,
+		user.PublicApiEnabled, caps, user.Id,
+	)
+	return err
+}
+
+// WriteSubscriptionState persists only the membership/subscription fields for a
+// single user with a targeted UPDATE, avoiding a full-table rewrite for frequent
+// self-service tier changes. Canonicalizes userGroupIds before persisting.
+func (users *Users) WriteSubscriptionState(user *User, db *Database) error {
+	if user == nil || db == nil || db.Sql == nil {
+		return nil
+	}
+	user.loadGroupMemberships()
+	_, err := db.Sql.Exec(
+		`UPDATE "users" SET "userGroupId"=$1, "userGroupIds"=$2, "stripeCustomerId"=$3, "stripeSubscriptionId"=$4, "subscriptionStatus"=$5, "pinExpiresAt"=$6 WHERE "userId"=$7`,
+		user.UserGroupId, user.UserGroupIds, user.StripeCustomerId, user.StripeSubscriptionId, user.SubscriptionStatus, int64(user.PinExpiresAt), user.Id,
+	)
+	return err
 }
 
 func (users *Users) GetUserByEmail(email string) *User {
@@ -1019,6 +1474,20 @@ func (users *Users) GetAllUsers() []*User {
 	return userList
 }
 
+// HasSystemAdmin reports whether at least one system administrator user exists.
+// Used to prevent disabling admin password login when no SSO-capable admin remains.
+func (users *Users) HasSystemAdmin() bool {
+	users.mutex.RLock()
+	defer users.mutex.RUnlock()
+
+	for _, user := range users.users {
+		if user.SystemAdmin {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckDuplicateEmails finds users with duplicate emails (case-insensitive)
 // Returns a map of normalized email -> list of users with that email
 func (users *Users) CheckDuplicateEmails() map[string][]*User {
@@ -1048,6 +1517,7 @@ func (users *Users) SaveNewUser(user *User, db *Database) error {
 	formatError := errorFormatter("users", "saveNewUser")
 
 	user.ensurePinsLoaded()
+	user.loadGroupMemberships() // canonicalize UserGroupIds before insert
 
 	// All these columns are NOT NULL, so use empty string instead of NULL
 	systems := user.Systems
@@ -1089,13 +1559,15 @@ func (users *Users) SaveNewUser(user *User, db *Database) error {
 	}
 
 	// Insert user with all fields including systems, delays, settings, and Stripe data
-	err := db.Sql.QueryRow(`INSERT INTO "users" ("email", "password", "pin", "pinExpiresAt", "connectionLimit", "verified", "verificationToken", "createdAt", "lastLogin", "firstName", "lastName", "zipCode", "systems", "talkgroups", "delay", "systemDelays", "talkgroupDelays", "settings", "stripeCustomerId", "stripeSubscriptionId", "subscriptionStatus", "accountExpiresAt", "userGroupId", "isGroupAdmin", "systemAdmin", "forcePasswordReset", "mobileSetupTokenHash", "mobileSetupTokenExpires", "mobileWelcomeEmailSent") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) RETURNING "userId"`,
-		user.Email, user.Password, user.Pin, user.PinExpiresAt, user.ConnectionLimit, user.Verified, user.VerificationToken, createdAtStr, lastLoginStr, user.FirstName, user.LastName, user.ZipCode, systems, user.Talkgroups, user.Delay, systemDelays, talkgroupDelays, settings, stripeCustomerId, stripeSubscriptionId, subscriptionStatus, user.AccountExpiresAt, user.UserGroupId, user.IsGroupAdmin, user.SystemAdmin, user.ForcePasswordReset, user.MobileSetupTokenHash, int64(user.MobileSetupTokenExpires), user.MobileWelcomeEmailSent).Scan(&userId)
+	err := db.Sql.QueryRow(`INSERT INTO "users" ("email", "password", "pin", "pinExpiresAt", "connectionLimit", "verified", "verificationToken", "createdAt", "lastLogin", "firstName", "lastName", "zipCode", "systems", "talkgroups", "delay", "systemDelays", "talkgroupDelays", "settings", "stripeCustomerId", "stripeSubscriptionId", "subscriptionStatus", "accountExpiresAt", "userGroupId", "isGroupAdmin", "systemAdmin", "pushSystemNoAudioAlerts", "pushApiKeyNoAudioAlerts", "systemNoAudioAlertSystems", "apiKeyNoAudioAlertApiKeys", "forcePasswordReset", "suspended", "mobileSetupTokenHash", "mobileSetupTokenExpires", "mobileWelcomeEmailSent", "userGroupIds") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35) RETURNING "userId"`,
+		user.Email, user.Password, user.Pin, user.PinExpiresAt, user.ConnectionLimit, user.Verified, user.VerificationToken, createdAtStr, lastLoginStr, user.FirstName, user.LastName, user.ZipCode, systems, user.Talkgroups, user.Delay, systemDelays, talkgroupDelays, settings, stripeCustomerId, stripeSubscriptionId, subscriptionStatus, user.AccountExpiresAt, user.UserGroupId, user.IsGroupAdmin, user.SystemAdmin, user.PushSystemNoAudioAlerts, user.PushApiKeyNoAudioAlerts, user.SystemNoAudioAlertSystems, user.ApiKeyNoAudioAlertApiKeys, user.ForcePasswordReset, user.Suspended, user.MobileSetupTokenHash, int64(user.MobileSetupTokenExpires), user.MobileWelcomeEmailSent, user.UserGroupIds).Scan(&userId)
 	if err != nil {
 		return formatError(err, "")
 	}
 	user.Id = uint64(userId)
 	user.loadSystemScopes()
+	user.loadNoAudioAlertScopes()
+	user.loadGroupMemberships()
 	user.loadDelayMaps()
 
 	// Now add to memory with the real ID

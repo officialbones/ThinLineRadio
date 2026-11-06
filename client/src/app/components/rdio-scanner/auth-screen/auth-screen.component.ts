@@ -17,23 +17,31 @@
  * ****************************************************************************
  */
 
-import { Component, OnInit, Output, EventEmitter, OnDestroy, AfterViewChecked, AfterViewInit, ChangeDetectorRef, NgZone } from '@angular/core';
+import { Component, OnInit, Output, EventEmitter, OnDestroy, ChangeDetectorRef, ChangeDetectionStrategy, ViewChild } from '@angular/core';
 import { FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 import { Router, ActivatedRoute } from '@angular/router';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatDialog } from '@angular/material/dialog';
+import packageInfo from '../../../../../package.json';
 import { RdioScannerService } from '../rdio-scanner.service';
 import { RdioScannerEvent, RdioScannerConfig } from '../rdio-scanner';
 import { Subscription } from 'rxjs';
+import { RdioScannerTurnstileComponent } from '../turnstile/turnstile.component';
 
 @Component({
-  selector: 'rdio-scanner-auth-screen',
-  templateUrl: './auth-screen.component.html',
-  styleUrls: ['./auth-screen.component.scss']
+    selector: 'rdio-scanner-auth-screen',
+    templateUrl: './auth-screen.component.html',
+    styleUrls: ['./auth-screen.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
+    standalone: false
 })
-export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterViewChecked, AfterViewInit {
+export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy {
   @Output() authenticated = new EventEmitter<void>();
+
+  @ViewChild('loginTurnstile') loginTurnstile?: RdioScannerTurnstileComponent;
+  @ViewChild('registerTurnstile') registerTurnstile?: RdioScannerTurnstileComponent;
+  @ViewChild('groupAdminTurnstile') groupAdminTurnstile?: RdioScannerTurnstileComponent;
 
   authMode: 'login' | 'register' | 'group-admin' = 'login';
   loginForm: FormGroup;
@@ -66,6 +74,13 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   availableChannels: any[] = [];
   loadingChannels = false;
   showChannels = false;
+
+  // Multi-tier public registration: every group flagged public is a tier the
+  // user can join. Paid tiers are billed together on one combined subscription.
+  tiers: any[] = [];
+  selectedTiers: { [groupId: number]: boolean } = {};
+  tierPrice: { [groupId: number]: string } = {};
+  primaryTierId: number | null = null;
   /** Set from `/api/registration-settings` after load — do not assume invite-only before then (fixes invite box vanishing when public mode loads). */
   registrationSettingsLoaded = false;
   isInviteOnlyMode = true;
@@ -73,6 +88,21 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   pendingAccessCode = '';
   validatingCode = false;
   codeValidationError = '';
+
+  /** When true, this scanner is paired to Central Management — use AlertPage auth proxy. */
+  cmMode = false;
+  cmPortalUrl = '';
+  cmServerName = '';
+  needsSubscription = false;
+  needsSubscriptionMessage = '';
+  needsSubscriptionPortalUrl = '';
+  /** CM password-reset token from email link (?token= on /reset-password). */
+  cmResetToken = '';
+  showCMForgotPassword = false;
+  showCMResetPassword = false;
+  cmForgotSuccess = '';
+  cmResetPasswordValue = '';
+  cmResetConfirmValue = '';
 
   /** When true, signup is email → 6-digit code → full form (from `/api/registration-settings`). */
   emailVerificationRequired = false;
@@ -83,6 +113,12 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   pendingEmail = '';
   /** True after user enters the 6-digit signup code (email-verification-required flow only). */
   signupEmailCodeConfirmed = false;
+  /**
+   * When true, the registration email input is read-only (OTP confirmed, or invite
+   * bound to a specific email). Access/invite codes without a bound email must NOT
+   * set this — that left an empty "Verified" field users could not type into (#261).
+   */
+  emailLockedAfterVerify = false;
   /** True when registration completed via an access/invitation code — user is auto-verified, no email check needed. */
   registeredWithCode = false;
   
@@ -100,40 +136,16 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   countdownSeconds = 0;
   private countdownInterval: any;
   
-  // Turnstile CAPTCHA
-  private _turnstileToken: string = '';
-  turnstileWidgetId: any = null;
+  // Turnstile CAPTCHA — tokens are single-use; each form owns its own widget (issue #259).
+  turnstileToken = '';
   turnstileSiteKey: string = '';
   turnstileEnabled: boolean = false;
-  private turnstileInitAttempted = false;
-  private turnstileInitializing = false; // New flag to prevent race conditions
-  
-  // Getter/setter for turnstile token
-  // Store token in sessionStorage to survive component recreation
-  get turnstileToken(): string {
-    // Try to get from sessionStorage first (survives component recreation)
-    const storedToken = sessionStorage.getItem('turnstile_token') || '';
-    if (storedToken && !this._turnstileToken) {
-      this._turnstileToken = storedToken;
-    }
-    return this._turnstileToken;
+  /** Authoritative type from /api/user/validate-access-code (not format guessing). */
+  accessCodeType: 'invitation' | 'registration' | null = null;
+
+  get isInvitationAccessCode(): boolean {
+    return this.accessCodeType === 'invitation';
   }
-  set turnstileToken(value: string) {
-    // Don't allow clearing the token once it's set (unless explicitly cleared via resetTurnstile)
-    if (this._turnstileToken && !value && !this.isResettingTurnstile) {
-      return;
-    }
-    this._turnstileToken = value;
-    
-    // Store in sessionStorage to survive component recreation
-    if (value) {
-      sessionStorage.setItem('turnstile_token', value);
-    } else if (this.isResettingTurnstile) {
-      sessionStorage.removeItem('turnstile_token');
-    }
-  }
-  
-  private isResettingTurnstile = false;
 
   constructor(
     private fb: FormBuilder,
@@ -143,8 +155,7 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     private snackBar: MatSnackBar,
     private dialog: MatDialog,
     private rdioScannerService: RdioScannerService,
-    private cdr: ChangeDetectorRef,
-    private ngZone: NgZone
+    private cdr: ChangeDetectorRef
   ) {
     // Initialize login form
     this.loginForm = this.fb.group({
@@ -213,10 +224,9 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     this.turnstileEnabled = initialConfig.options?.turnstileEnabled || false;
     this.turnstileSiteKey = initialConfig.options?.turnstileSiteKey || '';
     
-    // Load Turnstile if enabled
-    if (this.turnstileEnabled && this.turnstileSiteKey) {
-      this.loadTurnstileScript();
-    }
+    // Drop any leftover single-use token from older builds (issue #239).
+    try { sessionStorage.removeItem('turnstile_token'); } catch { /* ignore */ }
+    this.turnstileToken = '';
   }
 
   ngOnInit(): void {
@@ -227,12 +237,36 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         this.startCountdown(parseInt(seconds, 10));
       }
     });
+
+    // CM password-reset email links land on /reset-password?token=...
+    const urlParams = new URLSearchParams(window.location.search);
+    const path = (window.location.pathname || '').replace(/\/+$/, '');
+    const resetToken = urlParams.get('token') || '';
+    if (resetToken && path.endsWith('/reset-password')) {
+      this.cmResetToken = resetToken;
+      this.showCMResetPassword = true;
+      this.authMode = 'login';
+      // Clean the URL so a refresh does not keep a one-time token in the address bar longer than needed.
+      window.history.replaceState({}, document.title, window.location.pathname.split('/reset-password')[0] || '/');
+    }
+
+    // AlertPage My Scanners opens this scanner with ?cm_token=<JWT> for auto-login.
+    const cmHandoffToken = (urlParams.get('cm_token') || '').trim();
+    if (cmHandoffToken) {
+      urlParams.delete('cm_token');
+      const cleaned =
+        window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '') + (window.location.hash || '');
+      window.history.replaceState({}, document.title, cleaned);
+      this.loading = true;
+      this.error = '';
+      this.authMode = 'login';
+      this.completeCMSession(cmHandoffToken);
+    }
     
     // Load registration settings first to determine if invite-only
     this.loadRegistrationSettings();
     
     // Check for Stripe checkout success/cancel parameters
-    const urlParams = new URLSearchParams(window.location.search);
     const checkoutStatus = urlParams.get('checkout');
     
     if (checkoutStatus === 'success') {
@@ -356,10 +390,13 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
           // Invitation link counts as email verification — skip the email code step
           this.signupEmailCodeConfirmed = true;
           
-          // Pre-fill email if provided in invitation
+          // Pre-fill email if provided in invitation; only lock when we have one
           if (response.email) {
             this.registerForm.patchValue({ email: response.email });
             this.pendingEmail = response.email;
+            this.emailLockedAfterVerify = true;
+          } else {
+            this.emailLockedAfterVerify = false;
           }
           
           // Set invitation code as accessCode
@@ -468,6 +505,13 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   }
 
   setAuthMode(mode: 'login' | 'register' | 'group-admin'): void {
+    if (this.cmMode && mode === 'register') {
+      this.openCMSignup();
+      return;
+    }
+    if (this.cmMode && mode === 'group-admin') {
+      mode = 'login';
+    }
     // Prevent switching to register mode if registration is disabled
     if (mode === 'register' && !this.isUserRegistrationEnabled()) {
       this.authMode = 'login';
@@ -480,12 +524,20 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     }
     
     this.authMode = mode;
+    this.needsSubscription = false;
+    this.needsSubscriptionMessage = '';
+    this.showCMForgotPassword = false;
+    if (!this.cmResetToken) {
+      this.showCMResetPassword = false;
+    }
+    this.cmForgotSuccess = '';
     if (mode === 'register') {
       this.emailVerificationStep = false;
       this.verificationCode = '';
       this.pendingEmail = '';
       this.emailVerificationError = '';
       this.signupEmailCodeConfirmed = false;
+      this.emailLockedAfterVerify = false;
     }
     // Clear errors when switching modes
     if (mode !== 'group-admin') {
@@ -499,14 +551,22 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     this.showResetPassword = false;
     this.resetEmail = '';
     
-    // Reset the widget initialization flag so it can re-render on the new form
-    // But keep the token (it's stored in sessionStorage)
-    this.turnstileInitAttempted = false;
-    this.turnstileInitializing = false;
-    this.turnstileWidgetId = null;
+    // New mode gets a fresh Turnstile widget via *ngIf remount (issue #259).
+    this.turnstileToken = '';
   }
 
   onForgotPassword(): void {
+    if (this.cmMode) {
+      this.showCMForgotPassword = true;
+      this.showCMResetPassword = false;
+      this.cmForgotSuccess = '';
+      this.error = '';
+      const email = this.loginForm.get('email')?.value;
+      if (email) {
+        this.forgotPasswordForm.patchValue({ email });
+      }
+      return;
+    }
     this.showForgotPassword = true;
     this.showResetPassword = false;
     this.error = '';
@@ -516,25 +576,93 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     if (this.forgotPasswordForm.valid && !this.loading) {
       this.loading = true;
       this.error = '';
+      this.cmForgotSuccess = '';
 
       const formData = {
-        email: this.forgotPasswordForm.value.email.toLowerCase() // Ensure email is lowercase
+        email: this.forgotPasswordForm.value.email.toLowerCase()
       };
+
+      const endpoint = this.cmMode ? '/api/cm-auth/forgot-password' : '/api/user/forgot-password';
       
-      this.http.post('/api/user/forgot-password', formData).subscribe({
+      this.http.post(endpoint, formData).subscribe({
         next: (response: any) => {
           this.loading = false;
           this.resetEmail = formData.email;
+          if (this.cmMode) {
+            this.cmForgotSuccess = response?.message ||
+              'If an account exists with this email, a password reset link has been sent.';
+            this.error = '';
+            this.cdr.markForCheck();
+            return;
+          }
           this.showForgotPassword = false;
           this.showResetPassword = true;
           this.error = '';
         },
         error: (error) => {
           this.loading = false;
-          this.error = error.error?.error || 'Failed to send reset code. Please try again.';
+          this.error = this.extractHttpError(error, 'Failed to send reset email. Please try again.');
+          this.cdr.markForCheck();
         }
       });
     }
+  }
+
+  onCMResetPassword(): void {
+    if (this.loading) {
+      return;
+    }
+    const password = (this.cmResetPasswordValue || '').trim();
+    const confirm = (this.cmResetConfirmValue || '').trim();
+    if (!this.cmResetToken) {
+      this.error = 'Reset link is missing or expired. Please request a new one.';
+      return;
+    }
+    if (password.length < 8) {
+      this.error = 'Password must be at least 8 characters.';
+      return;
+    }
+    if (password !== confirm) {
+      this.error = 'Passwords do not match.';
+      return;
+    }
+
+    this.loading = true;
+    this.error = '';
+    this.http.post('/api/cm-auth/reset-password', {
+      token: this.cmResetToken,
+      password,
+    }).subscribe({
+      next: () => {
+        this.loading = false;
+        this.showCMResetPassword = false;
+        this.showCMForgotPassword = false;
+        this.cmResetToken = '';
+        this.cmResetPasswordValue = '';
+        this.cmResetConfirmValue = '';
+        this.cmForgotSuccess = '';
+        this.snackBar.open('Password reset successful! Please login with your new password.', 'Close', {
+          duration: 5000,
+          panelClass: ['success-snackbar']
+        });
+        this.cdr.markForCheck();
+      },
+      error: (error) => {
+        this.loading = false;
+        this.error = this.extractHttpError(error, 'Failed to reset password. Please try again.');
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
+  backToCMLogin(): void {
+    this.showCMForgotPassword = false;
+    this.showCMResetPassword = false;
+    this.cmForgotSuccess = '';
+    this.cmResetToken = '';
+    this.cmResetPasswordValue = '';
+    this.cmResetConfirmValue = '';
+    this.error = '';
   }
 
   onResetPassword(): void {
@@ -596,9 +724,10 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         password: this.groupAdminForm.value.password
       };
       
-      // Add Turnstile token if enabled
+      // Add Turnstile token if enabled, then clear immediately (single-use).
       if (this.turnstileEnabled && this.turnstileToken) {
         formData.turnstile_token = this.turnstileToken;
+        this.turnstileToken = '';
       }
 
       this.http.post('/api/group-admin/login', formData).subscribe({
@@ -622,6 +751,7 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         },
         error: (error) => {
           this.groupAdminLoading = false;
+          this.refreshTurnstile();
           // Check if IP is blocked due to too many failed attempts
           if (error.error?.blocked && error.error?.retryAfter) {
             // Navigate with query params to show countdown
@@ -654,6 +784,11 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
 
   onLogin(): void {
     if (!this.loading) {
+      if (this.cmMode) {
+        this.onCMLogin();
+        return;
+      }
+
       // Check Turnstile if enabled (but don't disable button, just show error)
       if (this.turnstileEnabled && !this.turnstileToken) {
         this.error = 'Please complete the CAPTCHA verification';
@@ -668,11 +803,12 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         password: this.loginForm.value.password
       };
       
-      // Add Turnstile token if enabled
+      // Add Turnstile token if enabled, then clear immediately (single-use).
       if (this.turnstileEnabled && this.turnstileToken) {
         formData.turnstile_token = this.turnstileToken;
+        this.turnstileToken = '';
       }
-      
+
       this.http.post('/api/user/login', formData).subscribe({
         next: (response: any) => {
           this.loading = false;
@@ -682,6 +818,7 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
           }
           // Persist system admin flag so the main UI can show the Admin Panel button
           this.rdioScannerService.saveIsSystemAdmin(response?.user?.systemAdmin === true);
+          this.rdioScannerService.savePublicApiEnabled(response?.user?.publicApiEnabled === true);
           console.log('Login successful:', response);
           
           // Reload the page to ensure fresh state and WebSocket connection
@@ -689,6 +826,7 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         },
         error: (error) => {
           this.loading = false;
+          this.refreshTurnstile();
           
           // Check if IP is blocked due to too many failed attempts
           // MUST check FIRST before any error message processing
@@ -731,8 +869,135 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     }
   }
 
+  private onCMLogin(): void {
+    if (this.loginForm.invalid) {
+      this.error = 'Please enter a valid email and password.';
+      return;
+    }
+    this.loading = true;
+    this.error = '';
+    this.needsSubscription = false;
+
+    const formData = {
+      email: this.loginForm.value.email.toLowerCase(),
+      password: this.loginForm.value.password,
+    };
+
+    this.http.post('/api/cm-auth/login', formData).subscribe({
+      next: (response: any) => {
+        const token = response?.token;
+        if (typeof token !== 'string' || !token) {
+          this.loading = false;
+          this.error = 'Login succeeded but no session token was returned.';
+          this.cdr.markForCheck();
+          return;
+        }
+        this.completeCMSession(token);
+      },
+      error: (error) => {
+        this.loading = false;
+        this.error = this.extractHttpError(error, 'Login failed. Please check your credentials.');
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
+  private completeCMSession(token: string): void {
+    this.http.post('/api/cm-auth/session', {
+      token,
+      returnUrl: window.location.origin,
+    }).subscribe({
+      next: (session: any) => {
+        this.loading = false;
+        if (typeof session?.pin === 'string' && session.pin.length > 0) {
+          this.rdioScannerService.savePin(session.pin);
+          this.rdioScannerService.saveIsSystemAdmin(false);
+          this.rdioScannerService.savePublicApiEnabled(false);
+          window.location.reload();
+          return;
+        }
+        if (session?.needsSubscription) {
+          this.needsSubscription = true;
+          this.needsSubscriptionMessage = session.message ||
+            'An AlertPage subscription or scanner assignment is required.';
+          this.needsSubscriptionPortalUrl = session.portalUrl || this.cmPortalUrl;
+          this.error = '';
+          this.cdr.markForCheck();
+          return;
+        }
+        this.error = 'Unable to obtain scanner access. Please try again.';
+        this.cdr.markForCheck();
+      },
+      error: (error) => {
+        this.loading = false;
+        this.error = this.extractHttpError(error, 'Unable to resolve scanner access.');
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
+  openCMPortal(): void {
+    const url = this.needsSubscriptionPortalUrl || this.cmPortalUrl;
+    if (url) {
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+  }
+
+  /** Send new users to AlertPage to create an account (billing / scanner selection). */
+  openCMSignup(): void {
+    const base = (this.cmPortalUrl || '').replace(/\/$/, '');
+    if (!base) {
+      this.error = 'AlertPage portal URL is not configured.';
+      return;
+    }
+    window.location.href = `${base}/login?tab=register`;
+  }
+
+  getAlertPageLogoUrl(): string {
+    return 'assets/icons/alertpage.png';
+  }
+
+  /** Local scanner display name shown under the AlertPage logo. */
+  getScannerName(): string {
+    const fromConfig = (this.config?.branding || '').trim();
+    if (fromConfig && fromConfig.toLowerCase() !== 'thinline radio' && fromConfig.toLowerCase() !== 'alertpage radio') {
+      return fromConfig;
+    }
+    return (this.cmServerName || fromConfig || '').trim();
+  }
+
+  private extractHttpError(error: any, fallback: string): string {
+    if (error?.error?.message && typeof error.error.message === 'string') {
+      return error.error.message;
+    }
+    if (error?.error?.error && typeof error.error.error === 'string') {
+      return error.error.error;
+    }
+    if (typeof error?.error === 'string' && error.error.trim()) {
+      return error.error.trim();
+    }
+    if (error?.message && typeof error.message === 'string') {
+      return error.message;
+    }
+    return fallback;
+  }
+
 
   async onRegister(): Promise<void> {
+    if (this.cmMode) {
+      this.openCMSignup();
+      return;
+    }
+
+    // Multi-tier signup (2+ public groups): require an explicit selection + plan per paid tier.
+    // Single-tier paid signup does not pick a plan here — that happens on /setup/plan.
+    if (this.usingTierSelection() && !this.tierSelectionValid()) {
+      const missingPricing = this.tiers.some(t => this.tierMissingPricing(t));
+      this.error = missingPricing
+        ? 'One of the selected paid tiers has no pricing plans configured. Please contact the site admin or choose another tier.'
+        : 'Select at least one tier and choose a plan for each paid tier.';
+      return;
+    }
     if (this.registerForm.valid && !this.loading) {
       this.loading = true;
       this.error = '';
@@ -756,34 +1021,78 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         formData.accessCode = accessCode;
       }
       
+      // Multi-tier public signup: send the chosen tiers + primary so the server
+      // records the full membership instead of falling back to one public group.
+      const chosenTierIds = this.usingTierSelection() ? this.selectedTierIds() : [];
+      if (chosenTierIds.length > 0) {
+        formData.groupIds = chosenTierIds;
+        formData.primaryGroupId = this.primaryTierId || chosenTierIds[0];
+      }
+      // Multi-tier paid selections settle in one combined Stripe checkout.
+      // Single-tier paid signup uses /setup/plan after register instead.
+      const paidItems = this.usingTierSelection()
+        ? this.tiers
+            .filter(t => this.selectedTiers[t.groupId] && t.billingEnabled && this.tierPrice[t.groupId])
+            .map(t => ({ groupId: t.groupId, priceId: this.tierPrice[t.groupId] }))
+        : [];
+
       console.log('Registration form data being sent:', formData);
-      
-      // Check Turnstile if enabled (but skip if using access code that looks like invitation - it's already validated via email)
-      // Invitation codes are 16 chars and alphanumeric, registration codes are 12 chars with special chars
-      const isLikelyInvitation = hasAccessCode && accessCode.length === 16 && /^[A-Z0-9]+$/.test(accessCode);
-      if (this.turnstileEnabled && !this.turnstileToken && !isLikelyInvitation) {
+
+      // Check Turnstile if enabled (skip only for server-confirmed invitations)
+      if (this.turnstileEnabled && !this.turnstileToken && !this.isInvitationAccessCode) {
         this.error = 'Please complete the CAPTCHA verification';
         this.loading = false;
         return;
       }
       
-      // Add Turnstile token if enabled and available
+      // Add Turnstile token if enabled, then clear immediately (single-use).
       if (this.turnstileEnabled && this.turnstileToken) {
         formData.turnstile_token = this.turnstileToken;
+        this.turnstileToken = '';
       }
       
       this.http.post('/api/user/register', formData).subscribe({
         next: async (response: any) => {
           this.loading = false;
+          this.refreshTurnstile();
           const pin = response?.pin;
           if (typeof pin === 'string' && pin.length > 0) {
             this.rdioScannerService.savePin(pin);
           }
+          const email = (this.registerForm.get('email')?.value || '').toLowerCase();
+
+          // Paid tiers selected: start the combined Stripe checkout (one line
+          // item per paid tier) instead of the single-plan setup page.
+          if (paidItems.length > 0) {
+            try {
+              const baseUrl = window.location.origin;
+              const res = await fetch('/api/stripe/create-checkout-session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  email,
+                  items: paidItems,
+                  successUrl: `${baseUrl}/?checkout=success`,
+                  cancelUrl: `${baseUrl}/?checkout=cancel`,
+                }),
+              });
+              const result = await res.json();
+              if (result.checkoutUrl) {
+                window.location.href = result.checkoutUrl;
+                return;
+              }
+              this.error = result.error || 'Could not start checkout.';
+            } catch (e: any) {
+              this.error = e?.message || 'Could not start checkout.';
+            }
+            this.cdr.markForCheck();
+            return;
+          }
+
           const alreadyVerified =
             response?.verified === true || response?.message === 'User registered successfully.';
           if (alreadyVerified) {
             this.success = false;
-            const email = (this.registerForm.get('email')?.value || '').toLowerCase();
             await this.router.navigate(['/setup/plan'], { queryParams: { email } });
             this.cdr.markForCheck();
             return;
@@ -796,6 +1105,7 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
         },
         error: (error) => {
           this.loading = false;
+          this.refreshTurnstile();
           // Display backend validation errors
           if (error.error?.error && typeof error.error.error === 'string') {
             this.error = error.error.error;
@@ -858,7 +1168,10 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     this.emailVerificationError = '';
     this.emailVerificationStep = false;
     this.signupEmailCodeConfirmed = true;
+    this.emailLockedAfterVerify = !!this.pendingEmail;
     this.registerForm.patchValue({ email: this.pendingEmail });
+    // Full registration form (and its Turnstile widget) mounts via *ngIf.
+    this.turnstileToken = '';
     this.cdr.markForCheck();
     this.snackBar.open('Code accepted. Complete your registration below.', 'Close', {
       duration: 4000,
@@ -872,6 +1185,8 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     this.emailVerificationError = '';
     this.pendingEmail = '';
     this.signupEmailCodeConfirmed = false;
+    this.emailLockedAfterVerify = false;
+    this.turnstileToken = '';
     this.cdr.markForCheck();
   }
 
@@ -890,8 +1205,19 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     }
   }
 
+  private onCMRegister(): void {
+    this.openCMSignup();
+  }
+
   getBranding(): string {
+    if (this.cmMode) {
+      return 'AlertPage Radio';
+    }
     return this.config?.branding || 'ThinLine Radio';
+  }
+
+  getServerVersion(): string {
+    return this.config?.version || packageInfo.version || '';
   }
 
   getSupportEmail(): string {
@@ -903,13 +1229,29 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   }
 
   shouldShowTurnstile(): boolean {
-    // Don't show Turnstile if user has an access code that looks like an invitation
-    // Invitation codes are 16 chars and alphanumeric only
-    const accessCode = this.registerForm.get('accessCode')?.value;
-    if (accessCode && accessCode.length === 16 && /^[A-Z0-9]+$/.test(accessCode)) {
-      return false; // Likely an invitation code, skip Turnstile
+    // Skip only when the server identified the access code as an invitation.
+    return !this.isInvitationAccessCode;
+  }
+
+  onTurnstileToken(token: string): void {
+    this.turnstileToken = token || '';
+    if (token) {
+      this.error = '';
+      this.groupAdminError = '';
     }
-    return true; // Show Turnstile for registration codes or no code
+    this.cdr.markForCheck();
+  }
+
+  onTurnstileFailed(message: string): void {
+    this.turnstileToken = '';
+    if (message) {
+      if (this.authMode === 'group-admin') {
+        this.groupAdminError = message;
+      } else {
+        this.error = message;
+      }
+    }
+    this.cdr.markForCheck();
   }
 
   handleSubscriptionRequired(): void {
@@ -956,8 +1298,25 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     this.http.get<any>('/api/registration-settings').subscribe({
       next: (settings) => {
         console.log('[AUTH-SCREEN] Registration settings received:', settings);
+        this.cmMode = !!settings.centralManagementEnabled;
+        this.cmPortalUrl = settings.centralManagementPortalUrl || '';
+        this.cmServerName = settings.scannerName || settings.centralManagementServerName || '';
         this.isInviteOnlyMode = !settings.publicRegistrationEnabled;
         this.emailVerificationRequired = !!settings.emailVerificationRequired;
+
+        if (this.cmMode) {
+          // AlertPage signup: no local zip / invite / CAPTCHA / email-code flow.
+          this.isInviteOnlyMode = false;
+          this.emailVerificationRequired = false;
+          this.registerForm.get('zipCode')?.clearValidators();
+          this.registerForm.get('zipCode')?.updateValueAndValidity();
+          this.turnstileEnabled = false;
+          console.log('[AUTH-SCREEN] CM mode enabled — using AlertPage auth proxy');
+          this.registrationSettingsLoaded = true;
+          this.cdr.markForCheck();
+          return;
+        }
+
         console.log('[AUTH-SCREEN] isInviteOnlyMode set to:', this.isInviteOnlyMode);
         
         // Only load public info if NOT in invite-only mode
@@ -987,26 +1346,143 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     this.http.get<any>('/api/public-registration-info').subscribe({
       next: (info) => {
         this.publicGroupInfo = info;
+        // Only offer self-billable public tiers for signup (admin-billed tiers
+        // reject at register with "cannot be self-selected").
+        const rawTiers = info?.tiers || [];
+        this.tiers = rawTiers.filter((t: any) => t.selfBillable !== false);
+        // A single tier behaves exactly like the old single-group signup.
+        if (this.tiers.length === 1) {
+          this.selectedTiers[this.tiers[0].groupId] = true;
+          this.primaryTierId = this.tiers[0].groupId;
+        }
         this.loadingGroupInfo = false;
+        // Refresh channels now that tiers (and any auto-selected single tier) are known.
+        this.loadAvailableChannels();
+        this.cdr.markForCheck();
       },
       error: (error) => {
         console.error('Error loading public registration info:', error);
         this.loadingGroupInfo = false;
+        this.cdr.markForCheck();
       }
     });
   }
 
-  loadAvailableChannels(): void {
-    this.loadingChannels = true;
-    this.http.get<any>('/api/public-registration-channels').subscribe({
-      next: (response) => {
-        this.availableChannels = response.systems || [];
-        this.loadingChannels = false;
-      },
-      error: (error) => {
-        console.error('Error loading available channels:', error);
-        this.loadingChannels = false;
+  toggleTier(groupId: number): void {
+    this.selectedTiers[groupId] = !this.selectedTiers[groupId];
+    if (this.selectedTiers[groupId]) {
+      if (this.primaryTierId === null) {
+        this.primaryTierId = groupId;
       }
+      this.autoSelectSoleTierPrice(groupId);
+    } else {
+      delete this.tierPrice[groupId];
+      if (this.primaryTierId === groupId) {
+        const remaining = this.selectedTierIds();
+        this.primaryTierId = remaining.length ? remaining[0] : null;
+      }
+    }
+    // Keep the "available channels" union in sync with the selection.
+    this.loadAvailableChannels();
+    this.cdr.markForCheck();
+  }
+
+  /** When a paid tier has exactly one pricing option, pick it automatically. */
+  autoSelectSoleTierPrice(groupId: number): void {
+    const tier = this.tiers.find(t => t.groupId === groupId);
+    if (!tier?.billingEnabled || this.tierPrice[groupId]) {
+      return;
+    }
+    const options = tier.pricingOptions || [];
+    if (options.length === 1 && options[0]?.priceId) {
+      this.tierPrice[groupId] = options[0].priceId;
+    }
+  }
+
+  setTierPrice(groupId: number, priceId: string): void {
+    this.tierPrice[groupId] = priceId;
+    this.cdr.markForCheck();
+  }
+
+  /** True when a selected paid tier has billing on but no pricing options configured. */
+  tierMissingPricing(tier: any): boolean {
+    return !!this.selectedTiers[tier.groupId] && !!tier.billingEnabled && !(tier.pricingOptions?.length);
+  }
+
+  selectedTierIds(): number[] {
+    return this.tiers.filter(t => this.selectedTiers[t.groupId]).map(t => t.groupId);
+  }
+
+  /** Every selected paid tier must have a pricing option chosen. */
+  tierSelectionValid(): boolean {
+    if (this.selectedTierIds().length === 0) {
+      return false;
+    }
+    return this.tiers.every(t => {
+      if (!this.selectedTiers[t.groupId]) { return true; }
+      if (!t.billingEnabled) { return true; }
+      // Misconfigured paid tier (no prices) cannot be joined via self-serve signup.
+      if (!(t.pricingOptions?.length)) { return false; }
+      return !!this.tierPrice[t.groupId];
+    });
+  }
+
+  /**
+   * True when the signup form should require an explicit tier selection.
+   * Matches the server: only when more than one public registration group exists.
+   * Single-tier paid signup continues to choose a plan on /setup/plan after register.
+   */
+  usingTierSelection(): boolean {
+    return this.tiers.length > 1 && !this.registerForm.get('accessCode')?.value?.trim();
+  }
+
+  loadAvailableChannels(): void {
+    // Show the union of channels granted by the selected tiers (or all public
+    // tiers before anything is selected / single-tier signup).
+    let ids = this.selectedTierIds();
+    if (ids.length === 0) {
+      ids = this.tiers.map(t => t.groupId);
+    }
+
+    // No tier info yet — fall back to the legacy single-group endpoint.
+    if (ids.length === 0) {
+      this.loadingChannels = true;
+      this.http.get<any>('/api/public-registration-channels').subscribe({
+        next: (response) => { this.availableChannels = response.systems || []; this.loadingChannels = false; this.cdr.markForCheck(); },
+        error: () => { this.loadingChannels = false; this.cdr.markForCheck(); }
+      });
+      return;
+    }
+
+    this.loadingChannels = true;
+    const sysMap = new Map<any, any>();
+    let pending = ids.length;
+    const done = () => {
+      if (--pending > 0) { return; }
+      this.availableChannels = [...sysMap.values()].map((e: any) => {
+        const { _tgIds, ...rest } = e;
+        return rest;
+      });
+      this.loadingChannels = false;
+      this.cdr.markForCheck();
+    };
+    ids.forEach(id => {
+      this.http.get<any>(`/api/public-registration-channels?groupId=${id}`).subscribe({
+        next: (response) => {
+          (response?.systems || []).forEach((sys: any) => {
+            let entry = sysMap.get(sys.id);
+            if (!entry) {
+              entry = { id: sys.id, label: sys.label, talkgroups: [], _tgIds: new Set() };
+              sysMap.set(sys.id, entry);
+            }
+            (sys.talkgroups || []).forEach((tg: any) => {
+              if (!entry._tgIds.has(tg.id)) { entry._tgIds.add(tg.id); entry.talkgroups.push(tg); }
+            });
+          });
+          done();
+        },
+        error: () => done()
+      });
     });
   }
 
@@ -1075,20 +1551,29 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
           this.codeValidated = true;
           // A validated access/invitation code counts as email verification — skip the email code step
           this.signupEmailCodeConfirmed = true;
+          this.accessCodeType =
+            response.type === 'invitation' ? 'invitation' :
+            response.type === 'registration' ? 'registration' :
+            null;
           
           // Set the code in the form
           this.registerForm.patchValue({
             accessCode: this.pendingAccessCode
           });
           
-          // If email was provided in invitation, pre-fill it
+          // Only lock email when the code is bound to a specific address.
+          // Generic access codes leave email empty and editable (#261).
           if (response.email) {
             this.registerForm.patchValue({
               email: response.email
             });
             this.pendingEmail = response.email;
+            this.emailLockedAfterVerify = true;
+          } else {
+            this.emailLockedAfterVerify = false;
           }
           
+          this.turnstileToken = '';
           this.snackBar.open('Code validated successfully!', 'Close', {
             duration: 3000
           });
@@ -1121,6 +1606,9 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
   }
 
   isUserRegistrationEnabled(): boolean {
+    if (this.cmMode) {
+      return true;
+    }
     // If options are missing (e.g., websocket config without options), assume enabled
     const opt = this.config?.options;
     if (!opt || opt.userRegistrationEnabled === undefined) {
@@ -1149,136 +1637,30 @@ export class RdioScannerAuthScreenComponent implements OnInit, OnDestroy, AfterV
     }
   }
   
-  loadTurnstileScript(): void {
-    // Check if script is already loaded
-    if ((window as any).turnstile) {
-      this.initTurnstileWidget();
+  /** Clear the used token and remount the active form's Turnstile widget (issue #239 / #259). */
+  refreshTurnstile(): void {
+    if (!this.turnstileEnabled) {
       return;
     }
-
-    // Load Turnstile script (latest version)
-    const script = document.createElement('script');
-    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-    script.async = true;
-    script.defer = true;
-    script.onload = () => {
-      this.initTurnstileWidget();
-    };
-    document.head.appendChild(script);
-  }
-
-  initTurnstileWidget(): void {
-    // Prevent multiple simultaneous initializations - set flag IMMEDIATELY
-    if (this.turnstileInitAttempted || this.turnstileInitializing) {
-      return;
-    }
-    
-    this.turnstileInitAttempted = true;
-    this.turnstileInitializing = true;
-    
-    // Clear any old token from sessionStorage when starting a new verification
-    this.isResettingTurnstile = true;
     this.turnstileToken = '';
-    this.isResettingTurnstile = false;
-    
-    // Wait for DOM to be ready
-    setTimeout(() => {
-      const widgetContainer = document.getElementById('turnstile-widget-auth');
-      if (widgetContainer && (window as any).turnstile && this.turnstileSiteKey) {
-        // Check if widget already exists in container
-        if (widgetContainer.children.length > 0) {
-          // Widget already exists, don't create another
-          this.turnstileInitAttempted = true;
-          return;
-        }
-        
-        // Remove existing widget if any
-        if (this.turnstileWidgetId !== null) {
-          try {
-            (window as any).turnstile.remove(this.turnstileWidgetId);
-          } catch (e) {
-            // Ignore errors
-          }
-          this.turnstileWidgetId = null;
-        }
-        
-        // Clear container
-        widgetContainer.innerHTML = '';
-        
-        try {
-          this.turnstileWidgetId = (window as any).turnstile.render(widgetContainer, {
-            sitekey: this.turnstileSiteKey,
-            callback: (token: string) => {
-              // Wrap in ngZone to ensure Angular detects the change
-              this.ngZone.run(() => {
-                this.turnstileToken = token;
-                this.error = ''; // Clear error when token is received
-                this.cdr.detectChanges();
-              });
-            },
-            'error-callback': (errorCode: string) => {
-              this.ngZone.run(() => {
-                this.turnstileToken = '';
-                this.error = 'CAPTCHA verification failed. Please try again.';
-                this.cdr.detectChanges();
-              });
-            },
-            'expired-callback': () => {
-              this.ngZone.run(() => {
-                this.turnstileToken = '';
-                this.cdr.detectChanges();
-              });
-            },
-            theme: 'light',
-            size: 'normal'
-          });
-          this.turnstileInitializing = false;
-        } catch (e) {
-          // If rendering fails, reset the flags so we can try again
-          this.turnstileInitAttempted = false;
-          this.turnstileInitializing = false;
-        }
-      }
-    }, 300);
+    try { sessionStorage.removeItem('turnstile_token'); } catch { /* ignore */ }
+
+    // Defer so ViewChild is available after Angular recreates the view.
+    setTimeout(() => this.activeTurnstile()?.refresh(), 0);
+    this.cdr.markForCheck();
   }
-  
-  resetTurnstile(): void {
-    this.isResettingTurnstile = true; // Allow token to be cleared
-    
-    if (this.turnstileWidgetId !== null && (window as any).turnstile) {
-      try {
-        (window as any).turnstile.remove(this.turnstileWidgetId);
-      } catch (e) {
-        // Ignore errors
-      }
-      this.turnstileWidgetId = null;
+
+  private activeTurnstile(): RdioScannerTurnstileComponent | undefined {
+    if (this.authMode === 'login') {
+      return this.loginTurnstile;
     }
-    // Clear the container
-    const widgetContainer = document.getElementById('turnstile-widget-auth');
-    if (widgetContainer) {
-      widgetContainer.innerHTML = '';
+    if (this.authMode === 'register') {
+      return this.registerTurnstile;
     }
-    this.turnstileToken = ''; // This will also clear sessionStorage
-    this.isResettingTurnstile = false;
-  }
-  
-  private autofillCheckAttempts = 0;
-  private maxAutofillChecks = 20; // Check for 10 seconds (20 * 500ms)
-  
-  ngAfterViewInit(): void {
-    // No special autofill handling needed - we read values directly from inputs on submit
-  }
-  
-  ngAfterViewChecked(): void {
-    // Check if we need to initialize Turnstile widget
-    // Only initialize once per auth mode change
-    if (this.turnstileEnabled && this.turnstileSiteKey && !this.turnstileInitAttempted) {
-      const widgetContainer = document.getElementById('turnstile-widget-auth');
-      if (widgetContainer && (window as any).turnstile && widgetContainer.children.length === 0) {
-        // Only initialize if container is empty (no widget already rendered)
-        this.initTurnstileWidget();
-      }
+    if (this.authMode === 'group-admin') {
+      return this.groupAdminTurnstile;
     }
+    return undefined;
   }
 }
 

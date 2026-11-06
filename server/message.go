@@ -22,6 +22,7 @@ import (
 
 const (
 	MessageCommandAlert          = "ALT"
+	MessageCommandIncident       = "INC"
 	MessageCommandCall           = "CAL"
 	MessageCommandConfig         = "CFG"
 	MessageCommandError          = "ERR"
@@ -34,6 +35,7 @@ const (
 	MessageCommandMax            = "MAX"
 	MessageCommandPin            = "PIN"
 	MessageCommandPinSet         = "PNS"
+	MessageCommandPing           = "PNG"
 	MessageCommandPushId         = "PID"
 	MessageCommandServer         = "SRV"
 	MessageCommandVersion        = "VER"

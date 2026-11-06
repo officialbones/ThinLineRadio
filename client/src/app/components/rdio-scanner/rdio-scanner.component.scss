@@ -1,12 +1,28 @@
-$background-color: rgb(30, 30, 30);
+$background-color: #06080c;
 
 :host {
   background-color: $background-color;
   color: rgb(255, 255, 255);
-  display: block;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
   height: 100%;
+  min-height: 0;
   min-width: 320px;
   position: relative;
+
+  // Full-page auth / verify / mobile hub: allow vertical scroll, no desktop floor width
+  &:has(rdio-scanner-auth-screen),
+  &:has(rdio-scanner-email-verification),
+  &:has(rdio-scanner-mobile-web-hub) {
+    height: auto;
+    min-height: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 
   .scanner-shell {
     align-items: stretch;
@@ -14,106 +30,62 @@ $background-color: rgb(30, 30, 30);
     color: inherit;
     display: flex;
     flex-direction: row;
-    justify-content: center;
+    flex: 1 1 auto;
     height: 100%;
     min-height: 0;
+    min-width: 0;
+    width: 100%;
+
+    &:has(rdio-scanner-auth-screen),
+    &:has(rdio-scanner-email-verification),
+    &:has(rdio-scanner-mobile-web-hub) {
+      flex-direction: column;
+      min-width: 0;
+      max-width: 100%;
+      width: 100%;
+      height: auto;
+      min-height: 100%;
+      overflow-x: hidden;
+      overflow-y: visible;
+    }
   }
 
-  /* Both view branches (console + classic) are mounted simultaneously and
-     toggled via [hidden] so view switches preserve all in-component state. */
+  ::ng-deep rdio-scanner-auth-screen,
+  ::ng-deep rdio-scanner-email-verification,
+  ::ng-deep rdio-scanner-mobile-web-hub {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    flex: 1 1 auto;
+    align-self: stretch;
+  }
+
   .view-host {
     display: flex;
     flex: 1 1 auto;
     flex-direction: column;
     align-items: stretch;
-    justify-content: center;
+    justify-content: flex-start;
     min-height: 0;
     min-width: 0;
     width: 100%;
-
-    &[hidden] {
-      display: none !important;
-    }
+    height: 100%;
   }
 
-  /* New tab-based console fills height. Width / centering / gutters live on
-     the component's own :host so it stays under its component scope. */
+  ::ng-deep rdio-scanner-chassis {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
   ::ng-deep rdio-scanner-console {
     flex: 1 1 auto;
     min-height: 0;
+    height: 100%;
     display: flex;
     flex-direction: column;
-  }
-
-  /* Classic view: sidenav container fills full height */
-  ::ng-deep .mat-sidenav-container {
-    background-color: $background-color;
-    color: inherit;
-    height: 100%;
-    width: 100%;
-  }
-
-  ::ng-deep .mat-sidenav {
-    background-color: $background-color;
-    color: inherit;
-    width: 100%;
-  }
-
-  ::ng-deep .mat-sidenav-content {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    overflow: auto;
-  }
-
-  /* ── ThinLine skin — classic view chassis ────────────────────────────
-   * Only kicks in when classic view opts in via .thinline-skin on the
-   * sidenav container; legacy main-legacy SCSS supplies the per-panel
-   * overrides. */
-  ::ng-deep .mat-sidenav-container.thinline-skin,
-  ::ng-deep .mat-sidenav-container.thinline-skin .mat-sidenav-content {
-    background: var(--tlr-chassis-gradient, $background-color);
-    color: var(--tlr-text, inherit);
-  }
-
-  ::ng-deep .mat-sidenav-container.thinline-skin .mat-sidenav {
-    background: var(--tlr-lcd-gradient, $background-color);
-    color: var(--tlr-text, inherit);
-  }
-}
-
-.panel {
-  background-color: $background-color;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-
-  &.search .mat-toolbar > div {
-    justify-content: flex-end;
-  }
-
-  > div {
-    flex: 1;
-    height: 100%;
-    overflow: auto;
-  }
-
-  .mat-toolbar {
-    background-color: inherit;
-    box-shadow: 0 4px 8px rgba($background-color, 0.8);
-    color: currentColor;
-    z-index: 2;
-
-    > div {
-      display: flex;
-      flex-direction: row;
-    }
-  }
-
-  > div > div,
-  .mat-toolbar > div {
-    margin: 0 auto;
-    max-width: 1200px;
-    width: 100%;
   }
 }

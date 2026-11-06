@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,12 +53,17 @@ type UserGroup struct {
 	StripeTaxRateId       string // Stripe Tax Rate ID (e.g. txr_xxx) used when TaxMode = "fixed"
 	IsPublicRegistration  bool
 	AllowAddExistingUsers bool // Allow group admins to add existing users from any group
-	CreatedAt             int64
-	systemAccessData      []uint64 // Legacy format: simple array of system IDs
-	systemAccessDataNew   any      // New format: array of objects with id and talkgroups (same format as user systemsData)
-	systemDelaysMap       map[uint64]uint
-	talkgroupDelaysMap    map[string]uint
-	pricingOptionsData    []PricingOption
+	// AutoEnableNewTalkgroups controls whether newly created systems/talkgroups are
+	// automatically granted to this group (when access uses wildcards / All) and
+	// whether clients should default those channels on in the livefeed map.
+	// Default false: freeze wildcards to an explicit snapshot on save; clients default off.
+	AutoEnableNewTalkgroups bool
+	CreatedAt               int64
+	systemAccessData        []uint64 // Legacy format: simple array of system IDs
+	systemAccessDataNew     any      // New format: array of objects with id and talkgroups (same format as user systemsData)
+	systemDelaysMap         map[uint64]uint
+	talkgroupDelaysMap      map[string]uint
+	pricingOptionsData      []PricingOption
 }
 
 type UserGroups struct {
@@ -72,9 +78,18 @@ func NewUserGroups() *UserGroups {
 }
 
 func (ug *UserGroup) loadSystemAccess() {
-	if strings.TrimSpace(ug.SystemAccess) == "" {
+	trimmed := strings.TrimSpace(ug.SystemAccess)
+	if trimmed == "" {
+		// Empty string means All systems (legacy wildcard).
 		ug.systemAccessData = []uint64{}
 		ug.systemAccessDataNew = nil
+		return
+	}
+
+	// Explicit empty JSON array means no systems (deny-all), not All.
+	if trimmed == "[]" {
+		ug.systemAccessData = []uint64{}
+		ug.systemAccessDataNew = []map[string]interface{}{}
 		return
 	}
 
@@ -99,6 +114,149 @@ func (ug *UserGroup) loadSystemAccess() {
 		ug.systemAccessData = systems
 		ug.systemAccessDataNew = nil
 	}
+}
+
+// NormalizeSystemAccess freezes wildcards when AutoEnableNewTalkgroups is false.
+// Empty SystemAccess (All) and talkgroups:"*" become explicit ID lists of systems/TGs
+// that exist at save time, so later additions are not granted until an admin updates the group.
+// When freezeAll is false, empty All is left unchanged (only talkgroups:"*" are expanded);
+// use freezeAll=true on admin save so choosing All with the toggle off becomes a snapshot.
+func (ug *UserGroup) NormalizeSystemAccess(systems *Systems) {
+	ug.normalizeSystemAccess(systems, true)
+}
+
+// ExpandStarTalkgroups expands talkgroups:"*" to current TG IDs when auto-enable is
+// off, without converting empty All into a full snapshot. Safe for startup.
+func (ug *UserGroup) ExpandStarTalkgroups(systems *Systems) {
+	ug.normalizeSystemAccess(systems, false)
+}
+
+func (ug *UserGroup) normalizeSystemAccess(systems *Systems, freezeAll bool) {
+	if ug == nil || ug.AutoEnableNewTalkgroups {
+		return
+	}
+	if systems == nil {
+		systems = &Systems{}
+	}
+
+	trimmed := strings.TrimSpace(ug.SystemAccess)
+
+	buildAllSnapshot := func() []map[string]interface{} {
+		out := make([]map[string]interface{}, 0, len(systems.List))
+		for _, system := range systems.List {
+			tgRefs := make([]interface{}, 0, len(system.Talkgroups.List))
+			for _, tg := range system.Talkgroups.List {
+				tgRefs = append(tgRefs, tg.TalkgroupRef)
+			}
+			out = append(out, map[string]interface{}{
+				"id":         system.SystemRef,
+				"talkgroups": tgRefs,
+			})
+		}
+		return out
+	}
+
+	expandTalkgroups := func(systemRef uint64, talkgroups any) []interface{} {
+		system, ok := systems.GetSystemByRef(uint(systemRef))
+		if !ok || system == nil || system.Talkgroups == nil {
+			if list, ok := talkgroups.([]interface{}); ok {
+				return list
+			}
+			return []interface{}{}
+		}
+		switch v := talkgroups.(type) {
+		case string:
+			if v == "*" {
+				refs := make([]interface{}, 0, len(system.Talkgroups.List))
+				for _, tg := range system.Talkgroups.List {
+					refs = append(refs, tg.TalkgroupRef)
+				}
+				return refs
+			}
+		case []interface{}:
+			return v
+		case nil:
+			refs := make([]interface{}, 0, len(system.Talkgroups.List))
+			for _, tg := range system.Talkgroups.List {
+				refs = append(refs, tg.TalkgroupRef)
+			}
+			return refs
+		}
+		refs := make([]interface{}, 0, len(system.Talkgroups.List))
+		for _, tg := range system.Talkgroups.List {
+			refs = append(refs, tg.TalkgroupRef)
+		}
+		return refs
+	}
+
+	var frozen []map[string]interface{}
+
+	if trimmed == "" {
+		if !freezeAll {
+			return
+		}
+		frozen = buildAllSnapshot()
+	} else {
+		var newFormat []map[string]interface{}
+		if err := json.Unmarshal([]byte(trimmed), &newFormat); err == nil && len(newFormat) > 0 {
+			if _, ok := newFormat[0]["id"]; ok {
+				frozen = make([]map[string]interface{}, 0, len(newFormat))
+				changed := false
+				for _, scope := range newFormat {
+					var systemRef uint64
+					switch id := scope["id"].(type) {
+					case float64:
+						systemRef = uint64(id)
+					case string:
+						if parsed, err := strconv.ParseUint(id, 10, 64); err == nil {
+							systemRef = parsed
+						}
+					}
+					if systemRef == 0 {
+						continue
+					}
+					tgVal := scope["talkgroups"]
+					if s, ok := tgVal.(string); ok && s == "*" {
+						changed = true
+					} else if tgVal == nil {
+						changed = true
+					}
+					frozen = append(frozen, map[string]interface{}{
+						"id":         systemRef,
+						"talkgroups": expandTalkgroups(systemRef, tgVal),
+					})
+				}
+				if !freezeAll && !changed {
+					return
+				}
+			}
+		}
+		if frozen == nil {
+			var legacy []uint64
+			if err := json.Unmarshal([]byte(trimmed), &legacy); err == nil {
+				// Legacy system-ID lists imply all talkgroups; expand when freezing.
+				frozen = make([]map[string]interface{}, 0, len(legacy))
+				for _, systemRef := range legacy {
+					frozen = append(frozen, map[string]interface{}{
+						"id":         systemRef,
+						"talkgroups": expandTalkgroups(systemRef, "*"),
+					})
+				}
+			} else if freezeAll {
+				frozen = buildAllSnapshot()
+			} else {
+				return
+			}
+		}
+	}
+
+	encoded, err := json.Marshal(frozen)
+	if err != nil {
+		log.Printf("Error freezing system access for group %d: %v", ug.Id, err)
+		return
+	}
+	ug.SystemAccess = string(encoded)
+	ug.loadSystemAccess()
 }
 
 func (ug *UserGroup) loadSystemDelays() {
@@ -147,6 +305,24 @@ func (ug *UserGroup) loadPricingOptions() {
 
 func (ug *UserGroup) GetPricingOptions() []PricingOption {
 	return ug.pricingOptionsData
+}
+
+// HasAnySystemAccess reports whether the group grants access to at least one system.
+func (ug *UserGroup) HasAnySystemAccess() bool {
+	if ug == nil {
+		return false
+	}
+	if ug.systemAccessDataNew != nil {
+		switch v := ug.systemAccessDataNew.(type) {
+		case []map[string]interface{}:
+			return len(v) > 0
+		}
+	}
+	// Legacy: empty list means all systems.
+	if len(ug.systemAccessData) == 0 {
+		return true
+	}
+	return len(ug.systemAccessData) > 0
 }
 
 func (ug *UserGroup) HasSystemAccess(systemId uint64) bool {
@@ -281,7 +457,7 @@ func (ugs *UserGroups) Load(db *Database) error {
 	ugs.mutex.Lock()
 	defer ugs.mutex.Unlock()
 
-	rows, err := db.Sql.Query(`SELECT "userGroupId", "name", "description", "systemAccess", "delay", "systemDelays", "talkgroupDelays", "connectionLimit", "maxUsers", "billingEnabled", "stripePriceId", "pricingOptions", "billingMode", "collectSalesTax", "taxMode", "stripeTaxRateId", "isPublicRegistration", "allowAddExistingUsers", "createdAt" FROM "userGroups"`)
+	rows, err := db.Sql.Query(`SELECT "userGroupId", "name", "description", "systemAccess", "delay", "systemDelays", "talkgroupDelays", "connectionLimit", "maxUsers", "billingEnabled", "stripePriceId", "pricingOptions", "billingMode", "collectSalesTax", "taxMode", "stripeTaxRateId", "isPublicRegistration", "allowAddExistingUsers", "autoEnableNewTalkgroups", "createdAt" FROM "userGroups"`)
 	if err != nil {
 		return err
 	}
@@ -300,6 +476,7 @@ func (ugs *UserGroups) Load(db *Database) error {
 		var createdAt sql.NullInt64
 		var maxUsers sql.NullInt64
 		var allowAddExistingUsers sql.NullBool
+		var autoEnableNewTalkgroups sql.NullBool
 		var stripePriceId sql.NullString
 		var pricingOptions sql.NullString
 		var billingMode sql.NullString
@@ -326,6 +503,7 @@ func (ugs *UserGroups) Load(db *Database) error {
 			&stripeTaxRateId,
 			&group.IsPublicRegistration,
 			&allowAddExistingUsers,
+			&autoEnableNewTalkgroups,
 			&createdAt,
 		)
 		if err != nil {
@@ -341,6 +519,12 @@ func (ugs *UserGroups) Load(db *Database) error {
 			group.AllowAddExistingUsers = allowAddExistingUsers.Bool
 		} else {
 			group.AllowAddExistingUsers = false // Default to false for existing groups
+		}
+
+		if autoEnableNewTalkgroups.Valid {
+			group.AutoEnableNewTalkgroups = autoEnableNewTalkgroups.Bool
+		} else {
+			group.AutoEnableNewTalkgroups = false
 		}
 
 		if stripePriceId.Valid {
@@ -432,6 +616,31 @@ func (ugs *UserGroups) GetPublicRegistrationGroup() *UserGroup {
 	return nil
 }
 
+// GetPublicRegistrationGroups returns every group flagged as a public
+// registration tier, ordered by name for a stable signup listing.
+func (ugs *UserGroups) GetPublicRegistrationGroups() []*UserGroup {
+	ugs.mutex.RLock()
+	defer ugs.mutex.RUnlock()
+	out := []*UserGroup{}
+	for _, group := range ugs.groups {
+		if group.IsPublicRegistration {
+			out = append(out, group)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// IsSelfBillable reports whether a user can self-serve join/leave this group:
+// free groups, or paid groups billed per-user ("all_users"). Groups billed via
+// "group_admin" (a shared customer the admin pays) are excluded.
+func (ug *UserGroup) IsSelfBillable() bool {
+	if ug == nil {
+		return false
+	}
+	return !ug.BillingEnabled || ug.BillingMode == "all_users" || ug.BillingMode == ""
+}
+
 func (ugs *UserGroups) GetAll() []*UserGroup {
 	ugs.mutex.RLock()
 	defer ugs.mutex.RUnlock()
@@ -454,9 +663,9 @@ func (ugs *UserGroups) Add(group *UserGroup, db *Database) error {
 
 	var userId int64
 	err := db.Sql.QueryRow(
-		`INSERT INTO "userGroups" ("name", "description", "systemAccess", "delay", "systemDelays", "talkgroupDelays", "connectionLimit", "maxUsers", "billingEnabled", "stripePriceId", "pricingOptions", "billingMode", "collectSalesTax", "taxMode", "stripeTaxRateId", "isPublicRegistration", "allowAddExistingUsers", "createdAt") 
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING "userGroupId"`,
-		group.Name, group.Description, group.SystemAccess, group.Delay, group.SystemDelays, group.TalkgroupDelays, group.ConnectionLimit, group.MaxUsers, group.BillingEnabled, group.StripePriceId, group.PricingOptions, group.BillingMode, group.CollectSalesTax, group.TaxMode, group.StripeTaxRateId, group.IsPublicRegistration, group.AllowAddExistingUsers, group.CreatedAt,
+		`INSERT INTO "userGroups" ("name", "description", "systemAccess", "delay", "systemDelays", "talkgroupDelays", "connectionLimit", "maxUsers", "billingEnabled", "stripePriceId", "pricingOptions", "billingMode", "collectSalesTax", "taxMode", "stripeTaxRateId", "isPublicRegistration", "allowAddExistingUsers", "autoEnableNewTalkgroups", "createdAt") 
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING "userGroupId"`,
+		group.Name, group.Description, group.SystemAccess, group.Delay, group.SystemDelays, group.TalkgroupDelays, group.ConnectionLimit, group.MaxUsers, group.BillingEnabled, group.StripePriceId, group.PricingOptions, group.BillingMode, group.CollectSalesTax, group.TaxMode, group.StripeTaxRateId, group.IsPublicRegistration, group.AllowAddExistingUsers, group.AutoEnableNewTalkgroups, group.CreatedAt,
 	).Scan(&userId)
 
 	if err != nil {
@@ -479,8 +688,8 @@ func (ugs *UserGroups) Update(group *UserGroup, db *Database) error {
 	group.loadPricingOptions()
 
 	_, err := db.Sql.Exec(
-		`UPDATE "userGroups" SET "name" = $1, "description" = $2, "systemAccess" = $3, "delay" = $4, "systemDelays" = $5, "talkgroupDelays" = $6, "connectionLimit" = $7, "maxUsers" = $8, "billingEnabled" = $9, "stripePriceId" = $10, "pricingOptions" = $11, "billingMode" = $12, "collectSalesTax" = $13, "taxMode" = $14, "stripeTaxRateId" = $15, "isPublicRegistration" = $16, "allowAddExistingUsers" = $17 WHERE "userGroupId" = $18`,
-		group.Name, group.Description, group.SystemAccess, group.Delay, group.SystemDelays, group.TalkgroupDelays, group.ConnectionLimit, group.MaxUsers, group.BillingEnabled, group.StripePriceId, group.PricingOptions, group.BillingMode, group.CollectSalesTax, group.TaxMode, group.StripeTaxRateId, group.IsPublicRegistration, group.AllowAddExistingUsers, group.Id,
+		`UPDATE "userGroups" SET "name" = $1, "description" = $2, "systemAccess" = $3, "delay" = $4, "systemDelays" = $5, "talkgroupDelays" = $6, "connectionLimit" = $7, "maxUsers" = $8, "billingEnabled" = $9, "stripePriceId" = $10, "pricingOptions" = $11, "billingMode" = $12, "collectSalesTax" = $13, "taxMode" = $14, "stripeTaxRateId" = $15, "isPublicRegistration" = $16, "allowAddExistingUsers" = $17, "autoEnableNewTalkgroups" = $18 WHERE "userGroupId" = $19`,
+		group.Name, group.Description, group.SystemAccess, group.Delay, group.SystemDelays, group.TalkgroupDelays, group.ConnectionLimit, group.MaxUsers, group.BillingEnabled, group.StripePriceId, group.PricingOptions, group.BillingMode, group.CollectSalesTax, group.TaxMode, group.StripeTaxRateId, group.IsPublicRegistration, group.AllowAddExistingUsers, group.AutoEnableNewTalkgroups, group.Id,
 	)
 
 	if err != nil {
@@ -527,7 +736,7 @@ func (ugs *UserGroups) GetUserCount(groupId uint64, users *Users) uint {
 	defer users.mutex.RUnlock()
 
 	for _, user := range users.users {
-		if user.UserGroupId == groupId {
+		if user.IsMemberOf(groupId) {
 			count++
 		}
 	}

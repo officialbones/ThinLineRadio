@@ -48,6 +48,8 @@ type SystemAlertData struct {
 	Threshold        int    `json:"threshold,omitempty"`
 	LastCallTime     int64  `json:"lastCallTime,omitempty"`
 	MinutesSinceLast int    `json:"minutesSinceLast,omitempty"`
+	ApiKeyId         uint64 `json:"apiKeyId,omitempty"`
+	ApiKeyIdent      string `json:"apiKeyIdent,omitempty"`
 }
 
 // CreateSystemAlert creates a new system alert
@@ -87,19 +89,29 @@ func (controller *Controller) CreateSystemAlert(alertType, severity, title, mess
 	return nil
 }
 
-// SendSystemAlertNotification sends a push notification for system alerts
-// Manual alerts (sent by admins) go to all verified users
-// Health monitoring alerts only go to system admins
+// SendSystemAlertNotification sends a push notification for system alerts.
+// Manual alerts go to all verified users.
+// System/API key no-audio alerts go to system admins and users with push enabled
+// for the specific assigned system or API key.
+// Other health alerts go to system admins only.
 func (controller *Controller) SendSystemAlertNotification(title, message, alertType, severity, dataJSON string) {
 	var query string
 	var targetDescription string
+	filterByAssignment := false
 
-	if alertType == "manual" {
-		// Manual alerts: send to ALL verified users
+	switch alertType {
+	case "manual":
 		query = `SELECT "userId" FROM "users" WHERE "verified" = true`
 		targetDescription = "verified users"
-	} else {
-		// Health/monitoring alerts: only send to system admins
+	case "no_audio", "no_audio_received":
+		query = `SELECT "userId" FROM "users" WHERE "verified" = true AND ("systemAdmin" = true OR "pushSystemNoAudioAlerts" = true)`
+		targetDescription = "system no-audio alert recipients"
+		filterByAssignment = true
+	case "api_key_no_audio", "sdrtrunk_control_lost", "sdrtrunk_tuner_error", "sdrtrunk_uploader_error", "sdrtrunk_offline", "sdrtrunk_sample_overflow":
+		query = `SELECT "userId" FROM "users" WHERE "verified" = true AND ("systemAdmin" = true OR "pushApiKeyNoAudioAlerts" = true)`
+		targetDescription = "API key no-audio alert recipients"
+		filterByAssignment = true
+	default:
 		query = `SELECT "userId" FROM "users" WHERE "systemAdmin" = true`
 		targetDescription = "system admins"
 	}
@@ -116,6 +128,12 @@ func (controller *Controller) SendSystemAlertNotification(title, message, alertT
 		var userId uint64
 		if err := rows.Scan(&userId); err != nil {
 			continue
+		}
+		if filterByAssignment {
+			user := controller.Users.GetUserById(userId)
+			if !controller.userShouldReceiveSystemAlertPush(user, alertType, dataJSON) {
+				continue
+			}
 		}
 		targetUserIds = append(targetUserIds, userId)
 	}
@@ -304,8 +322,12 @@ func getProviderDisplayName(provider string) string {
 		return "Azure Speech Services"
 	case "google":
 		return "Google Cloud Speech-to-Text"
+	case "gemini":
+		return "Gemini Flash-Lite"
 	case "assemblyai":
 		return "AssemblyAI"
+	case "cloudflare":
+		return "Cloudflare Workers AI"
 	default:
 		// Default fallback if provider is unknown or empty
 		if provider == "" {
@@ -352,7 +374,7 @@ func (controller *Controller) MonitorTranscriptionFailures() {
 			repeatMinutes = 60 // Default: 60 minutes
 		}
 
-	checkAlertQuery := `SELECT MAX("createdAt") FROM "systemAlerts" 
+		checkAlertQuery := `SELECT MAX("createdAt") FROM "systemAlerts" 
 		WHERE "alertType" = 'transcription_failure' 
 			AND "dismissed" = false`
 
@@ -469,7 +491,7 @@ func (controller *Controller) MonitorToneDetectionIssues() {
 				repeatMinutes = 60 // Default: 60 minutes
 			}
 
-		checkAlertQuery := fmt.Sprintf(`
+			checkAlertQuery := fmt.Sprintf(`
 			SELECT MAX("createdAt") FROM "systemAlerts" 
 			WHERE "alertType" = 'tone_detection_issue' 
 				AND "data" LIKE '%%"talkgroupId":%d%%'
@@ -531,7 +553,7 @@ func (controller *Controller) MonitorNoAudioForSystem(systemId uint64, systemLab
 
 	var timeSinceLastCall time.Duration
 	var lastCallTimeMs int64
-	
+
 	// If no calls found, treat as infinite time since last call
 	if !lastCallTime.Valid {
 		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio monitoring: system '%s' (ID: %d) has no calls in database - will create alert", systemLabel, systemId))
@@ -543,17 +565,17 @@ func (controller *Controller) MonitorNoAudioForSystem(systemId uint64, systemLab
 		lastCall := time.Unix(lastCallTime.Int64/1000, 0)
 		timeSinceLastCall = currentTime.Sub(lastCall)
 		lastCallTimeMs = lastCallTime.Int64
-		
-		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio check: system '%s' (ID: %d) last call was %d minutes ago (threshold: %d minutes)", 
+
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio check: system '%s' (ID: %d) last call was %d minutes ago (threshold: %d minutes)",
 			systemLabel, systemId, int(timeSinceLastCall.Minutes()), thresholdMinutes))
 	}
 
 	// Check if time since last call exceeds threshold
 	thresholdDuration := time.Duration(thresholdMinutes) * time.Minute
 	if timeSinceLastCall > thresholdDuration {
-		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio threshold exceeded for system '%s' (ID: %d): %d minutes since last call (threshold: %d minutes)", 
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio threshold exceeded for system '%s' (ID: %d): %d minutes since last call (threshold: %d minutes)",
 			systemLabel, systemId, int(timeSinceLastCall.Minutes()), thresholdMinutes))
-		
+
 		// Check for existing alert
 		repeatMinutes := int(controller.Options.NoAudioRepeatMinutes)
 		if repeatMinutes <= 0 {
@@ -576,15 +598,15 @@ func (controller *Controller) MonitorNoAudioForSystem(systemId uint64, systemLab
 			if lastAlertTime.Int64 > repeatThreshold {
 				shouldCreateAlert = false
 				minutesSinceLastAlert := int(currentTime.Sub(time.UnixMilli(lastAlertTime.Int64)).Minutes())
-				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping no-audio alert for system '%s' (ID: %d) - alert created %d minutes ago (repeat interval: %d minutes)", 
+				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping no-audio alert for system '%s' (ID: %d) - alert created %d minutes ago (repeat interval: %d minutes)",
 					systemLabel, systemId, minutesSinceLastAlert, repeatMinutes))
 			}
 		}
 
 		if shouldCreateAlert {
-		// Dismiss any existing no-audio alerts for this system before creating new one
-		// This keeps only the latest alert instead of accumulating them
-		dismissQuery := fmt.Sprintf(`
+			// Dismiss any existing no-audio alerts for this system before creating new one
+			// This keeps only the latest alert instead of accumulating them
+			dismissQuery := fmt.Sprintf(`
 			UPDATE "systemAlerts" 
 			SET "dismissed" = true 
 			WHERE "alertType" = 'no_audio' 
@@ -630,7 +652,7 @@ func (controller *Controller) MonitorNoAudioForSystem(systemId uint64, systemLab
 			}
 		}
 	} else {
-		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio check OK: system '%s' (ID: %d) within threshold - %d minutes since last call (threshold: %d minutes)", 
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("no-audio check OK: system '%s' (ID: %d) within threshold - %d minutes since last call (threshold: %d minutes)",
 			systemLabel, systemId, int(timeSinceLastCall.Minutes()), thresholdMinutes))
 	}
 }
@@ -773,6 +795,230 @@ func (controller *Controller) RestartNoAudioMonitoringForSystem(systemId uint64)
 	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("restarted no-audio monitoring for system '%s' (ID: %d) with %d minute threshold", systemLabel, systemId, thresholdMinutes))
 }
 
+// MonitorNoAudioForApiKey monitors a specific API key for lack of upload activity.
+func (controller *Controller) MonitorNoAudioForApiKey(apikeyId uint64, apikeyIdent string, thresholdMinutes uint, monitorStartedAt int64) {
+	if !controller.Options.NoAudioAlertsEnabled || !controller.Options.SystemHealthAlertsEnabled {
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("api-key no-audio monitoring skipped for '%s' (ID: %d) - globally disabled", apikeyIdent, apikeyId))
+		return
+	}
+
+	currentTime := time.Now()
+
+	var lastCallAt int64
+	query := `SELECT "lastCallAt" FROM "apikeys" WHERE "apikeyId" = $1`
+	if err := controller.Database.Sql.QueryRow(query, apikeyId).Scan(&lastCallAt); err != nil {
+		controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("failed to query last call time for API key %d: %v", apikeyId, err))
+		return
+	}
+
+	referenceTime := lastCallAt
+	if referenceTime == 0 {
+		referenceTime = monitorStartedAt
+	}
+	if referenceTime == 0 {
+		referenceTime = currentTime.UnixMilli()
+	}
+
+	timeSinceLastCall := currentTime.Sub(time.UnixMilli(referenceTime))
+	lastCallTimeMs := lastCallAt
+
+	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("api-key no-audio check: key '%s' (ID: %d) last upload was %d minutes ago (threshold: %d minutes)",
+		apikeyIdent, apikeyId, int(timeSinceLastCall.Minutes()), thresholdMinutes))
+
+	thresholdDuration := time.Duration(thresholdMinutes) * time.Minute
+	if timeSinceLastCall <= thresholdDuration {
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("api-key no-audio check OK: key '%s' (ID: %d) within threshold - %d minutes since last upload (threshold: %d minutes)",
+			apikeyIdent, apikeyId, int(timeSinceLastCall.Minutes()), thresholdMinutes))
+		return
+	}
+
+	controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("api-key no-audio threshold exceeded for '%s' (ID: %d): %d minutes since last upload (threshold: %d minutes)",
+		apikeyIdent, apikeyId, int(timeSinceLastCall.Minutes()), thresholdMinutes))
+
+	if skip, reason := controller.sdrtrunkHealthExplainsQuietUpload(apikeyId); skip {
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping api-key no-audio alert for '%s' (ID: %d) - %s", apikeyIdent, apikeyId, reason))
+		return
+	}
+
+	repeatMinutes := int(controller.Options.NoAudioRepeatMinutes)
+	if repeatMinutes <= 0 {
+		repeatMinutes = 30
+	}
+
+	checkAlertQuery := fmt.Sprintf(`
+		SELECT MAX("createdAt") FROM "systemAlerts"
+		WHERE "alertType" = 'api_key_no_audio'
+			AND ("data" LIKE '%%"apiKeyId":%d,%%' OR "data" LIKE '%%"apiKeyId":%d}%%')
+			AND "dismissed" = false
+	`, apikeyId, apikeyId)
+
+	var lastAlertTime sql.NullInt64
+	shouldCreateAlert := true
+	repeatThreshold := currentTime.Add(-time.Duration(repeatMinutes) * time.Minute).UnixMilli()
+	if err := controller.Database.Sql.QueryRow(checkAlertQuery).Scan(&lastAlertTime); err == nil && lastAlertTime.Valid {
+		if lastAlertTime.Int64 > repeatThreshold {
+			shouldCreateAlert = false
+			minutesSinceLastAlert := int(currentTime.Sub(time.UnixMilli(lastAlertTime.Int64)).Minutes())
+			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("skipping api-key no-audio alert for '%s' (ID: %d) - alert created %d minutes ago (repeat interval: %d minutes)",
+				apikeyIdent, apikeyId, minutesSinceLastAlert, repeatMinutes))
+		}
+	}
+
+	if !shouldCreateAlert {
+		return
+	}
+
+	dismissQuery := fmt.Sprintf(`
+		UPDATE "systemAlerts"
+		SET "dismissed" = true
+		WHERE "alertType" = 'api_key_no_audio'
+			AND ("data" LIKE '%%"apiKeyId":%d,%%' OR "data" LIKE '%%"apiKeyId":%d}%%')
+			AND "dismissed" = false
+	`, apikeyId, apikeyId)
+	if _, err := controller.Database.Sql.Exec(dismissQuery); err != nil {
+		controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("failed to dismiss old api-key no-audio alerts for key %d: %v", apikeyId, err))
+	}
+
+	data := &SystemAlertData{
+		ApiKeyId:         apikeyId,
+		ApiKeyIdent:      apikeyIdent,
+		Threshold:        int(thresholdMinutes),
+		LastCallTime:     lastCallTimeMs,
+		MinutesSinceLast: int(timeSinceLastCall.Minutes()),
+	}
+
+	title := "No Uploads from API Key"
+	var message string
+	if lastCallTimeMs == 0 {
+		message = fmt.Sprintf("API key '%s' has not received any uploads since monitoring was enabled (threshold: %d minutes)",
+			apikeyIdent, thresholdMinutes)
+	} else {
+		message = fmt.Sprintf("API key '%s' has not received uploads for %d minutes (threshold: %d minutes)",
+			apikeyIdent, int(timeSinceLastCall.Minutes()), thresholdMinutes)
+	}
+
+	if err := controller.CreateSystemAlert(
+		"api_key_no_audio",
+		"warning",
+		title,
+		message,
+		data,
+		0,
+	); err != nil {
+		controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("failed to create api-key no-audio alert for '%s' (ID: %d): %v", apikeyIdent, apikeyId, err))
+	} else {
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("created api-key no-audio alert for '%s' (ID: %d) - %d minutes since last upload", apikeyIdent, apikeyId, int(timeSinceLastCall.Minutes())))
+	}
+}
+
+func (controller *Controller) stopAllApiKeyNoAudioMonitors() {
+	controller.apikeyNoAudioMonitorStopsMu.Lock()
+	defer controller.apikeyNoAudioMonitorStopsMu.Unlock()
+	for apikeyId, ch := range controller.apikeyNoAudioMonitorStops {
+		close(ch)
+		delete(controller.apikeyNoAudioMonitorStops, apikeyId)
+	}
+	controller.apikeyNoAudioMonitorStarted = make(map[uint64]int64)
+}
+
+// StartNoAudioMonitoringForAllApiKeys stops any existing per-API-key monitors and
+// starts fresh ones for all enabled, non-disabled API keys.
+func (controller *Controller) StartNoAudioMonitoringForAllApiKeys() {
+	// Preserve start times so unrelated API key saves don't reset grace periods
+	// for keys that have never uploaded (lastCallAt == 0).
+	controller.apikeyNoAudioMonitorStopsMu.Lock()
+	previousStarted := make(map[uint64]int64, len(controller.apikeyNoAudioMonitorStarted))
+	for id, ts := range controller.apikeyNoAudioMonitorStarted {
+		previousStarted[id] = ts
+	}
+	controller.apikeyNoAudioMonitorStopsMu.Unlock()
+
+	controller.stopAllApiKeyNoAudioMonitors()
+
+	if !controller.Options.NoAudioAlertsEnabled || !controller.Options.SystemHealthAlertsEnabled {
+		controller.Logs.LogEvent(LogLevelInfo, "api-key no-audio monitoring is disabled")
+		return
+	}
+
+	controller.apikeyNoAudioMonitorStopsMu.Lock()
+	if controller.apikeyNoAudioMonitorStops == nil {
+		controller.apikeyNoAudioMonitorStops = make(map[uint64]chan struct{})
+	}
+	if controller.apikeyNoAudioMonitorStarted == nil {
+		controller.apikeyNoAudioMonitorStarted = make(map[uint64]int64)
+	}
+	controller.apikeyNoAudioMonitorStopsMu.Unlock()
+
+	query := `SELECT "apikeyId", "ident", "noAudioAlertsEnabled", "noAudioThresholdMinutes" FROM "apikeys" WHERE "disabled" = false AND "purpose" <> 'site'`
+	rows, err := controller.Database.Sql.Query(query)
+	if err != nil {
+		controller.Logs.LogEvent(LogLevelError, fmt.Sprintf("failed to query API keys for no-audio monitoring: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var apikeyId uint64
+		var apikeyIdent string
+		var noAudioAlertsEnabled bool
+		var thresholdMinutes uint
+		if err := rows.Scan(&apikeyId, &apikeyIdent, &noAudioAlertsEnabled, &thresholdMinutes); err != nil {
+			continue
+		}
+
+		if !noAudioAlertsEnabled {
+			continue
+		}
+
+		if thresholdMinutes == 0 {
+			thresholdMinutes = 10
+		}
+
+		monitorStartedAt := time.Now().UnixMilli()
+		if prev, ok := previousStarted[apikeyId]; ok && prev > 0 {
+			monitorStartedAt = prev
+		}
+		stopCh := make(chan struct{})
+		controller.apikeyNoAudioMonitorStopsMu.Lock()
+		controller.apikeyNoAudioMonitorStops[apikeyId] = stopCh
+		controller.apikeyNoAudioMonitorStarted[apikeyId] = monitorStartedAt
+		controller.apikeyNoAudioMonitorStopsMu.Unlock()
+
+		go controller.StartNoAudioMonitoringForApiKey(apikeyId, apikeyIdent, thresholdMinutes, monitorStartedAt, stopCh)
+		controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("started api-key no-audio monitoring for '%s' (ID: %d) with %d minute threshold", apikeyIdent, apikeyId, thresholdMinutes))
+	}
+}
+
+// StartNoAudioMonitoringForApiKey starts monitoring a specific API key with its own timer.
+func (controller *Controller) StartNoAudioMonitoringForApiKey(apikeyId uint64, apikeyIdent string, thresholdMinutes uint, monitorStartedAt int64, stopCh <-chan struct{}) {
+	ticker := time.NewTicker(time.Duration(thresholdMinutes) * time.Minute)
+	defer ticker.Stop()
+
+	controller.MonitorNoAudioForApiKey(apikeyId, apikeyIdent, thresholdMinutes, monitorStartedAt)
+
+	for {
+		select {
+		case <-stopCh:
+			controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("stopped api-key no-audio monitoring for '%s' (ID: %d)", apikeyIdent, apikeyId))
+			return
+		case <-ticker.C:
+			if !controller.Options.NoAudioAlertsEnabled || !controller.Options.SystemHealthAlertsEnabled {
+				controller.Logs.LogEvent(LogLevelInfo, fmt.Sprintf("stopping api-key no-audio monitoring for '%s' (ID: %d) - globally disabled", apikeyIdent, apikeyId))
+				return
+			}
+
+			startedAt := monitorStartedAt
+			controller.apikeyNoAudioMonitorStopsMu.Lock()
+			if ts, ok := controller.apikeyNoAudioMonitorStarted[apikeyId]; ok && ts > 0 {
+				startedAt = ts
+			}
+			controller.apikeyNoAudioMonitorStopsMu.Unlock()
+
+			controller.MonitorNoAudioForApiKey(apikeyId, apikeyIdent, thresholdMinutes, startedAt)
+		}
+	}
+}
+
 // StartSystemHealthMonitoring starts periodic system health checks.
 // An initial check runs immediately at startup, then repeats hourly.
 func (controller *Controller) StartSystemHealthMonitoring() {
@@ -797,6 +1043,11 @@ func (controller *Controller) StartSystemHealthMonitoring() {
 
 	// Start per-system no-audio monitoring with individual timers
 	go controller.StartNoAudioMonitoringForAllSystems()
+
+	// Start per-API-key no-audio monitoring with individual timers
+	go controller.StartNoAudioMonitoringForAllApiKeys()
+
+	controller.StartSdrtrunkHealthMonitor()
 
 	controller.Logs.LogEvent(LogLevelInfo, "system health monitoring started")
 }
